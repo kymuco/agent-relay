@@ -49,7 +49,7 @@ class GroupAwareness:
     def remember(self, message: dict[str, Any]) -> None:
         if not self.limit:
             return
-        text = message.get('text')
+        text = message.get('text') or message.get('caption')
         if not isinstance(text, str) or not text.strip():
             return
         sender = message.get('from') or {}

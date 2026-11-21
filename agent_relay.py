@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -15,6 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff, trusted_sender
+from relay_media import (attachment_info, artifact_filenames, find_new_images,
+                         generated_image_keys, markdown_to_telegram_html,
+                         prepare_incoming, read_verified_artifact, send_file,
+                         synthesize_voice, wants_generated_image)
 
 
 def load_dotenv(path: Path = Path('.env')) -> None:
@@ -90,6 +95,10 @@ class Config:
     bot_aliases: tuple[str, ...] = ()
     peer_reply_mode: bool = False
     peer_reply_window_seconds: int = 900
+    media_enabled: bool = True
+    media_auto_reply: bool = True
+    voice_reply_mode: str = 'on_voice'
+    max_media_bytes: int = 10 * 1024 * 1024
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -119,6 +128,14 @@ class Config:
             raise ValueError('PEER_REPLY_WINDOW_SECONDS must be between 60 and 7200')
         if peer_reply_mode and (len(peers) != 1 or len(bot_ids) != 1):
             raise ValueError('PEER_REPLY_MODE requires exactly one peer username and one peer bot ID')
+        media_enabled = os.getenv('MEDIA_ENABLED', 'on').strip().lower() in ('on', '1', 'true')
+        media_auto_reply = os.getenv('MEDIA_AUTO_REPLY', 'on').strip().lower() in ('on', '1', 'true')
+        voice_reply_mode = os.getenv('VOICE_REPLY_MODE', 'on_voice').strip().lower()
+        max_media_mb = int(os.getenv('MAX_MEDIA_MB', '10'))
+        if voice_reply_mode not in ('off', 'on_voice', 'always'):
+            raise ValueError('VOICE_REPLY_MODE must be off, on_voice, or always')
+        if not 1 <= max_media_mb <= 10:
+            raise ValueError('MAX_MEDIA_MB must be between 1 and 10')
         if interval < 0:
             raise ValueError('MIN_INTERVAL_SECONDS must not be negative')
         return cls(
@@ -137,6 +154,10 @@ class Config:
             bot_aliases=bot_aliases,
             peer_reply_mode=peer_reply_mode,
             peer_reply_window_seconds=peer_reply_window_seconds,
+            media_enabled=media_enabled,
+            media_auto_reply=media_auto_reply,
+            voice_reply_mode=voice_reply_mode,
+            max_media_bytes=max_media_mb * 1024 * 1024,
         )
 
 
@@ -158,7 +179,7 @@ def is_addressed(
             return False
     elif sender_id not in allowed_user_ids:
         return False
-    text = message.get('text') or ''
+    text = message.get('text') or message.get('caption') or ''
     mention = bool(re.search(r'(?<![\w@])@' + re.escape(username) + r'\b', text, re.IGNORECASE))
     command = bool(re.search(r'(?<![\w@])/[A-Za-z][A-Za-z0-9_]{0,31}@' + re.escape(username) + r'\b', text, re.IGNORECASE))
     if mention or command:
@@ -199,7 +220,7 @@ def make_prompt(message: dict[str, Any], peers: frozenset[str], history: str = '
         'The relay will convert that marker into an @mention for you.\n'
         f'{recent}'
         f'Sender ({kind}): {author}\n'
-        f'{quoted}Message:\n{str(message.get("text") or "")[:12000]}\n'
+        f'{quoted}Message:\n{str(message.get("text") or message.get("caption") or "")[:12000]}\n'
         'Reply naturally as a participant in the group.'
     )
 
@@ -280,6 +301,7 @@ class AgentRelay:
         self.group_context = GroupAwareness(config.group_context_limit)
         self.peer_reply_id: int | None = None
         self.peer_reply_expires_at = 0.0
+        self.pending_image_baseline: set[tuple[str, str]] | None = None
         me = api.call('getMe')
         self.bot_id = int(me['id'])
         self.bot_username = str(me['username'])
@@ -302,6 +324,22 @@ class AgentRelay:
             return False
         return True
 
+    def _send_ready_images(self, baseline: set[tuple[str, str]],
+                           reply_message_id: int | None = None) -> int:
+        observations = find_new_images(self.client, self.config.conversation_id, baseline)
+        delivered = 0
+        with tempfile.TemporaryDirectory(prefix='agentrelay-image-') as td:
+            for image in observations:
+                data = read_verified_artifact(self.client, self.config.conversation_id,
+                                              image.filename, Path(td),
+                                              max_bytes=self.config.max_media_bytes)
+                method = ('sendPhoto' if image.filename.lower().endswith(('.png', '.jpg', '.jpeg'))
+                          else 'sendDocument')
+                send_file(self.config.telegram_token, method, self.config.chat_id,
+                          data, image.filename, reply_message_id=reply_message_id)
+                delivered += 1
+        return delivered
+
     def process_update(self, update: dict[str, Any]) -> None:
         update_id = int(update['update_id'])
         if update_id < self.cursor.offset:
@@ -318,7 +356,7 @@ class AgentRelay:
         self.group_context.remember(message)
         sender = message.get('from') or {}
         sender_is_bot = bool(sender.get('is_bot'))
-        text_in = str(message.get('text') or '')
+        text_in = str(message.get('text') or message.get('caption') or '')
         command = text_in.strip().split(maxsplit=1)
         first_word = command[0].lower() if command else ''
         stop_commands = {'/stoprelay', f'/stoprelay@{self.bot_username}'.lower()}
@@ -328,15 +366,34 @@ class AgentRelay:
                 self.api.call('sendMessage', {'chat_id': self.config.chat_id,
                                                'text': f'@{self.bot_username}: межботовый диалог остановлен.'})
             return
+        image_command = first_word == f'/images@{self.bot_username}'.lower()
+        if image_command and not sender_is_bot and self.config.media_enabled:
+            if self.pending_image_baseline is None:
+                self.api.call('sendMessage', {'chat_id': self.config.chat_id,
+                                              'text': 'Нет ожидаемого изображения в этой сессии.'})
+                return
+            try:
+                amount = self._send_ready_images(self.pending_image_baseline,
+                                                 reply_message_id=message['message_id'])
+                if amount:
+                    self.pending_image_baseline = None
+                else:
+                    self.api.call('sendMessage', {'chat_id': self.config.chat_id,
+                                                  'text': 'Изображение пока не готово; попробуй позже /images@' + self.bot_username})
+            except Exception as exc:
+                print(f'Image readback stopped; {type(exc).__name__}.', file=sys.stderr)
+            return
         peer_id = int(sender['id'])
         peer_command = sender_is_bot and first_word == f'/relay@{self.bot_username}'.lower()
         reply_to = (message.get('reply_to_message') or {}).get('from') or {}
         peer_reply = (sender_is_bot and reply_to.get('id') == self.bot_id
                       and self._active_peer_reply(peer_id))
+        attached = self.config.media_enabled and not sender_is_bot and attachment_info(message) is not None
+        automatic_media = attached and self.config.media_auto_reply
         if not is_addressed(
             message, self.bot_username, self.bot_id, self.config.peers,
             self.config.allowed_user_ids, self.config.peer_bot_ids, self.config.bot_aliases,
-        ) and not peer_reply:
+        ) and not peer_reply and not automatic_media:
             return
         if peer_command:
             self._start_peer_reply(peer_id)
@@ -355,7 +412,32 @@ class AgentRelay:
             message, self.config.peers,
             self.group_context.recent_text(exclude_message_id=message.get('message_id')),
         )
+        inbound = None
+        if attached:
+            try:
+                inbound = prepare_incoming(self.api, self.config.telegram_token, message,
+                                           self.config.auth_file, limit=self.config.max_media_bytes)
+                prompt += '\n' + inbound.prompt
+                if inbound.media:
+                    prompt += '\nAnalyze the attached visual material when relevant.'
+            except Exception as exc:
+                label = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else type(exc).__name__
+                print(f'Media input rejected: {type(exc).__name__}', file=sys.stderr)
+                self.api.call('sendMessage', {'chat_id': self.config.chat_id,
+                                              'text': 'Не удалось обработать вложение: ' + label[:160]})
+                return
+        generation_requested = (self.config.media_enabled and not sender_is_bot
+                                and wants_generated_image(text_in))
+        before_images = None
+        if generation_requested:
+            try:
+                before_images = generated_image_keys(self.client, self.config.conversation_id)
+                self.pending_image_baseline = before_images
+            except Exception as exc:
+                print(f'Image discovery unavailable: {type(exc).__name__}', file=sys.stderr)
         params: dict[str, Any] = {'conversation': self.config.conversation_id}
+        if inbound and inbound.media:
+            params['media'] = inbound.media
         if self.config.model:
             params['model'] = self.config.model
         if self.config.effort:
@@ -363,7 +445,7 @@ class AgentRelay:
         try:
             result = self.client.send(prompt, **params)
             text = str(result.text or '').strip()
-            if not text:
+            if not text and not generation_requested:
                 raise RuntimeError('Empty CWA response')
             ending_peer = sender_is_bot and '[[stop_dialogue]]' in text
             text = text.replace('[[stop_dialogue]]', '').strip()
@@ -374,11 +456,18 @@ class AgentRelay:
             # the explicit per-process session is inside its wall-clock window.
             peer_reply_out = (continuing_peer and not ending_peer
                               and self._active_peer_reply(peer_id))
-            parts = split_for_telegram(text)
+            parts = split_for_telegram(text, limit=1800)
             if not parts:
                 parts = ['На этом остановимся.'] if ending_peer else []
             for index, part in enumerate(parts):
-                outgoing: dict[str, Any] = {'chat_id': self.config.chat_id, 'text': part}
+                markup = markdown_to_telegram_html(part)
+                valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096
+                outgoing: dict[str, Any] = {
+                    'chat_id': self.config.chat_id,
+                    'text': markup if valid_html_size else part,
+                }
+                if valid_html_size:
+                    outgoing['parse_mode'] = 'HTML'
                 # For long replies only the final chunk wakes the peer. Earlier
                 # chunks are plain group messages, not multiple model triggers.
                 if (index == 0 and not sender_is_bot) or (index == len(parts)-1 and peer_reply_out):
@@ -389,6 +478,41 @@ class AgentRelay:
                 if message.get('message_thread_id'):
                     outgoing['message_thread_id'] = message['message_thread_id']
                 self.api.call('sendMessage', outgoing)
+            if not sender_is_bot and self.config.media_enabled:
+                if before_images is not None:
+                    try:
+                        count = self._send_ready_images(before_images, reply_message_id=message['message_id'])
+                        if count:
+                            self.pending_image_baseline = None
+                        elif not text:
+                            self.api.call('sendMessage', {
+                                'chat_id': self.config.chat_id,
+                                'text': 'Генерация изображения запрошена, но готового файла пока нет. '
+                                        'Позже напиши /images@' + self.bot_username,
+                            })
+                    except Exception as exc:
+                        print(f'Generated images unavailable: {type(exc).__name__}', file=sys.stderr)
+                if text:
+                    with tempfile.TemporaryDirectory(prefix='agentrelay-artifact-') as td:
+                        for filename in artifact_filenames(text):
+                            try:
+                                data = read_verified_artifact(
+                                    self.client, self.config.conversation_id,
+                                    filename, Path(td), max_bytes=self.config.max_media_bytes)
+                                send_file(self.config.telegram_token, 'sendDocument', self.config.chat_id,
+                                          data, filename, reply_message_id=message['message_id'])
+                            except Exception as exc:
+                                print(f'Generated file unavailable: {type(exc).__name__}', file=sys.stderr)
+                requested_voice = (inbound is not None and inbound.is_voice
+                                   or '/voice' in text_in.lower())
+                if text and (self.config.voice_reply_mode == 'always'
+                             or self.config.voice_reply_mode == 'on_voice' and requested_voice):
+                    try:
+                        ogg = synthesize_voice(self.client, text)
+                        send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,
+                                  ogg, 'ragna-voice.ogg', reply_message_id=message['message_id'])
+                    except Exception as exc:
+                        print(f'Voice reply unavailable: {type(exc).__name__}', file=sys.stderr)
             if ending_peer and continuing_peer:
                 self._stop_peer_reply()
             if not sender_is_bot and self.config.peer_reply_mode:

@@ -107,3 +107,38 @@ When a reply contains multiple Telegram chunks, only its last chunk is sent as a
 direct Reply, preventing multiple parallel triggers. This is experimental;
 check both bot logs and agree on sharing chat messages with both ChatGPT accounts.
 Using GPT-6 High can generate long runs of substantial latency and usage.
+
+
+### Telegram multimodal bridge (experimental v0.4)
+
+- Images: allowed humans can send photo or image-document; their bytes are passed to
+  the existing CWA conversation. Image generation is requested by normal prompts
+  ("Рагна, нарисуй ..."), and ready generated images are retrieved through CWA's
+  canonical \`get_generated_images\` and verified \`handoff_generated_artifact\`.
+  If generation is not ready, send \`/images@YourBotUsername\` later in the same
+  running process. No fabricated public image URLs.
+- Files: PDF (extractable text, max 80 pages), DOCX, UTF-8 TXT/MD/PY/JSON/CSV/
+  JS/TS and other listed source files are read as untrusted document content in
+  the model prompt. Scanned PDFs require OCR and are rejected with an explanation.
+  CWA-generated sandbox file links are sent back using CWA's verified artifact
+  handoff, restricted to filenames/extensions and a 10 MB limit.
+- Voice: a Telegram voice message is transcribed by the supplied
+  \`cwa_dictate.py\` via the ChatGPT dictation endpoint. Responses to voice
+  messages are spoken via supplied \`cwa_tts.py\` (Read Aloud AAC), then converted
+  to OGG/Opus using FFmpeg for Telegram \`sendVoice\`. Text responses are also
+  retained. To request a voice reply to text, send \`@YourBot /voice расскажи ...\`.
+  \`VOICE_REPLY_MODE=off|on_voice|always\` controls automatic speech.
+- Formatting: a restricted safe Markdown-to-Telegram-HTML renderer supports
+  bold, italics, code blocks, inline code, blockquotes, headings and HTTP links;
+  escaping prevents arbitrary model-written HTML from being sent as markup.
+
+Set \`MEDIA_ENABLED=on\`, \`MEDIA_AUTO_REPLY=on\`, \`VOICE_REPLY_MODE=on_voice\`
+and \`MAX_MEDIA_MB=10\` in each owner's \`.env\`; group and user allowlists
+still apply. CWA module files are included in the repository for reproducibility.
+Audio processing requires FFmpeg (Windows installation example:
+\`winget install Gyan.FFmpeg\` and restart the PowerShell session).
+No new browser extension is required. These ChatGPT endpoints are unofficial and
+may change without notice. Inbound documents are sent to the owner's ChatGPT
+conversation; users should agree on group sharing and avoid sending secrets.
+The local isolated tests mock external requests; successful live Telegram/CWA
+image generation, voice and PDF handling remain to be verified by each owner.
