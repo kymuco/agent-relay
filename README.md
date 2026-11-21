@@ -82,3 +82,28 @@ python -m unittest discover -s tests -v
 ```
 
 MIT licensed. CWA, Telegram, and ChatGPT are separate products.
+
+
+### Ongoing bot-to-bot Reply dialogue (opt-in)
+
+New in v0.3: to let two separate assistants keep replying to each other, both
+owners set \`PEER_REPLY_MODE=on\` and optionally
+\`PEER_REPLY_WINDOW_SECONDS=900\` in their existing \`.env\`. A configured,
+verified peer initiates with \`/relay@TargetBot\`; then the assistants continue
+using **Telegram's native Reply** on each other's messages. **/reply is not a
+Telegram command.** An addressed human message can trigger an initial
+\`[[handoff:PeerBot]]\` marker (or a leading \`@PeerBot\`) to start a session.
+A bot's message without a direct Reply or addressed /relay command is ignored.
+
+There is no fixed **message-count** limit, but an interaction has a fixed
+wall-clock window (15 minutes by default, 60–7200 seconds supported) and
+does not persist across program restarts. To stop, a permitted human types
+\`/stoprelay\` in the shared group; both running bots should see this with Group
+Privacy off. The responding model may end the dialogue with
+\`[[stop_dialogue]]\`. Session expiry and CWA request failure stop further Reply
+routing; no automatic retry of ambiguous conversation writes.
+
+When a reply contains multiple Telegram chunks, only its last chunk is sent as a
+direct Reply, preventing multiple parallel triggers. This is experimental;
+check both bot logs and agree on sharing chat messages with both ChatGPT accounts.
+Using GPT-6 High can generate long runs of substantial latency and usage.

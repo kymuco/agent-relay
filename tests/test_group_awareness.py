@@ -114,6 +114,84 @@ class GroupAwarenessTests(unittest.TestCase):
             self.assertEqual(posted, ['@\u200bFriendBot продолжим'])
             self.assertNotIn('reply_parameters', [x.args[1] for x in api.call.call_args_list if x.args[0] == 'sendMessage'][0])
 
+    def test_opt_in_peer_reply_continues_without_explicit_mention(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cwa.send.return_value.text = 'Начинаю [[handoff:FriendBot]]'
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json', self.peers,
+                         self.allowed, self.peer_ids, state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, peer_reply_mode=True, peer_reply_window_seconds=900)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                app.process_update({'update_id': 1, 'message': self.msg(self.human, '@MyBot обсуди идею', 1)})
+                self.assertEqual(app.peer_reply_id, 20)
+                cwa.send.return_value.text = 'Продолжаю, коллега.'
+                inbound = self.msg(self.peer, 'Я согласен. А что дальше?', 2)
+                inbound['reply_to_message'] = {'from': {'id': 5, 'is_bot': True}}
+                app.process_update({'update_id': 2, 'message': inbound})
+            self.assertEqual(cwa.send.call_count, 2)
+            outgoing = [x.args[1] for x in api.call.call_args_list if x.args[0] == 'sendMessage']
+            self.assertEqual(outgoing[0]['text'], '/relay@FriendBot Начинаю')
+            self.assertEqual(outgoing[-1]['text'], 'Продолжаю, коллега.')
+            self.assertEqual(outgoing[-1]['reply_parameters']['message_id'], 2)
+
+    def test_incoming_peer_command_starts_reply_session_and_stop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cwa.send.return_value.text = 'Ответил, обсуждаем дальше.'
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json', self.peers,
+                         self.allowed, self.peer_ids, state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, peer_reply_mode=True, peer_reply_window_seconds=900)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                app.process_update({'update_id': 1, 'message': self.msg(self.peer, '/relay@MyBot Привет', 1)})
+                self.assertEqual(app.peer_reply_id, 20)
+                app.process_update({'update_id': 2, 'message': self.msg(self.human, '/stoprelay', 2)})
+                self.assertIsNone(app.peer_reply_id)
+                reply = self.msg(self.peer, 'Продолжим?', 3)
+                reply['reply_to_message'] = {'from': {'id': 5, 'is_bot': True}}
+                app.process_update({'update_id': 3, 'message': reply})
+            cwa.send.assert_called_once()
+            outgoing = [x.args[1] for x in api.call.call_args_list if x.args[0] == 'sendMessage']
+            self.assertEqual(outgoing[0]['reply_parameters']['message_id'], 1)
+            self.assertEqual(len(outgoing), 2)
+
+    def test_peer_reply_expiration_and_non_reply_do_not_trigger(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cwa.send.return_value.text = 'Ответ'
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json', self.peers,
+                         self.allowed, self.peer_ids, state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, peer_reply_mode=True, peer_reply_window_seconds=60)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                app.process_update({'update_id': 1, 'message': self.msg(self.peer, '/relay@MyBot Привет', 1)})
+                app.process_update({'update_id': 2, 'message': self.msg(self.peer, 'Просто сообщение', 2)})
+                app.peer_reply_expires_at = 0
+                reply = self.msg(self.peer, 'Ещё поговорим?', 3)
+                reply['reply_to_message'] = {'from': {'id': 5, 'is_bot': True}}
+                app.process_update({'update_id': 3, 'message': reply})
+            cwa.send.assert_called_once()
+
+    def test_model_can_end_peer_dialogue_without_triggering_reply(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cwa.send.return_value.text = 'Спасибо за обсуждение. [[stop_dialogue]]'
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json', self.peers,
+                         self.allowed, self.peer_ids, state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, peer_reply_mode=True, peer_reply_window_seconds=900)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                app.process_update({'update_id': 1, 'message': self.msg(self.peer, '/relay@MyBot Начнём', 1)})
+            outgoing = [x.args[1] for x in api.call.call_args_list if x.args[0] == 'sendMessage']
+            self.assertNotIn('reply_parameters', outgoing[-1])
+            self.assertEqual(outgoing[-1]['text'], 'Спасибо за обсуждение.')
+            self.assertIsNone(app.peer_reply_id)
+
 
 if __name__ == '__main__':
     unittest.main()

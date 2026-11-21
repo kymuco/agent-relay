@@ -88,6 +88,8 @@ class Config:
     min_interval_seconds: float = 2.0
     group_context_limit: int = 30
     bot_aliases: tuple[str, ...] = ()
+    peer_reply_mode: bool = False
+    peer_reply_window_seconds: int = 900
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -111,6 +113,12 @@ class Config:
         if not 0 <= group_context_limit <= 100:
             raise ValueError('GROUP_CONTEXT_LIMIT must be between 0 and 100')
         bot_aliases = tuple(a.strip() for a in os.getenv('BOT_ALIASES', '').split(',') if a.strip())
+        peer_reply_mode = os.getenv('PEER_REPLY_MODE', 'off').strip().lower() in ('on', 'true', '1')
+        peer_reply_window_seconds = int(os.getenv('PEER_REPLY_WINDOW_SECONDS', '900'))
+        if not 60 <= peer_reply_window_seconds <= 7200:
+            raise ValueError('PEER_REPLY_WINDOW_SECONDS must be between 60 and 7200')
+        if peer_reply_mode and (len(peers) != 1 or len(bot_ids) != 1):
+            raise ValueError('PEER_REPLY_MODE requires exactly one peer username and one peer bot ID')
         if interval < 0:
             raise ValueError('MIN_INTERVAL_SECONDS must not be negative')
         return cls(
@@ -127,6 +135,8 @@ class Config:
             min_interval_seconds=interval,
             group_context_limit=group_context_limit,
             bot_aliases=bot_aliases,
+            peer_reply_mode=peer_reply_mode,
+            peer_reply_window_seconds=peer_reply_window_seconds,
         )
 
 
@@ -182,7 +192,10 @@ def make_prompt(message: dict[str, Any], peers: frozenset[str], history: str = '
         f'Other assistants: {peer_text}. '
         'To hand the next turn to one of them, append exactly [[handoff:TheirBotUsername]] to your answer. '
         'Only do this when useful; never hand off just to say hello. '
-        'Do not hand off when replying to another bot. '
+        'When replying to another bot in an active dialogue, your answer is delivered '
+        'as Telegram Reply automatically. Continue the discussion naturally, but '
+        'if your conversation is complete append [[stop_dialogue]] to your answer. '
+        'Do not hand off explicitly when replying to another bot. '
         'The relay will convert that marker into an @mention for you.\n'
         f'{recent}'
         f'Sender ({kind}): {author}\n'
@@ -265,10 +278,29 @@ class AgentRelay:
         self.cursor = Cursor(config.state_file)
         self.last_send_time = float('-inf')
         self.group_context = GroupAwareness(config.group_context_limit)
+        self.peer_reply_id: int | None = None
+        self.peer_reply_expires_at = 0.0
         me = api.call('getMe')
         self.bot_id = int(me['id'])
         self.bot_username = str(me['username'])
         print(f'AgentRelay active: @{self.bot_username} in group {config.chat_id}', flush=True)
+
+    def _stop_peer_reply(self) -> None:
+        self.peer_reply_id = None
+        self.peer_reply_expires_at = 0.0
+
+    def _start_peer_reply(self, peer_id: int) -> None:
+        if self.config.peer_reply_mode:
+            self.peer_reply_id = peer_id
+            self.peer_reply_expires_at = time.monotonic() + self.config.peer_reply_window_seconds
+
+    def _active_peer_reply(self, sender_id: int) -> bool:
+        if not self.config.peer_reply_mode or sender_id != self.peer_reply_id:
+            return False
+        if time.monotonic() >= self.peer_reply_expires_at:
+            self._stop_peer_reply()
+            return False
+        return True
 
     def process_update(self, update: dict[str, Any]) -> None:
         update_id = int(update['update_id'])
@@ -282,13 +314,33 @@ class AgentRelay:
         if not trusted_sender(message, self.config.allowed_user_ids, self.config.peers,
                               self.config.peer_bot_ids, self.bot_id):
             return
-        # Observe all trusted group text, but NEVER send ordinary chat to CWA.
+        # Observe trusted group text, never call CWA just to remember.
         self.group_context.remember(message)
+        sender = message.get('from') or {}
+        sender_is_bot = bool(sender.get('is_bot'))
+        text_in = str(message.get('text') or '')
+        command = text_in.strip().split(maxsplit=1)
+        first_word = command[0].lower() if command else ''
+        stop_commands = {'/stoprelay', f'/stoprelay@{self.bot_username}'.lower()}
+        if not sender_is_bot and first_word in stop_commands:
+            if self.config.peer_reply_mode:
+                self._stop_peer_reply()
+                self.api.call('sendMessage', {'chat_id': self.config.chat_id,
+                                               'text': f'@{self.bot_username}: межботовый диалог остановлен.'})
+            return
+        peer_id = int(sender['id'])
+        peer_command = sender_is_bot and first_word == f'/relay@{self.bot_username}'.lower()
+        reply_to = (message.get('reply_to_message') or {}).get('from') or {}
+        peer_reply = (sender_is_bot and reply_to.get('id') == self.bot_id
+                      and self._active_peer_reply(peer_id))
         if not is_addressed(
             message, self.bot_username, self.bot_id, self.config.peers,
             self.config.allowed_user_ids, self.config.peer_bot_ids, self.config.bot_aliases,
-        ):
+        ) and not peer_reply:
             return
+        if peer_command:
+            self._start_peer_reply(peer_id)
+        continuing_peer = sender_is_bot and self._active_peer_reply(peer_id) and (peer_command or peer_reply)
         now = time.monotonic()
         if now - self.last_send_time < self.config.min_interval_seconds:
             return
@@ -302,19 +354,28 @@ class AgentRelay:
             params['model'] = self.config.model
         if self.config.effort:
             params['reasoning_effort'] = self.config.effort
-        sender_is_bot = bool((message.get('from') or {}).get('is_bot'))
         try:
             result = self.client.send(prompt, **params)
             text = str(result.text or '').strip()
             if not text:
                 raise RuntimeError('Empty CWA response')
+            ending_peer = sender_is_bot and '[[stop_dialogue]]' in text
+            text = text.replace('[[stop_dialogue]]', '').strip()
             text = explicit_handoff(text, self.config.peers, from_bot=sender_is_bot)
             if sender_is_bot:
                 text = neutralize_peer_mentions(text, self.config.peers)
+            # No fixed turn-count limit. Direct replies continue only while
+            # the explicit per-process session is inside its wall-clock window.
+            peer_reply_out = (continuing_peer and not ending_peer
+                              and self._active_peer_reply(peer_id))
             parts = split_for_telegram(text)
+            if not parts:
+                parts = ['На этом остановимся.'] if ending_peer else []
             for index, part in enumerate(parts):
                 outgoing: dict[str, Any] = {'chat_id': self.config.chat_id, 'text': part}
-                if index == 0 and not sender_is_bot:
+                # For long replies only the final chunk wakes the peer. Earlier
+                # chunks are plain group messages, not multiple model triggers.
+                if (index == 0 and not sender_is_bot) or (index == len(parts)-1 and peer_reply_out):
                     outgoing['reply_parameters'] = {
                         'message_id': message['message_id'],
                         'allow_sending_without_reply': True,
@@ -322,10 +383,22 @@ class AgentRelay:
                 if message.get('message_thread_id'):
                     outgoing['message_thread_id'] = message['message_thread_id']
                 self.api.call('sendMessage', outgoing)
+            if ending_peer and continuing_peer:
+                self._stop_peer_reply()
+            if not sender_is_bot and self.config.peer_reply_mode:
+                # Start a new session only when an authorized human-triggered
+                # model response explicitly routes to the verified peer bot.
+                for name in self.config.peers:
+                    relay = f'/relay@{name}'.lower()
+                    if text.lower() == relay or text.lower().startswith(relay + ' '):
+                        self._start_peer_reply(next(iter(self.config.peer_bot_ids)))
+                        break
             self.group_context.remember_own_reply(self.bot_username, text)
             print(f'Replied to Telegram update {update_id} ({len(parts)} part(s))', flush=True)
         except Exception as exc:
-            # Important: never replay an ambiguous CWA write automatically.
+            # An ambiguous CWA write must never be retried or re-handoffed.
+            if sender_is_bot:
+                self._stop_peer_reply()
             print(f'Update {update_id} stopped; {type(exc).__name__}. No retry.', file=sys.stderr)
 
     def serve(self) -> None:
