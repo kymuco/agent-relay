@@ -7,5 +7,7 @@ auth_data.json
 *auth_data*.json
 .agent-relay-state.json
 .agent-relay-state.json.tmp
+.agent-relay-control.json
+.agent-relay-control.json.tmp
 .env.tmp
 .runtime/
