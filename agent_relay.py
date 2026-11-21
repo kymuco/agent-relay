@@ -343,7 +343,13 @@ class AgentRelay:
         continuing_peer = sender_is_bot and self._active_peer_reply(peer_id) and (peer_command or peer_reply)
         now = time.monotonic()
         if now - self.last_send_time < self.config.min_interval_seconds:
-            return
+            if not continuing_peer:
+                return
+            # Preserve direct-Reply continuity while respecting minimum spacing.
+            time.sleep(self.config.min_interval_seconds - (now - self.last_send_time))
+            now = time.monotonic()
+            if not self._active_peer_reply(peer_id):
+                return
         self.last_send_time = now
         prompt = make_prompt(
             message, self.config.peers,
