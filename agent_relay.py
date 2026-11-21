@@ -468,8 +468,8 @@ class AgentRelay:
                 if peer_reply_out:
                     peer_destination = next(iter(self.config.peers))
                     # If the model already typed the command, keep only one.
-                    text = re.sub(r'^\\s*/relay@' + re.escape(peer_destination)
-                                  + r'(?=\\s|$)\\s*', '', text, count=1,
+                    text = re.sub(r'^\s*/relay@' + re.escape(peer_destination)
+                                  + r'(?=\s|$)\s*', '', text, count=1,
                                   flags=re.IGNORECASE).strip()
                 text = neutralize_peer_mentions(text, self.config.peers)
             parts = split_for_telegram(text, limit=1800)
