@@ -55,11 +55,23 @@ class GroupAwarenessTests(unittest.TestCase):
 
     def test_explicit_handoff_and_one_hop(self):
         out = explicit_handoff('Привет! [[handoff:FriendBot]]', self.peers, from_bot=False)
-        self.assertEqual(out, '@FriendBot Привет!')
-        self.assertEqual(explicit_handoff('@FriendBot hi [[handoff:friendbot]]', self.peers, from_bot=False), '@FriendBot hi')
+        self.assertEqual(out, '/relay@FriendBot Привет!')
+        self.assertEqual(explicit_handoff('@FriendBot hi [[handoff:friendbot]]', self.peers, from_bot=False), '/relay@friendbot hi')
+        self.assertEqual(explicit_handoff('@FriendBot hi', self.peers, from_bot=False), '/relay@FriendBot hi')
+        self.assertEqual(explicit_handoff('Quoted @FriendBot hi', self.peers, from_bot=False), 'Quoted @FriendBot hi')
         self.assertEqual(explicit_handoff('Hi [[handoff:BadBot]]', self.peers, from_bot=False), 'Hi')
         self.assertEqual(explicit_handoff('Hi [[handoff:FriendBot]]', self.peers, from_bot=True), 'Hi')
         self.assertEqual(explicit_handoff('Hello', self.peers, from_bot=False), 'Hello')
+
+    def test_telegram_command_mention_from_peer(self):
+        self.assertTrue(is_addressed(self.msg(self.peer, '/relay@MyBot Привет'), 'MyBot', 5,
+                                     self.peers, self.allowed, self.peer_ids))
+        self.assertTrue(is_addressed(self.msg(self.peer, '/relay@mybot Привет'), 'MyBot', 5,
+                                     self.peers, self.allowed, self.peer_ids))
+        self.assertFalse(is_addressed(self.msg({**self.peer, 'id': 99}, '/relay@MyBot Привет'), 'MyBot', 5,
+                                      self.peers, self.allowed, self.peer_ids))
+        self.assertFalse(is_addressed(self.msg(self.peer, '/relay@OtherBot Привет'), 'MyBot', 5,
+                                      self.peers, self.allowed, self.peer_ids))
 
     def test_group_context_does_not_trigger_ai_and_handoff_routes(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -84,7 +96,7 @@ class GroupAwarenessTests(unittest.TestCase):
             self.assertNotIn('чужая реплика', prompt)
             self.assertEqual(prompt.count('Рагна, продолжай'), 1)
             posted = [x.args[1]['text'] for x in api.call.call_args_list if x.args[0] == 'sendMessage']
-            self.assertEqual(posted, ['@FriendBot Передаю слово.'])
+            self.assertEqual(posted, ['/relay@FriendBot Передаю слово.'])
 
     def test_bot_reply_must_not_re_handoff(self):
         with tempfile.TemporaryDirectory() as folder:

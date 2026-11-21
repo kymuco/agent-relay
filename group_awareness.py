@@ -76,16 +76,24 @@ class GroupAwareness:
 
 
 def explicit_handoff(text: str, peers: frozenset[str], *, from_bot: bool) -> str:
-    """Translate assistant's deliberate [[handoff:Username]] into one @mention.
+    """Use Telegram's command-mention delivery for bounded peer handoffs.
 
-    Peer replies cannot trigger another handoff; human-initiated turns may.
-    Other text is preserved. Unknown or malformed markers never route a bot.
+    Handoff markers or a leading @Peer from human-triggered responses route
+    through /relay@Peer. Replies to bots cannot request another hop.
     """
     chosen = None
     for match in _HANDOFF.finditer(text):
         if not from_bot and chosen is None and match.group(1).lower() in peers:
             chosen = match.group(1)
     clean = _HANDOFF.sub('', text).strip()
-    if chosen and not re.search(r'(?<![\w@])@' + re.escape(chosen) + r'\b', clean, re.I):
-        return f'@{chosen} {clean}'.strip()
+    if from_bot:
+        return clean
+    leading_peer = re.match(r'^@([A-Za-z][A-Za-z0-9_]{4,31})\b(?:\s+|$)', clean, re.I)
+    if leading_peer and leading_peer.group(1).lower() in peers:
+        chosen = chosen or leading_peer.group(1)
+        # Avoid repeating the username after /relay@Peer.
+        if chosen.lower() == leading_peer.group(1).lower():
+            clean = clean[leading_peer.end():].strip()
+    if chosen:
+        return f'/relay@{chosen} {clean}'.strip()
     return clean

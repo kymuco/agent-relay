@@ -150,7 +150,8 @@ def is_addressed(
         return False
     text = message.get('text') or ''
     mention = bool(re.search(r'(?<![\w@])@' + re.escape(username) + r'\b', text, re.IGNORECASE))
-    if mention:
+    command = bool(re.search(r'(?<![\w@])/[A-Za-z][A-Za-z0-9_]{0,31}@' + re.escape(username) + r'\b', text, re.IGNORECASE))
+    if mention or command:
         return True
     if sender.get('is_bot'):
         return False  # no bot-to-bot Reply triggers; no ping-pong
