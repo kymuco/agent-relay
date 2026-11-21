@@ -133,7 +133,7 @@ class GroupAwarenessTests(unittest.TestCase):
             self.assertEqual(cwa.send.call_count, 2)
             outgoing = [x.args[1] for x in api.call.call_args_list if x.args[0] == 'sendMessage']
             self.assertEqual(outgoing[0]['text'], '/relay@FriendBot Начинаю')
-            self.assertEqual(outgoing[-1]['text'], 'Продолжаю, коллега.')
+            self.assertEqual(outgoing[-1]['text'], '/relay@friendbot Продолжаю, коллега.')
             self.assertEqual(outgoing[-1]['reply_parameters']['message_id'], 2)
 
     def test_peer_plain_mention_creates_native_reply_then_continues(self):
@@ -159,11 +159,51 @@ class GroupAwarenessTests(unittest.TestCase):
             self.assertEqual(cwa.send.call_count, 2)
             out = [c.args[1] for c in api.call.call_args_list if c.args[0] == 'sendMessage']
             self.assertEqual(len(out), 2)
+            self.assertTrue(out[0]['text'].startswith('/relay@friendbot '))
             self.assertIn('Подтверждаю 2/6', out[0]['text'])
             self.assertNotIn('handoff', out[0]['text'])
             self.assertNotIn('/reply', out[0]['text'])
+            self.assertEqual(out[1]['text'], '/relay@friendbot 4/6, продолжаем.')
             self.assertEqual(out[0]['reply_parameters']['message_id'], 42)
             self.assertEqual(out[1]['reply_parameters']['message_id'], 43)
+
+    def test_model_literal_relay_command_not_duplicated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cwa.send.return_value.text = '/relay@FriendBot 3/6, мой ход.'
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json',
+                         self.peers, self.allowed, self.peer_ids,
+                         state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, peer_reply_mode=True,
+                         peer_reply_window_seconds=900)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                app.process_update({'update_id': 1, 'message':
+                                    self.msg(self.peer, '/relay@MyBot 2/6', 100)})
+            out = [c.args[1] for c in api.call.call_args_list if c.args[0] == 'sendMessage']
+            self.assertEqual(out[0]['text'], '/relay@friendbot 3/6, мой ход.')
+            self.assertEqual(out[0]['reply_parameters']['message_id'], 100)
+
+    def test_long_peer_answer_routes_only_final_chunk(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cwa.send.return_value.text = 'Разговор ' + 'а' * 3800
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json',
+                         self.peers, self.allowed, self.peer_ids,
+                         state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, peer_reply_mode=True)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                app.process_update({'update_id': 1, 'message':
+                                    self.msg(self.peer, '/relay@MyBot продолжай', 88)})
+            out = [c.args[1] for c in api.call.call_args_list if c.args[0] == 'sendMessage']
+            self.assertGreater(len(out), 1)
+            self.assertTrue(out[-1]['text'].startswith('/relay@friendbot '))
+            self.assertFalse(any('/relay@friendbot' in x['text'] for x in out[:-1]))
+            self.assertNotIn('reply_parameters', out[0])
+            self.assertEqual(out[-1]['reply_parameters']['message_id'], 88)
 
     def test_peer_mention_without_reply_mode_stays_one_off(self):
         with tempfile.TemporaryDirectory() as folder:

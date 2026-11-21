@@ -216,9 +216,11 @@ def make_prompt(message: dict[str, Any], peers: frozenset[str], history: str = '
         'When replying to another bot in an active dialogue, your answer is delivered '
         'as Telegram Reply automatically. Continue the discussion naturally, but '
         'if your conversation is complete append [[stop_dialogue]] to your answer. '
-        'Do not hand off explicitly when replying to another bot: no @mention, '
-        'no /reply command and no [[handoff:...]] marker are needed. '
-        'The relay sets native Telegram Reply metadata automatically.\n'
+        'When replying to another bot, write only natural discussion text. '
+        'The relay automatically places a literal /relay@PeerBotName command '
+        'at the start of the outgoing Telegram reply; do not type this command '
+        'or [[handoff:...]] yourself. To finish, append [[stop_dialogue]]. '
+        'The relay also sets native Telegram Reply metadata.\n'
         f'{recent}'
         f'Sender ({kind}): {author}\n'
         f'{quoted}Message:\n{str(message.get("text") or message.get("caption") or "")[:12000]}\n'
@@ -456,15 +458,28 @@ class AgentRelay:
             ending_peer = sender_is_bot and '[[stop_dialogue]]' in text
             text = text.replace('[[stop_dialogue]]', '').strip()
             text = explicit_handoff(text, self.config.peers, from_bot=sender_is_bot)
-            if sender_is_bot:
-                text = neutralize_peer_mentions(text, self.config.peers)
-            # No fixed turn-count limit. Direct replies continue only while
-            # the explicit per-process session is inside its wall-clock window.
+            # Only a verified, active peer session may create a routing command.
+            # Keep /relay@... visible as real Telegram text: a native Reply alone
+            # does not always reach the other bot in a group.
             peer_reply_out = (continuing_peer and not ending_peer
                               and self._active_peer_reply(peer_id))
+            peer_destination = None
+            if sender_is_bot:
+                if peer_reply_out:
+                    peer_destination = next(iter(self.config.peers))
+                    # If the model already typed the command, keep only one.
+                    text = re.sub(r'^\\s*/relay@' + re.escape(peer_destination)
+                                  + r'(?=\\s|$)\\s*', '', text, count=1,
+                                  flags=re.IGNORECASE).strip()
+                text = neutralize_peer_mentions(text, self.config.peers)
             parts = split_for_telegram(text, limit=1800)
             if not parts:
                 parts = ['На этом остановимся.'] if ending_peer else []
+            if peer_reply_out and parts:
+                # Route only the LAST chunk to avoid waking the peer multiple
+                # times for one long model response. Command is not a hint;
+                # it must appear literally at the start of Telegram text.
+                parts[-1] = f'/relay@{peer_destination} {parts[-1]}'
             for index, part in enumerate(parts):
                 markup = markdown_to_telegram_html(part)
                 valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096

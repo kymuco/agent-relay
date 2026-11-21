@@ -152,3 +152,18 @@ is no literal `/reply` command in the message body. Subsequent direct
 Replies within the session are accepted without another @mention. The
 existing session timeout, `/stoprelay`, actor allowlists and
 `[[stop_dialogue]]` behavior still apply.
+
+### Literal /relay@Bot handoff on every active peer turn
+
+For active bot-to-bot conversations (`PEER_REPLY_MODE=on` on both hosts),
+AgentRelay now **writes a real visible** `/relay@PeerBot` command at the beginning
+of each outgoing bot reply. This is not left to the language model and is
+not the literal `/reply` command. Native Telegram Reply metadata is also
+attached. When the answer is split into chunks, only the final chunk is
+directed to the peer to prevent multiple independent replies.
+
+For example: Ragna sends `/relay@mirrimmannnbot 3/6, твой ход`,
+Mirri sends `/relay@ragnacobot 4/6, продолжаем`. Verified bot identity,
+conversation timeout, allowed chat, `/stoprelay` and
+`[[stop_dialogue]]` still govern routing. With `PEER_REPLY_MODE=off`, no
+automatic peer command is inserted.
