@@ -19,7 +19,8 @@ from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff
 from relay_media import (attachment_info, artifact_filenames, find_new_images,
                          generated_image_keys, markdown_to_telegram_html,
                          prepare_incoming, read_verified_artifact, send_file,
-                         synthesize_voice, wants_generated_image)
+                         synthesize_voice, unsupported_attachment,
+                         wants_generated_image)
 
 
 def load_dotenv(path: Path = Path('.env')) -> None:
@@ -395,6 +396,18 @@ class AgentRelay:
             message, self.bot_username, self.bot_id, self.config.peers,
             self.config.allowed_user_ids, self.config.peer_bot_ids, self.config.bot_aliases,
         )
+        # GIFs can arrive as MP4 documents or Telegram animations. Do not
+        # auto-reply or send them to CWA on normal group traffic.
+        if unsupported_attachment(message):
+            if addressed and not sender_is_bot:
+                self.api.call('sendMessage', {
+                    'chat_id': self.config.chat_id,
+                    'text': 'Этот тип медиа пока не поддерживается (GIF, MP4, видео). '
+                            'Отправь обычное фото, голосовое или PDF/текстовый файл.',
+                    'reply_parameters': {'message_id': message['message_id'],
+                                         'allow_sending_without_reply': True},
+                })
+            return
         peer_direct = sender_is_bot and addressed
         peer_reply = (sender_is_bot and reply_to.get('id') == self.bot_id
                       and self._active_peer_reply(peer_id))

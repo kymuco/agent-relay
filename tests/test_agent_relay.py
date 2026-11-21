@@ -149,6 +149,52 @@ class CoreTests(unittest.TestCase):
                 app = AgentRelay(cfg, api, cwa)
                 app.process_update({'update_id': 1, 'message': {**self.message, 'chat': {'id': -999}}})
             cwa.send.assert_not_called()
+    def test_unaddressed_gif_mp4_is_ignored_without_cwa(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json',
+                         self.peers, self.allowed, self.peer_ids,
+                         state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, media_enabled=True, media_auto_reply=True)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                for update_id, media in (
+                    (11, {'document': {'file_id': 'f', 'file_name': 'gif.mp4',
+                                       'mime_type': 'video/mp4'}}),
+                    (12, {'animation': {'file_id': 'f'}}),
+                    (13, {'video': {'file_id': 'f'}}),
+                ):
+                    app.process_update({'update_id': update_id,
+                                        'message': {'chat': {'id': -123, 'type': 'group'},
+                                                    'message_id': update_id,
+                                                    'from': self.human, **media}})
+            cwa.send.assert_not_called()
+            self.assertEqual([x for x in api.call.call_args_list
+                              if x.args[0] == 'sendMessage'], [])
+
+    def test_addressed_mp4_returns_error_without_cwa(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json',
+                         self.peers, self.allowed, self.peer_ids,
+                         state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, media_enabled=True, media_auto_reply=True)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                app.process_update({'update_id': 11,
+                                    'message': {'chat': {'id': -123, 'type': 'group'},
+                                                'message_id': 22, 'from': self.human,
+                                                'caption': '@MyBot распознай GIF',
+                                                'document': {'file_id': 'f',
+                                                             'file_name': 'gif.mp4'}}})
+            cwa.send.assert_not_called()
+            messages = [x.args[1] for x in api.call.call_args_list
+                        if x.args[0] == 'sendMessage']
+            self.assertEqual(len(messages), 1)
+            self.assertIn('не поддерживается', messages[0]['text'])
+
 
 
 if __name__ == '__main__':

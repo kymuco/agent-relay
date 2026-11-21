@@ -12,6 +12,7 @@ from relay_media import (
     Incoming, artifact_filenames, attachment_info, download_attachment,
     encode_multipart, markdown_to_telegram_html, prepare_incoming, safe_filename,
     send_file, wants_generated_image, generated_image_keys, find_new_images,
+    unsupported_attachment, supported_document,
 )
 
 
@@ -41,6 +42,25 @@ class Tests(unittest.TestCase):
             download_attachment(api,'TOKEN',{'photo':[{'file_id':'x','file_size':1}]})
         with self.assertRaisesRegex(ValueError,'exceeds'):
             download_attachment(api,'TOKEN',{'photo':[{'file_id':'x','file_size':20}]},limit=10)
+
+    def test_unsolicited_animations_are_not_attachments(self):
+        cases = [
+            {'document': {'file_id': 'f', 'file_name': 'gif.mp4', 'mime_type': 'video/mp4'}},
+            {'document': {'file_id': 'f', 'file_name': 'moving.gif', 'mime_type': 'image/gif'}},
+            {'animation': {'file_id': 'f'}},
+            {'video': {'file_id': 'f'}},
+            {'sticker': {'file_id': 'f'}},
+            {'audio': {'file_id': 'f'}},
+        ]
+        for item in cases:
+            with self.subTest(item=item):
+                self.assertTrue(unsupported_attachment(item))
+                self.assertIsNone(attachment_info(item))
+                with self.assertRaisesRegex(ValueError, 'No supported attachment'):
+                    download_attachment(Mock(), 'TOKEN', item)
+        self.assertTrue(supported_document({'file_id': 'f', 'file_name': 'source.py'}))
+        self.assertFalse(unsupported_attachment({'photo': [{'file_id': 'f'}]}))
+        self.assertFalse(unsupported_attachment({'voice': {'file_id': 'f'}}))
 
     def test_prepare_text_document(self):
         with patch('relay_media.download_attachment',return_value=('source.py',b'print("hi")\n')):

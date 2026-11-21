@@ -167,3 +167,16 @@ Mirri sends `/relay@ragnacobot 4/6, продолжаем`. Verified bot identity
 conversation timeout, allowed chat, `/stoprelay` and
 `[[stop_dialogue]]` still govern routing. With `PEER_REPLY_MODE=off`, no
 automatic peer command is inserted.
+
+### Unsolicited GIFs, MP4s, and other unsupported media
+
+Telegram often sends animated GIFs as MP4 documents. AgentRelay now filters
+unsupported documents, animations, videos, stickers, and audio from metadata
+before download or CWA submission. In regular group chat these are **ignored
+silently**, even with `MEDIA_AUTO_REPLY=on`. An explicitly addressed unsupported
+attachment receives one explanatory reply instead of an exception.
+
+To prevent auto-replies to ordinary photos, voice and supported documents too,
+set `MEDIA_AUTO_REPLY=off` in the existing local `.env` and restart.
+The shipped `.env.example` now defaults to `off`; it never overwrites
+an existing `.env`.

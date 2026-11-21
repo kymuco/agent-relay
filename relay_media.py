@@ -24,6 +24,8 @@ MAX_VOICE_REPLY_CHARS = 2500
 TEXT_EXTS = frozenset({'.txt', '.py', '.md', '.json', '.csv', '.log', '.yaml', '.yml',
                        '.js', '.ts', '.html', '.css', '.xml', '.toml', '.ini', '.sql', '.sh', '.ps1'})
 ARTIFACT_EXTS = TEXT_EXTS | {'.pdf', '.png', '.jpg', '.jpeg', '.webp', '.zip', '.docx'}
+INBOUND_DOCUMENT_EXTS = TEXT_EXTS | {'.pdf', '.docx', '.png', '.jpeg', '.jpg', '.webp'}
+UNSUPPORTED_MEDIA_KINDS = ('animation', 'video', 'video_note', 'sticker', 'audio')
 _FILENAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_. -]{0,119}$')
 _IMAGE_INTENT = re.compile(r'(?i)(?:нарисуй|сгенерируй\s+(?:изображени|картинк|иллюстрац)|создай\s+(?:изображени|картинк)|generate\s+(?:an?\s+)?image|draw\s+(?:a\s+)?)')
 _SANDBOX_FILE = re.compile(r'sandbox:/mnt/data/([A-Za-z0-9][A-Za-z0-9_.-]{0,119})')
@@ -44,12 +46,36 @@ def safe_filename(value: str, fallback: str = 'attachment.bin') -> str:
     return name
 
 
+def supported_document(record: dict) -> bool:
+    """Classify Telegram document metadata before any file download."""
+    if not isinstance(record, dict) or not record.get('file_id'):
+        return False
+    name = safe_filename(record.get('file_name'), '')
+    if not name or Path(name).suffix.lower() not in INBOUND_DOCUMENT_EXTS:
+        return False
+    mime = str(record.get('mime_type') or '').lower()
+    if mime.startswith(('video/', 'audio/')) or mime in {'image/gif', 'application/x-msdownload'}:
+        return False
+    return True
+
+
+def unsupported_attachment(message: dict) -> bool:
+    """Identify GIF/MP4/video or unsupported document media before downloading."""
+    if any(message.get(kind) for kind in UNSUPPORTED_MEDIA_KINDS):
+        return True
+    document = message.get('document')
+    return (isinstance(document, dict) and bool(document.get('file_id'))
+            and not supported_document(document))
+
+
 def attachment_info(message: dict) -> tuple[str, str, int] | None:
     if message.get('photo'):
         photos = [p for p in message['photo'] if isinstance(p, dict) and p.get('file_id')]
         if photos:
             best = max(photos, key=lambda p: int(p.get('file_size') or 0))
             return best['file_id'], 'telegram-photo.jpg', int(best.get('file_size') or 0)
+    if unsupported_attachment(message):
+        return None
     for key, name in (('voice', 'telegram-voice.ogg'), ('document', 'attachment.bin')):
         value = message.get(key)
         if isinstance(value, dict) and value.get('file_id'):
@@ -130,6 +156,8 @@ def prepare_incoming(api, token: str, message: dict, auth_file: str,
                      *, limit: int = MAX_BYTES) -> Incoming:
     selected = attachment_info(message)
     if selected is None:
+        if unsupported_attachment(message):
+            raise ValueError('Unsupported Telegram media format')
         return Incoming()
     filename, data = download_attachment(api, token, message, limit)
     if message.get('voice'):
