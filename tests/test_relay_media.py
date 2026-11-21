@@ -12,7 +12,8 @@ from relay_media import (
     Incoming, artifact_filenames, attachment_info, download_attachment,
     encode_multipart, markdown_to_telegram_html, prepare_incoming, safe_filename,
     send_file, wants_generated_image, generated_image_keys, find_new_images,
-    unsupported_attachment, supported_document,
+    unsupported_attachment, supported_document, quoted_attachment,
+    prepare_quoted_attachment, animation_info,
 )
 
 
@@ -61,6 +62,43 @@ class Tests(unittest.TestCase):
         self.assertTrue(supported_document({'file_id': 'f', 'file_name': 'source.py'}))
         self.assertFalse(unsupported_attachment({'photo': [{'file_id': 'f'}]}))
         self.assertFalse(unsupported_attachment({'voice': {'file_id': 'f'}}))
+
+    def test_quoted_picture_and_gif_detection(self):
+        photo = {'photo': [{'file_id': 'photo', 'file_size': 4}]}
+        gif = {'animation': {'file_id': 'gif', 'mime_type': 'video/mp4'}}
+        mp4 = {'document': {'file_id': 'clip', 'file_name': 'example.mp4',
+                            'mime_type': 'video/mp4'}}
+        for quoted in (photo, gif, mp4):
+            self.assertIs(quoted_attachment({'text': '@MyBot что здесь?',
+                                              'reply_to_message': quoted}), quoted)
+        self.assertIsNone(quoted_attachment({'text': 'нет вложения'}))
+        self.assertIsNone(quoted_attachment({'text': 'вопрос', 'reply_to_message':
+                                              {'text': 'without media'}}))
+        self.assertEqual(animation_info(mp4)[1], 'example.mp4')
+        self.assertIsNone(attachment_info(mp4))
+
+    def test_quoted_photo_forwards_media(self):
+        quoted = {'photo': [{'file_id': 'source', 'file_size': 10}]}
+        with patch('relay_media.download_attachment',
+                   return_value=('telegram-photo.jpg', b'fake-jpeg')):
+            result = prepare_quoted_attachment(Mock(), 'TOKEN', quoted, 'auth.json')
+        self.assertEqual(result.media, [(b'fake-jpeg', 'telegram-photo.jpg')])
+        self.assertIn('older Telegram attachment', result.prompt)
+
+    def test_quoted_gif_extracts_bounded_frames(self):
+        quoted = {'animation': {'file_id': 'g', 'file_name': 'loop.mp4'}}
+        with patch('relay_media._download_selected', return_value=('loop.mp4', b'mp4-content')):
+            with patch('relay_media.shutil.which', return_value='ffmpeg'):
+                def fake_ffmpeg(args, **kwargs):
+                    directory = Path(args[-1]).parent
+                    (directory / 'sample-01.jpg').write_bytes(b'jpeg1')
+                    (directory / 'sample-02.jpg').write_bytes(b'jpeg2')
+                    return types.SimpleNamespace(returncode=0)
+                with patch('relay_media.subprocess.run', side_effect=fake_ffmpeg):
+                    incoming = prepare_quoted_attachment(Mock(), 'TOKEN', quoted, 'auth.json')
+        self.assertEqual(len(incoming.media), 2)
+        self.assertIn('sampled frames', incoming.prompt)
+        self.assertTrue(all(len(data) > 0 for data, name in incoming.media))
 
     def test_prepare_text_document(self):
         with patch('relay_media.download_attachment',return_value=('source.py',b'print("hi")\n')):

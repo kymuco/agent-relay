@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent_relay import AgentRelay, Config, Cursor, ensure_auth_file, is_addressed, make_prompt, neutralize_peer_mentions, numeric_ids, split_for_telegram, usernames
+from relay_media import Incoming
 
 
 class CoreTests(unittest.TestCase):
@@ -194,6 +195,48 @@ class CoreTests(unittest.TestCase):
                         if x.args[0] == 'sendMessage']
             self.assertEqual(len(messages), 1)
             self.assertIn('не поддерживается', messages[0]['text'])
+
+    def test_addressed_reply_to_photo_passes_image_to_cwa(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cwa.send.return_value.text = 'Это фотография кота.'
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json',
+                         self.peers, self.allowed, self.peer_ids,
+                         state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, media_enabled=True,
+                         media_auto_reply=False)
+            quoted = {'from': {'id': 11}, 'photo': [{'file_id': 'photo'}]}
+            with patch('agent_relay.prepare_quoted_attachment',
+                       return_value=Incoming(prompt='quoted photo',
+                                             media=[(b'jpeg', 'image.jpg')],
+                                             has_file=True)):
+                with patch('builtins.print'):
+                    app = AgentRelay(cfg, api, cwa)
+                    app.process_update({'update_id': 11, 'message': {
+                        'chat': {'id': -123, 'type': 'group'},
+                        'message_id': 20, 'from': self.human,
+                        'text': '@MyBot что на картинке?',
+                        'reply_to_message': quoted}})
+            self.assertIn('quoted photo', cwa.send.call_args.args[0])
+            self.assertEqual(cwa.send.call_args.kwargs['media'], [(b'jpeg', 'image.jpg')])
+
+    def test_unaddressed_reply_to_gif_does_not_trigger_cwa(self):
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            api.call.return_value = {'id': 5, 'username': 'MyBot'}
+            cfg = Config('secret', -123, 'existing-conversation', 'auth.json',
+                         self.peers, self.allowed, self.peer_ids,
+                         state_file=str(Path(folder) / 'cursor.json'),
+                         min_interval_seconds=0, media_enabled=True,
+                         media_auto_reply=True)
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                app.process_update({'update_id': 11, 'message': {
+                    'chat': {'id': -123, 'type': 'group'},
+                    'message_id': 20, 'from': self.human, 'text': 'класс!',
+                    'reply_to_message': {'animation': {'file_id': 'gif'}}}})
+            cwa.send.assert_not_called()
 
 
 

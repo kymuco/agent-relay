@@ -87,6 +87,11 @@ def download_attachment(api, token: str, message: dict, limit: int = MAX_BYTES) 
     selected = attachment_info(message)
     if selected is None:
         raise ValueError('No supported attachment')
+    return _download_selected(api, token, selected, limit)
+
+
+def _download_selected(api, token: str, selected: tuple[str, str, int],
+                       limit: int = MAX_BYTES) -> tuple[str, bytes]:
     file_id, filename, announced_size = selected
     if announced_size > limit:
         raise ValueError('Attachment exceeds size limit')
@@ -110,6 +115,90 @@ def download_attachment(api, token: str, message: dict, limit: int = MAX_BYTES) 
     if not data or len(data) > limit:
         raise ValueError('Empty or oversized Telegram attachment')
     return filename, data
+
+
+def animation_info(message: dict) -> tuple[str, str, int] | None:
+    """Only used for explicitly addressed replies to GIF/video messages."""
+    for key in ('animation', 'video'):
+        value = message.get(key)
+        if isinstance(value, dict) and value.get('file_id'):
+            mime = str(value.get('mime_type') or '').lower()
+            name = safe_filename(value.get('file_name'),
+                                 'quoted-animation.gif' if mime == 'image/gif'
+                                 else 'quoted-animation.mp4')
+            return value['file_id'], name, int(value.get('file_size') or 0)
+    document = message.get('document')
+    if isinstance(document, dict) and document.get('file_id'):
+        mime = str(document.get('mime_type') or '').lower()
+        raw_name = str(document.get('file_name') or '')
+        extension = Path(raw_name).suffix.lower()
+        if mime in ('image/gif', 'video/mp4') or extension in ('.gif', '.mp4'):
+            filename = safe_filename(raw_name,
+                                     'quoted-animation.gif' if mime == 'image/gif'
+                                     else 'quoted-animation.mp4')
+            return document['file_id'], filename, int(document.get('file_size') or 0)
+    return None
+
+
+def quoted_attachment(message: dict) -> dict | None:
+    """Inspect one Telegram reply level; no recursive reply traversal."""
+    if attachment_info(message) is not None or unsupported_attachment(message):
+        return None
+    quoted = message.get('reply_to_message')
+    if not isinstance(quoted, dict):
+        return None
+    if animation_info(quoted) is not None or attachment_info(quoted) is not None:
+        return quoted
+    return None
+
+
+def _animation_frames(data: bytes, filename: str, *, limit: int) -> list[tuple[bytes, str]]:
+    """Decode up to three small JPEG previews. No animation/video audio claims."""
+    if shutil.which('ffmpeg') is None:
+        raise RuntimeError('FFmpeg is required to analyze GIF/video replies')
+    with tempfile.TemporaryDirectory(prefix='agentrelay-quoted-animation-') as td:
+        path = Path(td)
+        source = path / safe_filename(filename, 'animation.mp4')
+        source.write_bytes(data)
+        output = path / 'sample-%02d.jpg'
+        completed = subprocess.run(
+            ['ffmpeg', '-nostdin', '-v', 'error', '-threads', '1',
+             '-i', str(source), '-t', '6',
+             '-vf', 'fps=1,scale=640:-2:force_original_aspect_ratio=decrease',
+             '-frames:v', '3', '-q:v', '5', '-an', '-y', str(output)],
+            capture_output=True, timeout=25, check=False)
+        if completed.returncode != 0:
+            raise ValueError('Cannot decode GIF/video frames with FFmpeg')
+        samples = []
+        total = 0
+        for frame in sorted(path.glob('sample-*.jpg'))[:3]:
+            content = frame.read_bytes()
+            total += len(content)
+            if not content or total > limit:
+                raise ValueError('Decoded GIF preview exceeds size limit')
+            samples.append((content, f'quoted-animation-{len(samples)+1:02d}.jpg'))
+        if not samples:
+            raise ValueError('GIF/video contains no readable frames')
+        return samples
+
+
+def prepare_quoted_attachment(api, token: str, quoted: dict, auth_file: str,
+                              *, limit: int = MAX_BYTES) -> Incoming:
+    """Read the picture or bounded animation the human replied to."""
+    animation = animation_info(quoted)
+    if animation is not None:
+        name, data = _download_selected(api, token, animation, limit)
+        samples = _animation_frames(data, name, limit=limit)
+        return Incoming(
+            prompt=(f'[User replied to a Telegram GIF/video named {name}. '
+                    f'Attached are {len(samples)} sampled frames from its first seconds. '
+                    'These are not the full animation and contain no sound; do not '
+                    'claim to have watched unseen movement or heard audio.]'),
+            media=samples, has_file=True)
+    incoming = prepare_incoming(api, token, quoted, auth_file, limit=limit)
+    if incoming.has_file:
+        incoming.prompt = '[User replied to an older Telegram attachment.]\n' + incoming.prompt
+    return incoming
 
 
 def extract_pdf(data: bytes) -> str:

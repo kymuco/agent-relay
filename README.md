@@ -190,3 +190,18 @@ an existing `.env`.
 - For speech delivery the model receives **per-turn guidance** to use the listener's language, natural spoken sentences, brief responses, and no Markdown, URLs, code fences, emojis, or delivery markers. The model's generated text stays in the private CWA conversation but is **not sent to Telegram** when voice-only TTS succeeds.
 - If TTS synthesis or Telegram voice delivery fails, voice-only mode falls back to **one text answer**. No extra CWA send or automatic retry of uncertain voice delivery occurs.
 - Bot-to-bot `/relay@Peer` traffic remains text-only even if `VOICE_REPLY_MODE=always`.
+
+### Reply to someone else's photo or GIF
+
+An authorized human can address the bot in a **text reply** to a previous
+Telegram photo, image document, or GIF/MP4 animation:
+`@ragnacobot Что происходит на этом GIF?`. AgentRelay reads one
+`reply_to_message` level and attaches the quoted photo to CWA. GIF and MP4
+replies yield up to three small JPEG frames sampled from the first six seconds
+through FFmpeg. Frame samples are **not video understanding**: no audio,
+unseen motion, or events outside the sampled seconds are available.
+All downloads retain the 10 MB limit and safe Telegram-domain handling.
+Unaddressed replies remain silent even with `MEDIA_AUTO_REPLY=on`; ordinary
+unaddressed GIFs continue to be ignored. GIF support requires FFmpeg on the
+host. If Telegram omits media identifiers in the quoted message, the bot
+cannot retrieve those bytes.
