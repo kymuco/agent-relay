@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
+import threading
 import sys
 import tempfile
 import time
@@ -15,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_control import ControlState
 from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff, trusted_sender
 from relay_media import (attachment_info, artifact_filenames, find_new_images,
                          generated_image_keys, markdown_to_telegram_html,
@@ -92,6 +95,7 @@ class Config:
     model: str = ''
     effort: str = ''
     state_file: str = '.agent-relay-state.json'
+    control_file: str = '.agent-relay-control.json'
     min_interval_seconds: float = 2.0
     group_context_limit: int = 30
     bot_aliases: tuple[str, ...] = ()
@@ -151,6 +155,7 @@ class Config:
             model=os.getenv('CWA_MODEL', '').strip(),
             effort=os.getenv('CWA_REASONING_EFFORT', '').strip(),
             state_file=os.getenv('STATE_FILE', '.agent-relay-state.json'),
+            control_file=os.getenv('CONTROL_FILE', '.agent-relay-control.json'),
             min_interval_seconds=interval,
             group_context_limit=group_context_limit,
             bot_aliases=bot_aliases,
@@ -316,6 +321,7 @@ class Cursor:
     """At-most-once delivery to CWA: record before any external send."""
     def __init__(self, filename: str):
         self.path = Path(filename)
+        self._lock = threading.Lock()
         if self.path.exists():
             data = json.loads(self.path.read_text(encoding='utf-8'))
             self.offset = int(data['offset'])
@@ -323,16 +329,17 @@ class Cursor:
             self.offset = 0
 
     def advance(self, offset: int) -> None:
-        if offset <= self.offset:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_name(self.path.name + '.tmp')
-        with temp.open('w', encoding='utf-8') as stream:
-            json.dump({'offset': offset}, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, self.path)
-        self.offset = offset
+        with self._lock:
+            if offset <= self.offset:
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.path.with_name(self.path.name + '.tmp')
+            with temp.open('w', encoding='utf-8') as stream:
+                json.dump({'offset': offset}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, self.path)
+            self.offset = offset
 
 
 class AgentRelay:
@@ -341,6 +348,7 @@ class AgentRelay:
         self.api = api
         self.client = client
         self.cursor = Cursor(config.state_file)
+        self.control = ControlState(config.control_file)
         self.last_send_time = float('-inf')
         self.group_context = GroupAwareness(config.group_context_limit)
         self.peer_reply_id: int | None = None
@@ -369,26 +377,52 @@ class AgentRelay:
         return True
 
     def _send_ready_images(self, baseline: set[tuple[str, str]],
-                           reply_message_id: int | None = None) -> int:
+                           reply_message_id: int | None = None,
+                           run_generation: int | None = None) -> int:
         observations = find_new_images(self.client, self.config.conversation_id, baseline)
         delivered = 0
         with tempfile.TemporaryDirectory(prefix='agentrelay-image-') as td:
             for image in observations:
+                if run_generation is not None and not self.control.permits(run_generation):
+                    return delivered
                 data = read_verified_artifact(self.client, self.config.conversation_id,
                                               image.filename, Path(td),
                                               max_bytes=self.config.max_media_bytes)
                 method = ('sendPhoto' if image.filename.lower().endswith(('.png', '.jpg', '.jpeg'))
                           else 'sendDocument')
+                if run_generation is not None and not self.control.permits(run_generation):
+                    return delivered
                 send_file(self.config.telegram_token, method, self.config.chat_id,
                           data, image.filename, reply_message_id=reply_message_id)
                 delivered += 1
         return delivered
 
-    def process_update(self, update: dict[str, Any]) -> None:
+    def _control_command(self, message: dict[str, Any]) -> str | None:
+        """Control authority belongs only to allowed humans in this group."""
+        chat = message.get('chat') or {}
+        if chat.get('id') != self.config.chat_id or chat.get('type') not in ('group', 'supergroup'):
+            return None
+        if not trusted_sender(message, self.config.allowed_user_ids, self.config.peers,
+                              self.config.peer_bot_ids, self.bot_id):
+            return None
+        if (message.get('from') or {}).get('is_bot'):
+            return None
+        words = str(message.get('text') or '').strip().split(maxsplit=1)
+        first = words[0].lower() if words else ''
+        if first in ('/stop', f'/stop@{self.bot_username}'.lower()):
+            return 'stop'
+        if first in ('/resume', f'/resume@{self.bot_username}'.lower()):
+            return 'resume'
+        return None
+
+    def process_update(self, update: dict[str, Any], *,
+                       preadvanced: bool = False,
+                       expected_generation: int | None = None) -> None:
         update_id = int(update['update_id'])
-        if update_id < self.cursor.offset:
-            return
-        self.cursor.advance(update_id + 1)  # fail closed; no duplicate CWA send after crash
+        if not preadvanced:
+            if update_id < self.cursor.offset:
+                return
+            self.cursor.advance(update_id + 1)  # at-most-once CWA admission
         message = update.get('message') or {}
         chat = message.get('chat') or {}
         if chat.get('id') != self.config.chat_id or chat.get('type') not in ('group', 'supergroup'):
@@ -396,7 +430,28 @@ class AgentRelay:
         if not trusted_sender(message, self.config.allowed_user_ids, self.config.peers,
                               self.config.peer_bot_ids, self.bot_id):
             return
-        # Observe trusted group text, never call CWA just to remember.
+        control_command = self._control_command(message)
+        if control_command:
+            if control_command == 'stop':
+                changed = self.control.stop()
+                self._stop_peer_reply()
+                self.pending_image_baseline = None
+                status = ('Остановлен. Для продолжения отправь /resume.'
+                          if changed else 'Уже остановлен. Для продолжения отправь /resume.')
+            else:
+                changed = self.control.resume()
+                status = 'Продолжаю работу.' if changed else 'Уже работаю.'
+            self.api.call('sendMessage', {
+                'chat_id': self.config.chat_id, 'text': status,
+                'reply_parameters': {'message_id': message['message_id'],
+                                     'allow_sending_without_reply': True},
+            })
+            return
+        run_generation = (self.control.generation() if expected_generation is None
+                          else expected_generation)
+        if not self.control.permits(run_generation):
+            return
+        # Observe trusted group text only while running.
         self.group_context.remember(message)
         sender = message.get('from') or {}
         sender_is_bot = bool(sender.get('is_bot'))
@@ -473,6 +528,8 @@ class AgentRelay:
             now = time.monotonic()
             if not self._active_peer_reply(peer_id):
                 return
+        if not self.control.permits(run_generation):
+            return
         self.last_send_time = now
         prompt = make_prompt(
             message, self.config.peers,
@@ -523,7 +580,13 @@ class AgentRelay:
         if self.config.effort:
             params['reasoning_effort'] = self.config.effort
         try:
+            if not self.control.permits(run_generation):
+                return
             result = self.client.send(prompt, **params)
+            # A stop during CWA can never be rolled back. The answer is
+            # discarded even if /resume has been received in the meantime.
+            if not self.control.permits(run_generation):
+                return
             text = str(result.text or '').strip()
             if not text and not generation_requested:
                 raise RuntimeError('Empty CWA response')
@@ -553,12 +616,14 @@ class AgentRelay:
                 # it must appear literally at the start of Telegram text.
                 parts[-1] = f'/relay@{peer_destination} {parts[-1]}'
             voice_delivered = False
-            if delivery_mode == 'voice' and text:
+            if delivery_mode == 'voice' and text and self.control.permits(run_generation):
                 # Voice-only: synthesize and publish BEFORE any text. If either
                 # step fails, send the existing model text instead; never retry
                 # an ambiguous voice publish automatically.
                 try:
                     ogg = synthesize_voice(self.client, text)
+                    if not self.control.permits(run_generation):
+                        return
                     send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,
                               ogg, 'ragna-voice.ogg', reply_message_id=message['message_id'])
                     voice_delivered = True
@@ -567,6 +632,8 @@ class AgentRelay:
                           f'{type(exc).__name__}', file=sys.stderr)
             if not voice_delivered:
                 for index, part in enumerate(parts):
+                    if not self.control.permits(run_generation):
+                        return
                     markup = markdown_to_telegram_html(part)
                     valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096
                     outgoing: dict[str, Any] = {
@@ -585,10 +652,15 @@ class AgentRelay:
                     if message.get('message_thread_id'):
                         outgoing['message_thread_id'] = message['message_thread_id']
                     self.api.call('sendMessage', outgoing)
+            if not self.control.permits(run_generation):
+                return
             if not sender_is_bot and self.config.media_enabled:
                 if before_images is not None:
                     try:
-                        count = self._send_ready_images(before_images, reply_message_id=message['message_id'])
+                        if not self.control.permits(run_generation):
+                            return
+                        count = self._send_ready_images(before_images, reply_message_id=message['message_id'],
+                                                        run_generation=run_generation)
                         if count:
                             self.pending_image_baseline = None
                         elif not text:
@@ -606,6 +678,8 @@ class AgentRelay:
                                 data = read_verified_artifact(
                                     self.client, self.config.conversation_id,
                                     filename, Path(td), max_bytes=self.config.max_media_bytes)
+                                if not self.control.permits(run_generation):
+                                    return
                                 send_file(self.config.telegram_token, 'sendDocument', self.config.chat_id,
                                           data, filename, reply_message_id=message['message_id'])
                             except Exception as exc:
@@ -613,6 +687,8 @@ class AgentRelay:
                 if delivery_mode == 'both' and text:
                     try:
                         ogg = synthesize_voice(self.client, text)
+                        if not self.control.permits(run_generation):
+                            return
                         send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,
                                   ogg, 'ragna-voice.ogg', reply_message_id=message['message_id'])
                     except Exception as exc:
@@ -636,6 +712,23 @@ class AgentRelay:
             print(f'Update {update_id} stopped; {type(exc).__name__}. No retry.', file=sys.stderr)
 
     def serve(self) -> None:
+        # One non-reentrant CWA worker; poll Telegram independently for
+        # /stop and /resume even while generation or speech is in progress.
+        work_queue: queue.Queue[tuple[dict[str, Any], int]] = queue.Queue(maxsize=32)
+
+        def worker() -> None:
+            while True:
+                update, generation = work_queue.get()
+                try:
+                    if self.control.permits(generation):
+                        self.process_update(update, preadvanced=True,
+                                            expected_generation=generation)
+                except Exception as exc:
+                    print(f'Worker update failed: {type(exc).__name__}', file=sys.stderr)
+                finally:
+                    work_queue.task_done()
+
+        threading.Thread(target=worker, name='AgentRelayWorker', daemon=True).start()
         info = self.api.call('getWebhookInfo')
         if info.get('url'):
             raise RuntimeError('Telegram webhook is set; remove it before starting long polling')
@@ -652,7 +745,19 @@ class AgentRelay:
                     'allowed_updates': ['message'],
                 }, timeout=45)
                 for item in updates:
-                    self.process_update(item)
+                    update_id = int(item['update_id'])
+                    if update_id < self.cursor.offset:
+                        continue
+                    self.cursor.advance(update_id + 1)
+                    if self._control_command(item.get('message') or {}):
+                        # A human emergency command outranks a running worker.
+                        self.process_update(item, preadvanced=True)
+                    elif not self.control.paused:
+                        try:
+                            work_queue.put_nowait((item, self.control.generation()))
+                        except queue.Full:
+                            print('Worker queue full: update dropped without replay',
+                                  file=sys.stderr)
             except KeyboardInterrupt:
                 print('Stopped.')
                 break

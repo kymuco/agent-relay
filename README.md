@@ -205,3 +205,22 @@ Unaddressed replies remain silent even with `MEDIA_AUTO_REPLY=on`; ordinary
 unaddressed GIFs continue to be ignored. GIF support requires FFmpeg on the
 host. If Telegram omits media identifiers in the quoted message, the bot
 cannot retrieve those bytes.
+
+### Emergency /stop and /resume (Ragna and Mirri independently)
+
+Send `/stop@ragnacobot` to stop Ragna or `/stop@MirriMmannnBot`
+to stop Mirri. Send corresponding `/resume@...` to resume; bare `/stop`
+and `/resume` are understood by **each bot** in the group. Only allowlisted
+human Telegram IDs can control the bot; peer bots and model output cannot.
+Control commands are never sent to ChatGPT. They bypass per-turn cooldown
+and are accepted while a separate worker is waiting on CWA/TTS. An in-flight
+CWA submission cannot be reliably cancelled, but its response is invalidated:
+no new Telegram text, voice, image, or document should be sent from that
+generation after the stop has been processed. Network sends already underway
+cannot be recalled or guaranteed to be cancelled. Work queued before stop
+is invalidated even if resume happens quickly.
+
+Stop state is persisted in `CONTROL_FILE=.agent-relay-control.json` and
+survives process restart. The stopped bot discards new requests until resume.
+Unlike `/stoprelay` (which only closes a bot-to-bot session), `/stop`
+disables all AI responses and aborts session continuity.
