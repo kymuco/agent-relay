@@ -33,6 +33,44 @@ def usernames(value: str) -> frozenset[str]:
     return frozenset(part.strip().lstrip('@').lower() for part in value.split(',') if part.strip())
 
 
+def numeric_ids(value: str, label: str) -> frozenset[int]:
+    """Positive Telegram actor IDs; never authorize a mutable username alone."""
+    parts = [part.strip() for part in value.split(',') if part.strip()]
+    if any(not part.isascii() or not part.isdecimal() or int(part) <= 0 for part in parts):
+        raise ValueError(f'{label} must contain positive numeric Telegram IDs')
+    return frozenset(int(part) for part in parts)
+
+
+def ensure_auth_file(auth_file: str) -> None:
+    """Accept a manually supplied CWA file, including raw /api/auth/session JSON.
+
+    Never acquire credentials, open browsers, or emit their contents. CWA owns
+    subsequent token/session checks; this is only a local, fail-closed preflight.
+    """
+    target = Path(auth_file).expanduser()
+    if not target.is_file():
+        raise ValueError(
+            'CWA authorization missing. Put your own auth_data.json beside '
+            'agent_relay.py (or set CWA_AUTH_FILE to its local path).'
+        )
+    try:
+        if target.stat().st_size > 1024 * 1024:
+            raise ValueError('CWA authorization JSON exceeds the safe size limit')
+        payload = json.loads(target.read_text(encoding='utf-8-sig'))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError('CWA authorization JSON cannot be read or parsed') from None
+    if not isinstance(payload, dict) or not isinstance(payload.get('accessToken'), str) or not payload['accessToken'].strip():
+        raise ValueError('CWA authorization JSON must contain an accessToken')
+    cookies = payload.get('cookies')
+    has_cookie = isinstance(cookies, dict) and any(
+        name.startswith('__Secure-next-auth.session-token') and bool(value)
+        for name, value in cookies.items() if isinstance(name, str)
+    )
+    has_session = isinstance(payload.get('sessionToken'), str) and bool(payload['sessionToken'].strip())
+    if not has_cookie and not has_session:
+        raise ValueError('CWA authorization JSON must contain a sessionToken or ChatGPT session cookie')
+
+
 @dataclass(frozen=True)
 class Config:
     telegram_token: str
@@ -40,6 +78,8 @@ class Config:
     conversation_id: str
     auth_file: str
     peers: frozenset[str]
+    allowed_user_ids: frozenset[int] = frozenset()
+    peer_bot_ids: frozenset[int] = frozenset()
     model: str = ''
     effort: str = ''
     state_file: str = '.agent-relay-state.json'
@@ -48,13 +88,20 @@ class Config:
     @classmethod
     def from_env(cls) -> 'Config':
         load_dotenv()
-        required = ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'CWA_CONVERSATION_ID')
+        required = ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'CWA_CONVERSATION_ID', 'ALLOWED_USER_IDS')
         missing = [name for name in required if not os.environ.get(name, '').strip()]
         if missing:
             raise ValueError('Missing configuration: ' + ', '.join(missing))
         chat_id = int(os.environ['TELEGRAM_CHAT_ID'])
         if chat_id >= 0:
             raise ValueError('TELEGRAM_CHAT_ID must be a group or supergroup ID (negative integer)')
+        allowed = numeric_ids(os.environ['ALLOWED_USER_IDS'], 'ALLOWED_USER_IDS')
+        if not allowed:
+            raise ValueError('ALLOWED_USER_IDS must list at least one human Telegram ID')
+        peers = usernames(os.getenv('PEER_BOT_USERNAMES', ''))
+        bot_ids = numeric_ids(os.getenv('PEER_BOT_IDS', ''), 'PEER_BOT_IDS')
+        if bool(peers) != bool(bot_ids):
+            raise ValueError('Configure both PEER_BOT_USERNAMES and PEER_BOT_IDS, or neither')
         interval = float(os.getenv('MIN_INTERVAL_SECONDS', '2'))
         if interval < 0:
             raise ValueError('MIN_INTERVAL_SECONDS must not be negative')
@@ -63,7 +110,9 @@ class Config:
             chat_id=chat_id,
             conversation_id=os.environ['CWA_CONVERSATION_ID'].strip(),
             auth_file=os.getenv('CWA_AUTH_FILE', 'auth_data.json'),
-            peers=usernames(os.getenv('PEER_BOT_USERNAMES', '')),
+            peers=peers,
+            allowed_user_ids=allowed,
+            peer_bot_ids=bot_ids,
             model=os.getenv('CWA_MODEL', '').strip(),
             effort=os.getenv('CWA_REASONING_EFFORT', '').strip(),
             state_file=os.getenv('STATE_FILE', '.agent-relay-state.json'),
@@ -71,18 +120,29 @@ class Config:
         )
 
 
-def is_addressed(message: dict[str, Any], username: str, bot_id: int, peers: frozenset[str]) -> bool:
-    """Human @mention/reply, or allowlisted bot explicit @mention only."""
+def is_addressed(
+    message: dict[str, Any], username: str, bot_id: int,
+    peers: frozenset[str], allowed_user_ids: frozenset[int] = frozenset(),
+    peer_bot_ids: frozenset[int] = frozenset(),
+) -> bool:
+    """Fail-closed caller allowlist, then explicit @mention or human Reply."""
+    if message.get('sender_chat'):
+        return False  # anonymous group admins/channels have no trusted user identity
     sender = message.get('from') or {}
+    sender_id = sender.get('id')
+    if not isinstance(sender_id, int) or isinstance(sender_id, bool):
+        return False
     if sender.get('is_bot'):
-        if str(sender.get('username') or '').lower() not in peers:
+        if sender_id not in peer_bot_ids or str(sender.get('username') or '').lower() not in peers:
             return False
+    elif sender_id not in allowed_user_ids:
+        return False
     text = message.get('text') or ''
     mention = bool(re.search(r'(?<![\w@])@' + re.escape(username) + r'\b', text, re.IGNORECASE))
     if mention:
         return True
     if sender.get('is_bot'):
-        return False  # no bot-to-bot reply triggers; no ping-pong
+        return False  # no bot-to-bot Reply triggers; no ping-pong
     replied = (message.get('reply_to_message') or {}).get('from') or {}
     return replied.get('id') == bot_id
 
@@ -194,9 +254,13 @@ class AgentRelay:
             return
         self.cursor.advance(update_id + 1)  # fail closed; no duplicate CWA send after crash
         message = update.get('message') or {}
-        if (message.get('chat') or {}).get('id') != self.config.chat_id:
+        chat = message.get('chat') or {}
+        if chat.get('id') != self.config.chat_id or chat.get('type') not in ('group', 'supergroup'):
             return
-        if not is_addressed(message, self.bot_username, self.bot_id, self.config.peers):
+        if not is_addressed(
+            message, self.bot_username, self.bot_id, self.config.peers,
+            self.config.allowed_user_ids, self.config.peer_bot_ids,
+        ):
             return
         now = time.monotonic()
         if now - self.last_send_time < self.config.min_interval_seconds:
@@ -261,6 +325,7 @@ class AgentRelay:
 def main() -> None:
     try:
         config = Config.from_env()
+        ensure_auth_file(config.auth_file)
         from chatgpt_web_adapter import BrowserlessHTTPClient
         api = Telegram(config.telegram_token)
         client = BrowserlessHTTPClient(auth_file=config.auth_file)
