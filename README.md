@@ -142,3 +142,13 @@ may change without notice. Inbound documents are sent to the owner's ChatGPT
 conversation; users should agree on group sharing and avoid sending secrets.
 The local isolated tests mock external requests; successful live Telegram/CWA
 image generation, voice and PDF handling remain to be verified by each owner.
+
+### Fix: continuous peer Reply without typed /reply
+
+When `PEER_REPLY_MODE=on`, **either** a verified peer's `/relay@Bot`
+command **or** its ordinary `@Bot` mention starts a native Telegram Reply
+session. Replies are sent with Bot API `reply_parameters.message_id`; there
+is no literal `/reply` command in the message body. Subsequent direct
+Replies within the session are accepted without another @mention. The
+existing session timeout, `/stoprelay`, actor allowlists and
+`[[stop_dialogue]]` behavior still apply.

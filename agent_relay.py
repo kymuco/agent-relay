@@ -216,8 +216,9 @@ def make_prompt(message: dict[str, Any], peers: frozenset[str], history: str = '
         'When replying to another bot in an active dialogue, your answer is delivered '
         'as Telegram Reply automatically. Continue the discussion naturally, but '
         'if your conversation is complete append [[stop_dialogue]] to your answer. '
-        'Do not hand off explicitly when replying to another bot. '
-        'The relay will convert that marker into an @mention for you.\n'
+        'Do not hand off explicitly when replying to another bot: no @mention, '
+        'no /reply command and no [[handoff:...]] marker are needed. '
+        'The relay sets native Telegram Reply metadata automatically.\n'
         f'{recent}'
         f'Sender ({kind}): {author}\n'
         f'{quoted}Message:\n{str(message.get("text") or message.get("caption") or "")[:12000]}\n'
@@ -384,20 +385,25 @@ class AgentRelay:
                 print(f'Image readback stopped; {type(exc).__name__}.', file=sys.stderr)
             return
         peer_id = int(sender['id'])
-        peer_command = sender_is_bot and first_word == f'/relay@{self.bot_username}'.lower()
         reply_to = (message.get('reply_to_message') or {}).get('from') or {}
+        # Verified peer's direct @mention also establishes a Reply session.
+        # Previously only /relay@Username did; a regular @mention produced
+        # a text response but no Telegram reply_parameters, breaking the chain.
+        addressed = is_addressed(
+            message, self.bot_username, self.bot_id, self.config.peers,
+            self.config.allowed_user_ids, self.config.peer_bot_ids, self.config.bot_aliases,
+        )
+        peer_direct = sender_is_bot and addressed
         peer_reply = (sender_is_bot and reply_to.get('id') == self.bot_id
                       and self._active_peer_reply(peer_id))
         attached = self.config.media_enabled and not sender_is_bot and attachment_info(message) is not None
         automatic_media = attached and self.config.media_auto_reply
-        if not is_addressed(
-            message, self.bot_username, self.bot_id, self.config.peers,
-            self.config.allowed_user_ids, self.config.peer_bot_ids, self.config.bot_aliases,
-        ) and not peer_reply and not automatic_media:
+        if not addressed and not peer_reply and not automatic_media:
             return
-        if peer_command:
+        if peer_direct:
             self._start_peer_reply(peer_id)
-        continuing_peer = sender_is_bot and self._active_peer_reply(peer_id) and (peer_command or peer_reply)
+        continuing_peer = (sender_is_bot and self._active_peer_reply(peer_id)
+                           and (peer_direct or peer_reply))
         now = time.monotonic()
         if now - self.last_send_time < self.config.min_interval_seconds:
             if not continuing_peer:
