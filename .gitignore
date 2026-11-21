@@ -8,3 +8,4 @@ auth_data.json
 .agent-relay-state.json
 .agent-relay-state.json.tmp
 .env.tmp
+.runtime/
