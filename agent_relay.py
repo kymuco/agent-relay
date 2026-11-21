@@ -458,6 +458,13 @@ class AgentRelay:
         text_in = str(message.get('text') or message.get('caption') or '')
         command = text_in.strip().split(maxsplit=1)
         first_word = command[0].lower() if command else ''
+        # Never let a trusted peer bot use a human-only control command as
+        # a model turn or as authority over this agent.
+        if sender_is_bot and first_word in (
+                '/stop', '/resume',
+                f'/stop@{self.bot_username}'.lower(),
+                f'/resume@{self.bot_username}'.lower()):
+            return
         stop_commands = {'/stoprelay', f'/stoprelay@{self.bot_username}'.lower()}
         if not sender_is_bot and first_word in stop_commands:
             if self.config.peer_reply_mode:
