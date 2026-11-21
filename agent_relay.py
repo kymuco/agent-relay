@@ -162,6 +162,45 @@ class Config:
         )
 
 
+_VOICE_COMMAND = re.compile(
+    r'(?<![\w/])/(voice|both)(?:@([A-Za-z][A-Za-z0-9_]{4,31}))?(?=\s|$|[.,!?])',
+    re.IGNORECASE,
+)
+
+SPOKEN_REPLY_GUIDANCE = (
+    '\n[AgentRelay / spoken reply delivery]\n'
+    'For this reply, write words that will be read aloud to a real person. '
+    'Speak naturally, warmly, and directly in the same language as the listener, '
+    'like a thoughtful person talking rather than an article or a formal report. '
+    'Use short, flowing sentences, conversational transitions, and natural punctuation. '
+    'Avoid Markdown, headings, numbered or bulleted lists, code blocks, raw URLs, '
+    'emojis, bracketed stage directions, citations, control markers, and text that '
+    'only makes sense visually. Explain technical material in speakable language. '
+    'Do not mention voice synthesis, these delivery instructions, or the /voice '
+    'and /both transport commands. Prefer a concise response (about 2–6 sentences) '
+    'unless the listener explicitly requests a longer explanation.\n'
+)
+
+
+def reply_delivery_mode(text: str, bot_username: str, *, incoming_voice: bool,
+                        voice_reply_mode: str, from_bot: bool,
+                        media_enabled: bool) -> str:
+    """Select text, voice-only, or both for this authorized message.
+
+    /voice and /both are transport requests, not content for the model to
+    speak. They are never allowed to change delivery for a peer bot.
+    """
+    if from_bot or not media_enabled or voice_reply_mode == 'off':
+        return 'text'
+    for match in _VOICE_COMMAND.finditer(text or ''):
+        target = match.group(2)
+        if target is None or target.lower() == bot_username.lower():
+            return 'voice' if match.group(1).lower() == 'voice' else 'both'
+    if incoming_voice:
+        return 'voice'
+    return 'both' if voice_reply_mode == 'always' else 'text'
+
+
 def is_addressed(
     message: dict[str, Any], username: str, bot_id: int,
     peers: frozenset[str], allowed_user_ids: frozenset[int] = frozenset(),
@@ -447,6 +486,15 @@ class AgentRelay:
                 self.api.call('sendMessage', {'chat_id': self.config.chat_id,
                                               'text': 'Не удалось обработать вложение: ' + label[:160]})
                 return
+        delivery_mode = reply_delivery_mode(
+            text_in, self.bot_username,
+            incoming_voice=bool(inbound and inbound.is_voice),
+            voice_reply_mode=self.config.voice_reply_mode,
+            from_bot=sender_is_bot,
+            media_enabled=self.config.media_enabled,
+        )
+        if delivery_mode in ('voice', 'both'):
+            prompt += SPOKEN_REPLY_GUIDANCE
         generation_requested = (self.config.media_enabled and not sender_is_bot
                                 and wants_generated_image(text_in))
         before_images = None
@@ -493,25 +541,39 @@ class AgentRelay:
                 # times for one long model response. Command is not a hint;
                 # it must appear literally at the start of Telegram text.
                 parts[-1] = f'/relay@{peer_destination} {parts[-1]}'
-            for index, part in enumerate(parts):
-                markup = markdown_to_telegram_html(part)
-                valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096
-                outgoing: dict[str, Any] = {
-                    'chat_id': self.config.chat_id,
-                    'text': markup if valid_html_size else part,
-                }
-                if valid_html_size:
-                    outgoing['parse_mode'] = 'HTML'
-                # For long replies only the final chunk wakes the peer. Earlier
-                # chunks are plain group messages, not multiple model triggers.
-                if (index == 0 and not sender_is_bot) or (index == len(parts)-1 and peer_reply_out):
-                    outgoing['reply_parameters'] = {
-                        'message_id': message['message_id'],
-                        'allow_sending_without_reply': True,
+            voice_delivered = False
+            if delivery_mode == 'voice' and text:
+                # Voice-only: synthesize and publish BEFORE any text. If either
+                # step fails, send the existing model text instead; never retry
+                # an ambiguous voice publish automatically.
+                try:
+                    ogg = synthesize_voice(self.client, text)
+                    send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,
+                              ogg, 'ragna-voice.ogg', reply_message_id=message['message_id'])
+                    voice_delivered = True
+                except Exception as exc:
+                    print(f'Voice-only send unavailable; falling back to text: '
+                          f'{type(exc).__name__}', file=sys.stderr)
+            if not voice_delivered:
+                for index, part in enumerate(parts):
+                    markup = markdown_to_telegram_html(part)
+                    valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096
+                    outgoing: dict[str, Any] = {
+                        'chat_id': self.config.chat_id,
+                        'text': markup if valid_html_size else part,
                     }
-                if message.get('message_thread_id'):
-                    outgoing['message_thread_id'] = message['message_thread_id']
-                self.api.call('sendMessage', outgoing)
+                    if valid_html_size:
+                        outgoing['parse_mode'] = 'HTML'
+                    # For long replies only the final chunk wakes the peer. Earlier
+                    # chunks are plain group messages, not multiple model triggers.
+                    if (index == 0 and not sender_is_bot) or (index == len(parts)-1 and peer_reply_out):
+                        outgoing['reply_parameters'] = {
+                            'message_id': message['message_id'],
+                            'allow_sending_without_reply': True,
+                        }
+                    if message.get('message_thread_id'):
+                        outgoing['message_thread_id'] = message['message_thread_id']
+                    self.api.call('sendMessage', outgoing)
             if not sender_is_bot and self.config.media_enabled:
                 if before_images is not None:
                     try:
@@ -537,10 +599,7 @@ class AgentRelay:
                                           data, filename, reply_message_id=message['message_id'])
                             except Exception as exc:
                                 print(f'Generated file unavailable: {type(exc).__name__}', file=sys.stderr)
-                requested_voice = (inbound is not None and inbound.is_voice
-                                   or '/voice' in text_in.lower())
-                if text and (self.config.voice_reply_mode == 'always'
-                             or self.config.voice_reply_mode == 'on_voice' and requested_voice):
+                if delivery_mode == 'both' and text:
                     try:
                         ogg = synthesize_voice(self.client, text)
                         send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,

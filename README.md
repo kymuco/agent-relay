@@ -180,3 +180,13 @@ To prevent auto-replies to ordinary photos, voice and supported documents too,
 set `MEDIA_AUTO_REPLY=off` in the existing local `.env` and restart.
 The shipped `.env.example` now defaults to `off`; it never overwrites
 an existing `.env`.
+
+### Natural spoken answers: /voice and /both (v0.5)
+
+- With `VOICE_REPLY_MODE=on_voice`, `@YourBot /voice Привет` sends **only a Telegram voice message**. `@YourBot /both Привет` sends the **text and voice**. A regular addressed text message remains text-only.
+- A Telegram voice input (when accepted by the ordinary addressed-message or `MEDIA_AUTO_REPLY` gate) produces **voice only** by default. If `MEDIA_AUTO_REPLY=off`, voice inputs still need an addressed caption or a Reply to the bot; it is not an ambient listener.
+- With `VOICE_REPLY_MODE=always`, ordinary human turns remain text+voice (prior behavior); explicit `/voice` requests voice-only. `VOICE_REPLY_MODE=off` disables voice synthesis, including explicit requests.
+- Commands can also target the bot: `/voice@YourBotUsername` and `/both@YourBotUsername`. In a group with two bots, a bare `/voice` does not automatically address either bot. This prevents unintended double replies.
+- For speech delivery the model receives **per-turn guidance** to use the listener's language, natural spoken sentences, brief responses, and no Markdown, URLs, code fences, emojis, or delivery markers. The model's generated text stays in the private CWA conversation but is **not sent to Telegram** when voice-only TTS succeeds.
+- If TTS synthesis or Telegram voice delivery fails, voice-only mode falls back to **one text answer**. No extra CWA send or automatic retry of uncertain voice delivery occurs.
+- Bot-to-bot `/relay@Peer` traffic remains text-only even if `VOICE_REPLY_MODE=always`.
