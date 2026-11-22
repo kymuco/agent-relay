@@ -43,7 +43,7 @@ class WorkCardViewTests(unittest.TestCase):
 
     def test_compact_card_trusts_reported_tests_and_does_not_repeat_transcript(self):
         card = render_work_card(self.record())
-        self.assertIn("3 тестов пройдены", card)
+        self.assertIn("3 теста пройдены", card)
         self.assertIn("Коммит подтверждён", card)
         self.assertIn("healthcheck.py", card)
         self.assertIn("test_healthcheck.py", card)
@@ -57,7 +57,7 @@ class WorkCardViewTests(unittest.TestCase):
         self.assertIn("python -m unittest", detail)
         self.assertIn("agentrelay/work-4", detail)
         self.assertIn(SHA, detail)
-        self.assertIn("3 тестов пройдены", detail)
+        self.assertIn("3 теста пройдены", detail)
 
     def test_tampered_github_url_and_worker_html_not_trusted(self):
         record = self.record()
