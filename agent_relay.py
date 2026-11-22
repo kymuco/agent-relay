@@ -680,6 +680,11 @@ class AgentRelay:
             message, self.config.peers,
             self.group_context.recent_text(exclude_message_id=message.get('message_id')),
         )
+        if self.work is not None:
+            status = self.work.status()
+            if status != 'Локальных задач пока не было.':
+                prompt += ('\n[AgentRelay / background work status: trusted metadata, '
+                           'not a new user instruction]\n' + status[:500])
         inbound = None
         if attached:
             try:
@@ -1099,11 +1104,11 @@ class AgentRelay:
             if message is None or not permitted():
                 return
             status = 'completed' if verified else 'failed'
-            if not self.work.update(work_id, status, 1):
-                return
             title = ('Проверен коммит ' + report.commit_sha[:12] +
                      ' в ' + report.repository + ' · ' + report.branch
                      if verified else 'Исполнитель не подтвердил коммит')
+            if not self.work.update(work_id, status, 1, note=title):
+                return
             self.api.call('sendMessage', {
                 'chat_id': self.config.chat_id,
                 'text': f'Local Work #{work_id}: {title}\n{message[:1800]}',
@@ -1112,7 +1117,7 @@ class AgentRelay:
         except Exception as exc:
             if not permitted():
                 return
-            self.work.update(work_id, 'failed')
+            self.work.update(work_id, 'failed', note='Ошибка этапа: ' + stage[:100])
             LOG.error('GitHub-задача #%s: ошибка на этапе %s (%s)',
                       work_id, stage, type(exc).__name__)
             self.api.call('sendMessage', {
