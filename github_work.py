@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from local_codex import normalize_decision_envelope, _unique_json_object, _child_environment
+from relay_logging import LOG
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _BRANCH = re.compile(r"^(?!-)(?!.*(?:\.\.|@\{|\\|//|[\x00-\x20~^:?*\[\]]))"
@@ -211,6 +212,7 @@ class BackgroundDeveloper:
         returned_id = response_conversation_id(result)
         if not conversation:
             self.registry.remember(lane, returned_id)
+            LOG.info('Создан постоянный чат %s · GPT-6 High', lane)
         elif returned_id != conversation:
             raise ValueError("CWA returned a different conversation ID; refusing to continue")
         return str(getattr(result, "text", "") or "")
