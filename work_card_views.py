@@ -38,7 +38,14 @@ def _plain(value: Any, limit: int) -> str:
 
 
 def _h(value: Any, limit: int) -> str:
-    return html.escape(_plain(value, limit), quote=True)
+    # Bound the *escaped* output, not only the raw text. A hostile Developer
+    # report containing thousands of ampersands must not overflow Telegram.
+    original = _plain(value, limit)
+    escaped = html.escape(original, quote=True)
+    while len(escaped) > limit:
+        original = original[:max(0, len(original) - max(1, (len(escaped) - limit) // 2))]
+        escaped = html.escape(original, quote=True)
+    return escaped
 
 
 def _worker_test_count(text: str) -> int | None:
@@ -150,7 +157,14 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
         note = record.get("note", "")
         if note and phase in ("failed", "stopped", "interrupted", "needs_review"):
             lines.append("\n" + _h(note, 200))
-    return "\n".join(lines)[:3500]
+    # Each line is independently escaped/closed, so trimming by whole lines
+    # cannot break a Telegram HTML tag or entity.
+    kept: list[str] = []
+    for line in lines:
+        if sum(len(item) + 1 for item in kept) + len(line) > 3800:
+            break
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def journal_event(phase: str, note: str = "") -> dict[str, str]:
