@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from relay_logging import LOG
+from work_card_views import (render_work_card, render_work_journal,
+                             journal_event, work_keyboard)
 
 
 class TypingPulse:
@@ -100,91 +102,202 @@ def format_work_progress(work_id: int, project: str, task: str,
 
 
 class WorkProgress:
-    """Store the one editable Telegram message id for the current work id.
+    """One editable Telegram status card per task; callbacks reveal stored facts.
 
-    Never invent progress, resend a possibly delivered initial message, or
-    change an unrelated message. Failed edits are logged, not retried blindly.
+    Keeps a bounded history of verified message IDs across process restarts.
+    A callback must reference exactly the original bot card and its work ID.
+    Display-only interactions cannot start, cancel or modify any work.
     """
+
+    HISTORY_LIMIT = 30
 
     def __init__(self, api: Any, chat_id: int, state_file: str):
         self.api, self.chat_id = api, chat_id
         self.path = Path(state_file)
         self._lock = threading.RLock()
         self.record: dict[str, Any] | None = None
+        self.history: dict[str, dict[str, Any]] = {}
         if self.path.is_file():
             try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-                if (type(data.get("work_id")) is int and data["work_id"] > 0
-                        and type(data.get("message_id")) is int and data["message_id"] > 0
-                        and data.get("chat_id") == self.chat_id
-                        and isinstance(data.get("project"), str)
-                        and isinstance(data.get("task"), str)
-                        and data.get("phase") in _PHASES):
-                    self.record = data
+                saved = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(saved, dict):
+                    raise ValueError("Invalid progress state")
+                if isinstance(saved.get("records"), dict):
+                    for key, item in saved["records"].items():
+                        if self._valid(item) and key == str(item["work_id"]):
+                            self.history[key] = item
+                    last = saved.get("current_id")
+                    self.record = self.history.get(str(last))
+                elif self._valid(saved):
+                    # Backward compatible with the pre-button card state.
+                    self.record = saved
+                    self.history[str(saved["work_id"])] = saved
             except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
                 LOG.warning("Не удалось восстановить Telegram progress ID")
+
+    def _valid(self, item: Any) -> bool:
+        return (isinstance(item, dict)
+                and type(item.get("work_id")) is int and item["work_id"] > 0
+                and type(item.get("message_id")) is int and item["message_id"] > 0
+                and item.get("chat_id") == self.chat_id
+                and isinstance(item.get("project"), str)
+                and isinstance(item.get("task"), str)
+                and item.get("phase") in _PHASES)
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_name(self.path.name + ".tmp")
+        if len(self.history) > self.HISTORY_LIMIT:
+            oldest = sorted(self.history, key=int)[:-self.HISTORY_LIMIT]
+            for key in oldest:
+                del self.history[key]
+        payload = {
+            "current_id": self.record["work_id"] if self.record else None,
+            "records": self.history,
+        }
         with temp.open("w", encoding="utf-8") as out:
-            json.dump(self.record, out, ensure_ascii=False)
+            json.dump(payload, out, ensure_ascii=False)
             out.flush()
             os.fsync(out.fileno())
         os.replace(temp, self.path)
 
+    def _render(self, rec: dict[str, Any]) -> str:
+        return render_work_card(rec, detail=rec.get("view") == "detail")
+
+    def _markup(self, rec: dict[str, Any]) -> dict[str, Any]:
+        return work_keyboard(rec["work_id"], rec.get("view") == "detail",
+                             rec.get("result") or {})
+
     def begin(self, work_id: int, project: str, task: str,
-              *, reply_message_id: int, thread_id: int | None = None) -> bool:
+              *, reply_message_id: int, thread_id: int | None = None,
+              repo: str = "") -> bool:
         with self._lock:
-            text = format_work_progress(work_id, project, task, "queued")
+            rec: dict[str, Any] = {
+                "work_id": work_id, "project": project[:80],
+                "task": task[:250], "repository": repo[:130],
+                "chat_id": self.chat_id, "message_id": 0,
+                "thread_id": thread_id, "phase": "queued",
+                "view": "compact", "note": "", "result": {},
+                "events": [journal_event("queued")],
+            }
+            text = self._render(rec)
             payload: dict[str, Any] = {
-                "chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
+                "chat_id": self.chat_id,
+                "text": text, "parse_mode": "HTML",
+                "reply_markup": self._markup(rec),
                 "reply_parameters": {"message_id": reply_message_id,
                                      "allow_sending_without_reply": True},
             }
             if thread_id is not None:
                 payload["message_thread_id"] = thread_id
-            # Telegram may have delivered the message if the request times out;
-            # don't generate a duplicate fallback message in that case.
+            # An ambiguous initial send is not retried.
             result = self.api.call("sendMessage", payload)
             mid = result.get("message_id") if isinstance(result, dict) else None
             if type(mid) is not int or mid < 1:
                 LOG.warning("Telegram progress: missing message ID; edits disabled")
                 return False
-            self.record = {"work_id": work_id, "project": project,
-                           "task": task[:250], "chat_id": self.chat_id,
-                           "message_id": mid, "thread_id": thread_id,
-                           "phase": "queued", "html": text}
+            rec["message_id"] = mid
+            rec["html"] = text
+            self.record = rec
+            self.history[str(work_id)] = rec
             self._save()
             return True
 
     def update(self, work_id: int, phase: str, *, note: str = "") -> bool:
         with self._lock:
-            record = self.record
-            if record is None or record["work_id"] != work_id:
+            rec = self.record
+            if rec is None or rec["work_id"] != work_id:
                 return False
-            # Terminal phases are immutable, preventing stale worker threads
-            # from resurrecting progress after stop or completion.
-            if record["phase"] in _TERMINAL:
+            if rec["phase"] in _TERMINAL:
                 return False
-            rendered = format_work_progress(work_id, record["project"],
-                                            record["task"], phase, note=note)
-            if rendered == record["html"]:
+            if phase not in _PHASES:
+                return False
+            # Render from a copy: don't change local state before the edit.
+            target = dict(rec, phase=phase, note=note[:350])
+            rendered = self._render(target)
+            if rendered == rec.get("html"):
                 return False
             try:
                 self.api.call("editMessageText", {
                     "chat_id": self.chat_id,
-                    "message_id": record["message_id"],
+                    "message_id": rec["message_id"],
                     "text": rendered, "parse_mode": "HTML",
+                    "reply_markup": self._markup(target),
                 })
             except Exception as exc:
                 LOG.warning("Не удалось обновить Telegram прогресс (%s)",
                             type(exc).__name__)
                 return False
-            record["phase"] = phase
-            record["html"] = rendered
+            rec.update(phase=phase, note=note[:350], html=rendered)
+            rec.setdefault("events", []).append(journal_event(phase, note))
+            rec["events"] = rec["events"][-40:]
             self._save()
             return True
+
+    def result(self, work_id: int, *, developer_summary: str,
+               coordinator_summary: str, repository: str, branch: str,
+               commit_sha: str, remote_verified: bool, local_check: str = "",
+               pending_amendments: int = 0) -> bool:
+        """Save trusted worker report and Host verification as separate fields."""
+        with self._lock:
+            rec = self.record
+            if rec is None or rec["work_id"] != work_id:
+                return False
+            rec["result"] = {
+                "developer_summary": str(developer_summary)[:2300],
+                "coordinator_summary": str(coordinator_summary)[:1000],
+                "repository": str(repository)[:130],
+                "branch": str(branch)[:150],
+                "commit_sha": str(commit_sha)[:40],
+                "remote_verified": remote_verified is True,
+                "local_check": str(local_check)[:750],
+                "pending_amendments": pending_amendments,
+            }
+            rec.setdefault("events", []).append(
+                journal_event("review", "Отчёты и результаты сохранены"))
+            rec["events"] = rec["events"][-40:]
+            self._save()
+            return True
+
+    def card(self, work_id: int, message_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            rec = self.history.get(str(work_id))
+            if rec is None or rec.get("message_id") != message_id:
+                return None
+            return dict(rec)
+
+    def open_view(self, work_id: int, message_id: int, *, detail: bool) -> bool:
+        with self._lock:
+            rec = self.history.get(str(work_id))
+            if rec is None or rec["message_id"] != message_id:
+                return False
+            view = "detail" if detail else "compact"
+            if rec.get("view", "compact") == view:
+                return True
+            target = dict(rec, view=view)
+            rendered = self._render(target)
+            try:
+                self.api.call("editMessageText", {
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "text": rendered, "parse_mode": "HTML",
+                    "reply_markup": self._markup(target),
+                })
+            except Exception as exc:
+                LOG.warning("Не удалось раскрыть Telegram карточку (%s)",
+                            type(exc).__name__)
+                return False
+            rec["view"] = view
+            rec["html"] = rendered
+            self._save()
+            return True
+
+    def journal_bytes(self, work_id: int, message_id: int) -> bytes | None:
+        with self._lock:
+            rec = self.history.get(str(work_id))
+            if rec is None or rec["message_id"] != message_id:
+                return None
+            return render_work_journal(rec)
 
     def interrupted(self, work_id: int) -> None:
         self.update(work_id, "interrupted",
