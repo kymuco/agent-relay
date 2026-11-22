@@ -64,6 +64,40 @@ class LocalWorkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 parse_orchestrator_decision(bad, first=True)
 
+    def test_code_fenced_ragna_json_accepted_without_relaxing_contract(self):
+        wrapped = (
+            '```json\n'
+            '{\n  "action": "delegate",\n'
+            '  "instruction": "Создай CLI и запусти unittest."\n}'
+            '\n```'
+        )
+        self.assertEqual(parse_orchestrator_decision(wrapped, first=True),
+                         ("delegate", "Создай CLI и запусти unittest."))
+        for bad in (
+            'Сделай так:\n' + wrapped,
+            wrapped + '\nВот итог.',
+            '```json\n{"action":"delegate","instruction":"ok"}\n```\n'
+            '```json\n{"action":"delegate","instruction":"bad"}\n```',
+        ):
+            with self.assertRaises(ValueError):
+                parse_orchestrator_decision(bad, first=True)
+
+    def test_bad_ragna_reply_identifies_stage_without_running_codex(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, api, cwa = self.app(folder)
+            q = Queue()
+            app._handle_work_command(self.message(
+                "/work@MyBot start demo Fix the failing test"), q)
+            payload, generation = q.get_nowait()
+            cwa.send.return_value.text = 'Вот поручение: {"action":"delegate","instruction":"fix"}'
+            with patch.object(app.work.runner, "run") as codex:
+                with self.assertLogs("agentrelay", level="ERROR") as lines:
+                    app._run_local_work(payload["_local_work"], generation)
+                codex.assert_not_called()
+            self.assertIn("Ragna decision parsing", lines.output[0])
+            self.assertIn("JSON", lines.output[0])
+            self.assertEqual(app.work.record["status"], "failed")
+
     def test_workspace_state_stops_and_does_not_replay_after_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             f = str(Path(folder) / "work.json")
