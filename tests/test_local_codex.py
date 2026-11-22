@@ -20,7 +20,8 @@ class LocalWorkTests(unittest.TestCase):
                       frozenset({"friendbot"}), frozenset({10}), frozenset({20}),
                       state_file=str(Path(folder) / "cursor.json"),
                       control_file=str(Path(folder) / "control.json"),
-                      work_enabled=True, work_projects="demo=" + str(Path(folder).resolve()),
+                      work_enabled=True, work_allowed_user_ids=frozenset({10}),
+                      work_projects="demo=" + str(Path(folder).resolve()),
                       work_state_file=str(Path(folder) / "work.json"),
                       work_max_rounds=2, min_interval_seconds=0)
 
@@ -102,6 +103,8 @@ class LocalWorkTests(unittest.TestCase):
                 "/work@MyBot start demo fix bug", user=20, is_bot=True), q))
             self.assertTrue(app._handle_work_command(self.message(
                 "/work@MyBot start demo fix bug", user=99), q))
+            self.assertTrue(app._handle_work_command(self.message(
+                "/work@MyBot start demo fix bug", user=11), q))
             self.assertTrue(q.empty())
             self.assertEqual(app.work.record["status"], "idle")
             self.assertTrue(app._handle_work_command(self.message(

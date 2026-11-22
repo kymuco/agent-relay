@@ -342,3 +342,13 @@ Work status is saved to `.agent-relay-work.json` and never automatically
 replayed after an interruption/restart. CWA and Codex work is serialized
 through one worker; `/work status`, `/work stop` and `/stop` bypass it.
 Mocked CI tests cover this flow; live Codex + Telegram testing is still required.
+
+#### Separate local-execution authority
+
+WORK_ALLOWED_USER_IDS is REQUIRED when WORK_ENABLED=on. Set it to only
+your own Telegram numeric user ID. These IDs must also appear in
+ALLOWED_USER_IDS, but the two fields are intentionally independent:
+someone allowed to chat with Ragna is not automatically allowed to
+modify your local files. Unauthorized /work commands are ignored.
+
+Example in local .env: WORK_ALLOWED_USER_IDS=123456789

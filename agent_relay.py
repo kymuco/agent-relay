@@ -115,6 +115,7 @@ class Config:
     catchup_max_replies: int = 1
     catchup_max_age_minutes: int = 180
     work_enabled: bool = False
+    work_allowed_user_ids: frozenset[int] = frozenset()
     work_projects: str = ''
     work_state_file: str = '.agent-relay-work.json'
     work_timeout_seconds: int = 600
@@ -169,6 +170,7 @@ class Config:
         if not 1 <= catchup_max_age_minutes <= 1440:
             raise ValueError('CATCHUP_MAX_AGE_MINUTES must be between 1 and 1440')
         work_enabled = os.getenv('WORK_ENABLED', 'off').strip().lower() in ('on', 'true', '1')
+        work_allowed = numeric_ids(os.getenv('WORK_ALLOWED_USER_IDS', ''), 'WORK_ALLOWED_USER_IDS')
         work_projects = os.getenv('WORK_PROJECTS', '').strip()
         work_timeout = int(os.getenv('WORK_TIMEOUT_SECONDS', '600'))
         work_max_rounds = int(os.getenv('WORK_MAX_ROUNDS', '2'))
@@ -178,6 +180,10 @@ class Config:
             raise ValueError('WORK_MAX_ROUNDS must be between 1 and 3')
         if work_enabled and not parse_projects(work_projects):
             raise ValueError('WORK_ENABLED requires WORK_PROJECTS with at least one existing directory')
+        if work_enabled and not work_allowed:
+            raise ValueError('WORK_ENABLED requires explicit WORK_ALLOWED_USER_IDS')
+        if not work_allowed.issubset(allowed):
+            raise ValueError('WORK_ALLOWED_USER_IDS must be a subset of ALLOWED_USER_IDS')
         if interval < 0:
             raise ValueError('MIN_INTERVAL_SECONDS must not be negative')
         return cls(
@@ -206,6 +212,7 @@ class Config:
             catchup_max_replies=catchup_max_replies,
             catchup_max_age_minutes=catchup_max_age_minutes,
             work_enabled=work_enabled,
+            work_allowed_user_ids=work_allowed,
             work_projects=work_projects,
             work_state_file=os.getenv('WORK_STATE_FILE', '.agent-relay-work.json'),
             work_timeout_seconds=work_timeout,
@@ -908,7 +915,9 @@ class AgentRelay:
             return True
         if (not trusted_sender(message, self.config.allowed_user_ids,
                                self.config.peers, self.config.peer_bot_ids, self.bot_id)
-                or (message.get('from') or {}).get('is_bot')):
+                or (message.get('from') or {}).get('is_bot')
+                or (message.get('from') or {}).get('id') not in
+                    self.config.work_allowed_user_ids):
             return True
         verb, project, task = parsed
         reply = ''
