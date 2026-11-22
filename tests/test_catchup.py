@@ -85,13 +85,13 @@ class CatchupTests(unittest.TestCase):
             api.call.return_value = {'id': 5, 'username': 'MyBot'}
             cwa.send.return_value.text = json.dumps(
                 {'decision': 'reply', 'text': 'Продолжим обсуждение архитектуры.'})
-            with patch('builtins.print'):
+            with patch('builtins.print'), patch('agent_relay.time.time', return_value=20060):
                 app = AgentRelay(self.config(folder), api, cwa)
                 updates = [self.msg('@MyBot что думаешь?', 1),
                            self.msg('@MyBot а теперь?', 2)]
                 app._handle_catchup(updates, app.control.generation())
                 app._handle_catchup(updates, app.control.generation())
-            self.assertEqual(cwa.send.call_count, 1 if False else 2)
+            self.assertEqual(cwa.send.call_count, 1)
             posts = [x.args[1] for x in api.call.call_args_list
                      if x.args[0] == 'sendMessage']
             self.assertEqual(len(posts), 1)
@@ -103,7 +103,7 @@ class CatchupTests(unittest.TestCase):
             api, cwa = Mock(), Mock()
             api.call.return_value = {'id': 5, 'username': 'MyBot'}
             cfg = self.config(folder)
-            with patch('builtins.print'):
+            with patch('builtins.print'), patch('agent_relay.time.time', return_value=20060):
                 app = AgentRelay(cfg, api, cwa)
                 for reply in ['{"decision":"silent","text":""}', 'No, I will make a PR']:
                     cwa.send.return_value.text = reply
@@ -122,7 +122,7 @@ class CatchupTests(unittest.TestCase):
                 release.wait(timeout=3)
                 return Mock(text='{"decision":"reply","text":"too late"}')
             cwa.send.side_effect = blocked
-            with patch('builtins.print'):
+            with patch('builtins.print'), patch('agent_relay.time.time', return_value=20060):
                 app = AgentRelay(self.config(folder), api, cwa)
                 thread = threading.Thread(target=lambda: app._handle_catchup(
                     [self.msg('@MyBot question?', 1)], app.control.generation()))

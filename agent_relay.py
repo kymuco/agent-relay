@@ -743,7 +743,8 @@ class AgentRelay:
             print(f'Update {update_id} stopped; {type(exc).__name__}. No retry.', file=sys.stderr)
 
     def _handle_catchup(self, updates: list[dict[str, Any]], generation: int) -> None:
-        if self.config.catchup_max_replies == 0 or not self.control.permits(generation):
+        if (self.config.catchup_max_replies == 0 or self._catchup_replied
+                or not self.control.permits(generation)):
             return
         plan = select_catchup(
             updates, chat_id=self.config.chat_id, bot_id=self.bot_id,
