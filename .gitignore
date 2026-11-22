@@ -16,3 +16,5 @@ logs/
 .agent-relay-work.json.tmp
 .agent-relay-work-chats.json
 .agent-relay-work-chats.json.tmp
+.agent-relay-progress.json
+.agent-relay-progress.json.tmp

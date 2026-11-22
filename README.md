@@ -532,3 +532,38 @@ transfer outcome without logging prompts, generated content or tokens.
 This path is experimental because the CWA readback and generated
 artifact handoff depend on changing ChatGPT consumer endpoints.
 MEDIA_ENABLED=off disables image delivery; MAX_MEDIA_MB limits size.
+
+### Telegram typing presence + GitHub live progress (opt-in)
+
+Use CHAT_TYPING=on to show Telegram's native 'typing...' while the
+main Ragna conversation is waiting for CWA to answer. One ephemeral
+sendChatAction typing signal is emitted immediately and refreshed at
+most once per four seconds, then stopped on reply, error or /stop.
+This is not a background GitHub progress indicator. Typing is not
+shown for the entire developer job. Telegram itself clears it after
+at most five seconds or after a bot message.
+
+Use WORK_LIVE_PROGRESS=on with the existing GitHub work backend to
+create ONE editable status message at task admission. WorkProgress
+persists the real Telegram message ID in WORK_PROGRESS_FILE, and
+changes that exact message using editMessageText/HTML as the Host
+advances through its actual states: coordinator planning, developer
+working, remote SHA check, optional local test, final review and
+completed/failed/needs_review/stopped. No fake percentages and no
+new ChatGPT request. The already existing single final result report
+is still sent as a separate notification so completion is visible
+even if the status message has scrolled out of view.
+
+Status contents are safely HTML escaped and bounded. A failure
+to edit a status message does not lead to a duplicate message or
+automatic resending of a potentially successful write. /work stop
+and /stop mark the active card stopped. On restart, an interrupted
+job's old card is marked interrupted, never resumed automatically.
+Task progress isn't simulated while no work is happening.
+
+WORK_LIVE_PROGRESS works independently of TELEGRAM_RICH_MODE; it
+uses standard HTML sendMessage/editMessageText for broad client
+compatibility. Normal Rich Messages for model responses are unchanged.
+CHAT_TYPING and WORK_LIVE_PROGRESS are both off by default; enable
+one or both in .env. They don't require another model, new CWA
+conversations or a Codex API key.
