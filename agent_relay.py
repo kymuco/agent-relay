@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_control import ControlState
+from relay_logging import LOG, configure_logging
 from catchup import make_catchup_prompt, parse_catchup_decision, select_catchup
 from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff, trusted_sender
 from relay_media import (attachment_info, artifact_filenames, find_new_images,
@@ -371,6 +372,7 @@ class AgentRelay:
         self.client = client
         self.cursor = Cursor(config.state_file)
         self.control = ControlState(config.control_file)
+        self._shutdown = threading.Event()
         self.last_send_time = float('-inf')
         self.group_context = GroupAwareness(config.group_context_limit)
         self._catchup_history: list[dict[str, Any]] = []
@@ -381,7 +383,19 @@ class AgentRelay:
         me = api.call('getMe')
         self.bot_id = int(me['id'])
         self.bot_username = str(me['username'])
-        print(f'AgentRelay active: @{self.bot_username} in group {config.chat_id}', flush=True)
+        LOG.info('Запущен @%s · группа %s · Ctrl+C для остановки',
+                 self.bot_username, config.chat_id)
+        if self.control.paused:
+            LOG.warning('Бот на паузе: отправь /resume@%s', self.bot_username)
+
+    def shutdown(self) -> None:
+        """Stop pending worker output without persisting /stop."""
+        if not self._shutdown.is_set():
+            self._shutdown.set()
+            LOG.info('Остановлен.')
+
+    def _run_permitted(self, generation: int) -> bool:
+        return not self._shutdown.is_set() and self.control.permits(generation)
 
     def _stop_peer_reply(self) -> None:
         self.peer_reply_id = None
@@ -407,14 +421,14 @@ class AgentRelay:
         delivered = 0
         with tempfile.TemporaryDirectory(prefix='agentrelay-image-') as td:
             for image in observations:
-                if run_generation is not None and not self.control.permits(run_generation):
+                if run_generation is not None and not self._run_permitted(run_generation):
                     return delivered
                 data = read_verified_artifact(self.client, self.config.conversation_id,
                                               image.filename, Path(td),
                                               max_bytes=self.config.max_media_bytes)
                 method = ('sendPhoto' if image.filename.lower().endswith(('.png', '.jpg', '.jpeg'))
                           else 'sendDocument')
-                if run_generation is not None and not self.control.permits(run_generation):
+                if run_generation is not None and not self._run_permitted(run_generation):
                     return delivered
                 send_file(self.config.telegram_token, method, self.config.chat_id,
                           data, image.filename, reply_message_id=reply_message_id)
@@ -465,6 +479,7 @@ class AgentRelay:
             else:
                 changed = self.control.resume()
                 status = 'Продолжаю работу.' if changed else 'Уже работаю.'
+            LOG.info('Аварийный режим: %s', 'пауза' if control_command == 'stop' else 'работает')
             self.api.call('sendMessage', {
                 'chat_id': self.config.chat_id, 'text': status,
                 'reply_parameters': {'message_id': message['message_id'],
@@ -473,7 +488,7 @@ class AgentRelay:
             return
         run_generation = (self.control.generation() if expected_generation is None
                           else expected_generation)
-        if not self.control.permits(run_generation):
+        if not self._run_permitted(run_generation):
             return
         # Observe trusted group text only while running.
         self.group_context.remember(message)
@@ -511,7 +526,7 @@ class AgentRelay:
                     self.api.call('sendMessage', {'chat_id': self.config.chat_id,
                                                   'text': 'Изображение пока не готово; попробуй позже /images@' + self.bot_username})
             except Exception as exc:
-                print(f'Image readback stopped; {type(exc).__name__}.', file=sys.stderr)
+                LOG.warning('Не удалось получить изображение (%s)', type(exc).__name__)
             return
         peer_id = int(sender['id'])
         reply_to = (message.get('reply_to_message') or {}).get('from') or {}
@@ -559,7 +574,7 @@ class AgentRelay:
             now = time.monotonic()
             if not self._active_peer_reply(peer_id):
                 return
-        if not self.control.permits(run_generation):
+        if not self._run_permitted(run_generation):
             return
         self.last_send_time = now
         prompt = make_prompt(
@@ -581,7 +596,7 @@ class AgentRelay:
                     prompt += '\nAnalyze the attached visual material when relevant.'
             except Exception as exc:
                 label = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else type(exc).__name__
-                print(f'Media input rejected: {type(exc).__name__}', file=sys.stderr)
+                LOG.warning('Не удалось обработать вложение (%s)', type(exc).__name__)
                 self.api.call('sendMessage', {'chat_id': self.config.chat_id,
                                               'text': 'Не удалось обработать вложение: ' + label[:160]})
                 return
@@ -602,7 +617,7 @@ class AgentRelay:
                 before_images = generated_image_keys(self.client, self.config.conversation_id)
                 self.pending_image_baseline = before_images
             except Exception as exc:
-                print(f'Image discovery unavailable: {type(exc).__name__}', file=sys.stderr)
+                LOG.debug('Поиск изображений недоступен (%s)', type(exc).__name__)
         params: dict[str, Any] = {'conversation': self.config.conversation_id}
         if inbound and inbound.media:
             params['media'] = inbound.media
@@ -611,12 +626,12 @@ class AgentRelay:
         if self.config.effort:
             params['reasoning_effort'] = self.config.effort
         try:
-            if not self.control.permits(run_generation):
+            if not self._run_permitted(run_generation):
                 return
             result = self.client.send(prompt, **params)
             # A stop during CWA can never be rolled back. The answer is
             # discarded even if /resume has been received in the meantime.
-            if not self.control.permits(run_generation):
+            if not self._run_permitted(run_generation):
                 return
             text = str(result.text or '').strip()
             if not text and not generation_requested:
@@ -647,23 +662,22 @@ class AgentRelay:
                 # it must appear literally at the start of Telegram text.
                 parts[-1] = f'/relay@{peer_destination} {parts[-1]}'
             voice_delivered = False
-            if delivery_mode == 'voice' and text and self.control.permits(run_generation):
+            if delivery_mode == 'voice' and text and self._run_permitted(run_generation):
                 # Voice-only: synthesize and publish BEFORE any text. If either
                 # step fails, send the existing model text instead; never retry
                 # an ambiguous voice publish automatically.
                 try:
                     ogg = synthesize_voice(self.client, text)
-                    if not self.control.permits(run_generation):
+                    if not self._run_permitted(run_generation):
                         return
                     send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,
                               ogg, 'ragna-voice.ogg', reply_message_id=message['message_id'])
                     voice_delivered = True
                 except Exception as exc:
-                    print(f'Voice-only send unavailable; falling back to text: '
-                          f'{type(exc).__name__}', file=sys.stderr)
+                    LOG.warning('Голос недоступен (%s), отправляю текст', type(exc).__name__)
             if not voice_delivered:
                 for index, part in enumerate(parts):
-                    if not self.control.permits(run_generation):
+                    if not self._run_permitted(run_generation):
                         return
                     markup = markdown_to_telegram_html(part)
                     valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096
@@ -683,12 +697,12 @@ class AgentRelay:
                     if message.get('message_thread_id'):
                         outgoing['message_thread_id'] = message['message_thread_id']
                     self.api.call('sendMessage', outgoing)
-            if not self.control.permits(run_generation):
+            if not self._run_permitted(run_generation):
                 return
             if not sender_is_bot and self.config.media_enabled:
                 if before_images is not None:
                     try:
-                        if not self.control.permits(run_generation):
+                        if not self._run_permitted(run_generation):
                             return
                         count = self._send_ready_images(before_images, reply_message_id=message['message_id'],
                                                         run_generation=run_generation)
@@ -701,7 +715,7 @@ class AgentRelay:
                                         'Позже напиши /images@' + self.bot_username,
                             })
                     except Exception as exc:
-                        print(f'Generated images unavailable: {type(exc).__name__}', file=sys.stderr)
+                        LOG.warning('Не удалось отправить изображение (%s)', type(exc).__name__)
                 if text:
                     with tempfile.TemporaryDirectory(prefix='agentrelay-artifact-') as td:
                         for filename in artifact_filenames(text):
@@ -709,21 +723,21 @@ class AgentRelay:
                                 data = read_verified_artifact(
                                     self.client, self.config.conversation_id,
                                     filename, Path(td), max_bytes=self.config.max_media_bytes)
-                                if not self.control.permits(run_generation):
+                                if not self._run_permitted(run_generation):
                                     return
                                 send_file(self.config.telegram_token, 'sendDocument', self.config.chat_id,
                                           data, filename, reply_message_id=message['message_id'])
                             except Exception as exc:
-                                print(f'Generated file unavailable: {type(exc).__name__}', file=sys.stderr)
+                                LOG.warning('Не удалось отправить файл (%s)', type(exc).__name__)
                 if delivery_mode == 'both' and text:
                     try:
                         ogg = synthesize_voice(self.client, text)
-                        if not self.control.permits(run_generation):
+                        if not self._run_permitted(run_generation):
                             return
                         send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,
                                   ogg, 'ragna-voice.ogg', reply_message_id=message['message_id'])
                     except Exception as exc:
-                        print(f'Voice reply unavailable: {type(exc).__name__}', file=sys.stderr)
+                        LOG.warning('Не удалось озвучить ответ (%s)', type(exc).__name__)
             if ending_peer and continuing_peer:
                 self._stop_peer_reply()
             if not sender_is_bot and self.config.peer_reply_mode:
@@ -735,16 +749,16 @@ class AgentRelay:
                         self._start_peer_reply(next(iter(self.config.peer_bot_ids)))
                         break
             self.group_context.remember_own_reply(self.bot_username, text)
-            print(f'Replied to Telegram update {update_id} ({len(parts)} part(s))', flush=True)
+            LOG.debug('Ответ отправлен · update=%s · частей=%s', update_id, len(parts))
         except Exception as exc:
             # An ambiguous CWA write must never be retried or re-handoffed.
             if sender_is_bot:
                 self._stop_peer_reply()
-            print(f'Update {update_id} stopped; {type(exc).__name__}. No retry.', file=sys.stderr)
+            LOG.error('Ответ не завершён · update=%s · %s · без повтора', update_id, type(exc).__name__)
 
     def _handle_catchup(self, updates: list[dict[str, Any]], generation: int) -> None:
         if (self.config.catchup_max_replies == 0 or self._catchup_replied
-                or not self.control.permits(generation)):
+                or not self._run_permitted(generation)):
             return
         plan = select_catchup(
             updates, chat_id=self.config.chat_id, bot_id=self.bot_id,
@@ -763,7 +777,7 @@ class AgentRelay:
             params['reasoning_effort'] = self.config.effort
         try:
             result = self.client.send(prompt, **params)
-            if not self.control.permits(generation) or self._catchup_replied:
+            if not self._run_permitted(generation) or self._catchup_replied:
                 return
             output = parse_catchup_decision(str(result.text or ''))
             if output is None:
@@ -779,11 +793,10 @@ class AgentRelay:
                 },
             })
             self._catchup_replied = True
-            print(f'Catch-up answered once ({plan.included} messages)', flush=True)
+            LOG.info('Восстановлен разговор · сообщений %s · один ответ', plan.included)
         except Exception as exc:
             # Ambiguous CWA writes must never be retried automatically.
-            print(f'Catch-up stopped: {type(exc).__name__}; no retry',
-                  file=sys.stderr)
+            LOG.warning('Восстановление диалога не завершено (%s), без повтора', type(exc).__name__)
 
     def _drain_startup_backlog(self, startup_epoch: int) -> list[dict[str, Any]]:
         """Consume pending updates without replaying historical requests.
@@ -856,14 +869,14 @@ class AgentRelay:
             while True:
                 update, generation = work_queue.get()
                 try:
-                    if self.control.permits(generation):
+                    if self._run_permitted(generation):
                         if '_catchup_batch' in update:
                             self._handle_catchup(update['_catchup_batch'], generation)
                         else:
                             self.process_update(update, preadvanced=True,
                                                 expected_generation=generation)
                 except Exception as exc:
-                    print(f'Worker update failed: {type(exc).__name__}', file=sys.stderr)
+                    LOG.error('Ошибка обработки (%s)', type(exc).__name__)
                 finally:
                     work_queue.task_done()
 
@@ -891,7 +904,7 @@ class AgentRelay:
                     try:
                         work_queue.put_nowait((update, self.control.generation()))
                     except queue.Full:
-                        print('Startup fresh queue full; update dropped', file=sys.stderr)
+                        LOG.warning('Очередь заполнена: новое сообщение пропущено')
         while True:
             try:
                 updates = self.api.call('getUpdates', {
@@ -915,7 +928,7 @@ class AgentRelay:
                                 work_queue.put_nowait(({'_catchup_batch': self._catchup_history},
                                                        self.control.generation()))
                             except queue.Full:
-                                print('Catchup request dropped: queue full', file=sys.stderr)
+                                LOG.warning('Очередь заполнена: восстановление пропущено')
                         else:
                             self.api.call('sendMessage', {
                                 'chat_id': self.config.chat_id,
@@ -925,26 +938,49 @@ class AgentRelay:
                         try:
                             work_queue.put_nowait((item, self.control.generation()))
                         except queue.Full:
-                            print('Worker queue full: update dropped without replay',
-                                  file=sys.stderr)
+                            LOG.warning('Очередь заполнена: сообщение пропущено')
             except KeyboardInterrupt:
-                print('Stopped.')
                 break
             except Exception as exc:
-                print(f'Polling error: {type(exc).__name__}', file=sys.stderr)
+                LOG.warning('Нет связи с Telegram (%s), повтор через 3 с',
+                            type(exc).__name__)
                 time.sleep(3)
+        self.shutdown()
+
+
+def prepare_local_runtime(root: Path) -> None:
+    """Use portable Node installed during one-time setup, without bootstrap."""
+    if os.name == 'nt':
+        portable = root / '.runtime' / 'node.exe'
+        if portable.is_file():
+            os.environ['PATH'] = str(portable.parent) + os.pathsep + os.environ.get('PATH', '')
 
 
 def main() -> None:
+    app: AgentRelay | None = None
     try:
+        root = Path(__file__).resolve().parent
+        os.chdir(root)
         config = Config.from_env()
+        configure_logging(os.getenv('LOG_LEVEL', 'normal'),
+                          os.getenv('LOG_FILE', 'logs/agentrelay.log'), root=root)
+        prepare_local_runtime(root)
         ensure_auth_file(config.auth_file)
         from chatgpt_web_adapter import BrowserlessHTTPClient
         api = Telegram(config.telegram_token)
         client = BrowserlessHTTPClient(auth_file=config.auth_file)
-        AgentRelay(config, api, client).serve()
+        app = AgentRelay(config, api, client)
+        app.serve()
+    except KeyboardInterrupt:
+        if app is not None:
+            app.shutdown()
+        else:
+            LOG.info('Остановлен.')
     except Exception as exc:
-        print(f'Startup failed: {type(exc).__name__}: {str(exc) if isinstance(exc, ValueError) else "check local setup"}', file=sys.stderr)
+        LOG.error('Не удалось запустить: %s (%s)',
+                  str(exc) if isinstance(exc, (ValueError, RuntimeError))
+                  else 'проверь конфигурацию и соединение',
+                  type(exc).__name__)
         raise SystemExit(1) from None
 
 
