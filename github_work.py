@@ -160,13 +160,16 @@ def coordinator_prompt(task: str, *, repo: str, project: str,
     )
 
 
-def developer_prompt(instruction: str, *, repo: str, work_id: int) -> str:
+def developer_prompt(instruction: str, *, repo: str, work_id: int,
+                     previous_sha: str = "") -> str:
     return (
         "[AgentRelay / GitHub developer worker] The human authorized bounded "
         "development within exactly this GitHub repository: " + repo + ". "
         "Use your GitHub connector to inspect it and, if available and authorized "
         "by your tool approval policies, create EXACTLY this isolated work branch: "
-        + ("agentrelay/work-" + str(work_id)) + ". Commit only the requested "
+        + ("agentrelay/work-" + str(work_id)) +
+        ". If that exact branch already exists for this task, continue it "
+        "without replacing earlier commits. Commit only the requested "
         "source changes to it. Do NOT merge, publish releases, "
         "modify repository settings, force push, or access other repositories. "
         "Do not assume tool access: if connector actions are unavailable, or any "
@@ -179,7 +182,8 @@ def developer_prompt(instruction: str, *, repo: str, work_id: int) -> str:
         "from tool feedback) or blocked; blocked requires empty branch and SHA. "
         "Do not put secrets, raw source text, or full tool output in summary.\n"
         + json.dumps({"work_id": work_id, "repository": repo,
-                      "instruction": instruction}, ensure_ascii=False)
+                      "instruction": instruction, "previous_verified_sha": previous_sha},
+                     ensure_ascii=False)
     )
 
 
@@ -218,7 +222,8 @@ class BackgroundDeveloper:
         return str(getattr(result, "text", "") or "")
 
     def run(self, *, work_id: int, project: str, repo: str, task: str,
-            permitted: Callable[[], bool]) -> DeveloperReport | None:
+            permitted: Callable[[], bool],
+            previous_sha: str = "") -> DeveloperReport | None:
         if not permitted():
             return None
         planned = self._turn("coordinator", self.coordinator,
@@ -230,7 +235,8 @@ class BackgroundDeveloper:
         if action != "delegate":
             raise ValueError("coordinator did not delegate")
         raw = self._turn("developer", self.developer,
-                         developer_prompt(instruction, repo=repo, work_id=work_id),
+                         developer_prompt(instruction, repo=repo, work_id=work_id,
+                                          previous_sha=previous_sha),
                          work_id=work_id)
         if not permitted():
             return None
