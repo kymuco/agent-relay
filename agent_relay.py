@@ -25,6 +25,9 @@ from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
                          verify_remote_branch, checkout_verified_commit)
 from natural_work import route_natural_work
 from telegram_presence import TypingPulse, WorkProgress
+from task_conversation import (classify_task_reply, normalize_task_reply,
+                               trusted_task_context)
+from work_card_views import render_work_card
 from contextlib import nullcontext
 from telegram_presentation import use_rich_message, rich_payload
 from relay_logging import LOG, configure_logging
@@ -700,7 +703,8 @@ class AgentRelay:
 
     def process_update(self, update: dict[str, Any], *,
                        preadvanced: bool = False,
-                       expected_generation: int | None = None) -> None:
+                       expected_generation: int | None = None,
+                       task_context: str | None = None) -> None:
         update_id = int(update['update_id'])
         if not preadvanced:
             if update_id < self.cursor.offset:
@@ -831,6 +835,9 @@ class AgentRelay:
             message, self.config.peers,
             self.group_context.recent_text(exclude_message_id=message.get('message_id')),
         )
+        if task_context:
+            # Only the Host can attach this verified, bounded task binding.
+            prompt += '\n' + task_context[:1800]
         if self.work is not None:
             status = self.work.status()
             if status != 'Локальных задач пока не было.':
@@ -1296,6 +1303,98 @@ class AgentRelay:
             return True
         return False
 
+    def _handle_task_reply(
+        self, message: dict[str, Any],
+        work_queue: queue.Queue[tuple[dict[str, Any], int]],
+        *, update: dict[str, Any] | None = None,
+    ) -> bool:
+        """A Reply binds to exactly one saved bot card, not the latest work."""
+        if self.progress is None or self.work is None:
+            return False
+        chat = message.get('chat') or {}
+        sender = message.get('from') or {}
+        if (chat.get('id') != self.config.chat_id
+                or chat.get('type') not in ('group', 'supergroup')
+                or message.get('sender_chat') or sender.get('is_bot')
+                or type(sender.get('id')) is not int
+                or sender['id'] not in self.config.allowed_user_ids):
+            return False
+        card = self.progress.card_for_reply(message, bot_id=self.bot_id)
+        if card is None:
+            return False
+        text = str(message.get('text') or message.get('caption') or '').strip()
+        kind = classify_task_reply(
+            text, bot_username=self.bot_username,
+            aliases=self.config.bot_aliases, project=str(card.get('project') or ''),
+            project_repos=self.work_repos)
+        if kind is None:
+            return False
+
+        def say(answer: str, *, html_text: bool = False) -> None:
+            data: dict[str, Any] = {
+                'chat_id': self.config.chat_id,
+                'text': answer[:3700],
+                'reply_parameters': {
+                    'message_id': message['message_id'],
+                    'allow_sending_without_reply': True,
+                },
+            }
+            if message.get('message_thread_id'):
+                data['message_thread_id'] = message['message_thread_id']
+            if html_text:
+                data['parse_mode'] = 'HTML'
+            self.api.call('sendMessage', data)
+
+        work_id = card['work_id']
+        active = self.work.active(work_id)
+        if kind == 'stop_info':
+            say('Остановить именно задачу #' + str(work_id) +
+                ' можно кнопкой «Остановить задачу» в её карточке. '
+                'После нажатия потребуется подтверждение.'
+                if active else 'Эта задача уже не выполняется.')
+            return True
+        if kind == 'status':
+            say(render_work_card(card, detail=False), html_text=True)
+            return True
+        if kind == 'amend':
+            if (sender['id'] not in self.config.work_allowed_user_ids
+                    or self.control.paused):
+                say('Для изменения задачи недостаточно прав или Ragna приостановлена.')
+                return True
+            if not active or self.work.active_project() != card.get('project'):
+                say('Задача #' + str(work_id) +
+                    ' уже не выполняется. Уточнение не передано другой задаче. '
+                    'Для изменений дай новое поручение.')
+                return True
+            instruction = normalize_task_reply(
+                text, bot_username=self.bot_username, aliases=self.config.bot_aliases)
+            admitted = self.work.add_amendment(instruction, expected_id=work_id)
+            if admitted:
+                self.progress.pending_amendments(
+                    work_id, len(self.work.pending_snapshot()), admitted=True)
+                say('Учла уточнение к задаче #' + str(work_id) +
+                    '. Оно сохранено и будет передано разработчику, если '
+                    'останется разрешённая итерация.')
+            else:
+                say('Не смогла добавить уточнение: задача завершается или '
+                    'очередь изменений заполнена. Ничего не передала.')
+            return True
+
+        if self.control.paused:
+            say('Ragna приостановлена. Для продолжения используй /resume.')
+            return True
+        if update is None:
+            # External direct callers can still route a verified Reply without
+            # bypassing Telegram update/cursor admission.
+            return False
+        prepared = dict(update)
+        prepared['_task_reply_context'] = trusted_task_context(card)
+        try:
+            work_queue.put_nowait((prepared, self.control.generation()))
+        except queue.Full:
+            say('Очередь Ragna заполнена. Вопрос не передан, повтори позже.')
+        return True
+
     def _run_github_work(self, payload: tuple[int, str, str], generation: int) -> None:
         """Background GitHub work, bounded amendments, and verified remote SHA."""
         if self.work is None or self._background is None:
@@ -1356,6 +1455,8 @@ class AgentRelay:
                 if round_no < self.config.work_max_rounds:
                     amendments = self.work.take_amendments(work_id)
                     if amendments:
+                        if self.progress is not None:
+                            self.progress.pending_amendments(work_id, 0)
                         task = (
                             'Continue EXACTLY the same work and branch for project ' +
                             project + ' at previous verified commit ' + previous_sha +
@@ -1692,8 +1793,10 @@ class AgentRelay:
                         elif '_local_work' in update:
                             self._run_local_work(update['_local_work'], generation)
                         else:
-                            self.process_update(update, preadvanced=True,
-                                                expected_generation=generation)
+                            self.process_update(
+                                update, preadvanced=True,
+                                expected_generation=generation,
+                                task_context=update.get('_task_reply_context'))
                 except Exception as exc:
                     LOG.error('Ошибка обработки (%s)', type(exc).__name__)
                 finally:
@@ -1720,6 +1823,9 @@ class AgentRelay:
                                        self.control.generation()))
             for update in fresh:
                 if not self.control.paused:
+                    if self._handle_task_reply(
+                            update.get('message') or {}, work_queue, update=update):
+                        continue
                     try:
                         work_queue.put_nowait((update, self.control.generation()))
                     except queue.Full:
@@ -1744,6 +1850,8 @@ class AgentRelay:
                         self.process_update(item, preadvanced=True)
                     elif self._handle_work_command(message, work_queue):
                         pass  # Explicit work control bypasses CWA worker.
+                    elif self._handle_task_reply(message, work_queue, update=item):
+                        pass  # Exact task Reply: amendments or read-only conversation.
                     elif self._handle_natural_work(message, work_queue):
                         pass  # Human's explicit natural imperative admitted by Host.
                     elif self._manual_catchup_command(message):
