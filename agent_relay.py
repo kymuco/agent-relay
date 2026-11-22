@@ -405,6 +405,8 @@ class AgentRelay:
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self._shutdown = threading.Event()
         self.last_send_time = float('-inf')
+        self._cwa_request_lock = threading.Lock()
+        self._cwa_request_counter = 0
         self.group_context = GroupAwareness(config.group_context_limit)
         self._catchup_history: list[dict[str, Any]] = []
         self._catchup_replied = False
@@ -429,6 +431,28 @@ class AgentRelay:
 
     def _run_permitted(self, generation: int) -> bool:
         return not self._shutdown.is_set() and self.control.permits(generation)
+
+    def _cwa_send(self, prompt: str, *, purpose: str, **params: Any) -> Any:
+        """Log each outbound CWA chat turn without leaking prompt or credentials.
+
+        A unique ID pairs dispatch/completion lines, and elapsed time includes
+        the full CWA send. This is not low-level HTTP or token-stream tracing.
+        """
+        with self._cwa_request_lock:
+            self._cwa_request_counter += 1
+            request_id = self._cwa_request_counter
+        started = time.monotonic()
+        LOG.debug('CWA #%s → %s · отправка запроса', request_id, purpose)
+        try:
+            result = self.client.send(prompt, **params)
+        except Exception as exc:
+            LOG.debug('CWA #%s × %s · ошибка %s · %.1f с',
+                      request_id, purpose, type(exc).__name__,
+                      time.monotonic() - started)
+            raise
+        LOG.debug('CWA #%s ✓ %s · ответ получен · %.1f с',
+                  request_id, purpose, time.monotonic() - started)
+        return result
 
     def _stop_peer_reply(self) -> None:
         self.peer_reply_id = None
@@ -664,7 +688,7 @@ class AgentRelay:
         try:
             if not self._run_permitted(run_generation):
                 return
-            result = self.client.send(prompt, **params)
+            result = self._cwa_send(prompt, purpose='chat', **params)
             # A stop during CWA can never be rolled back. The answer is
             # discarded even if /resume has been received in the meantime.
             if not self._run_permitted(run_generation):
@@ -812,7 +836,7 @@ class AgentRelay:
         if self.config.effort:
             params['reasoning_effort'] = self.config.effort
         try:
-            result = self.client.send(prompt, **params)
+            result = self._cwa_send(prompt, purpose='catchup', **params)
             if not self._run_permitted(generation) or self._catchup_replied:
                 return
             output = parse_catchup_decision(str(result.text or ''))
@@ -983,9 +1007,10 @@ class AgentRelay:
                 self.work.update(work_id, 'running', round_no)
                 stage = 'Ragna planning'
                 segment_started = time.monotonic()
-                plan = self.client.send(
+                plan = self._cwa_send(
                     work_prompt(task, project, round_no=round_no, result=previous,
-                                max_rounds=self.config.work_max_rounds), **params)
+                                max_rounds=self.config.work_max_rounds),
+                    purpose=f'work#{work_id}.plan{round_no}', **params)
                 LOG.debug('Local Work #%s · Ragna round %s: %.1f s',
                           work_id, round_no, time.monotonic() - segment_started)
                 if not self._run_permitted(generation) or not self.work.active(work_id):
@@ -1029,11 +1054,12 @@ class AgentRelay:
                 return
             stage = 'Ragna final review'
             segment_started = time.monotonic()
-            final = self.client.send(work_prompt(
+            final = self._cwa_send(work_prompt(
                 task, project, round_no=self.config.work_max_rounds + 1,
                 result=previous, max_rounds=self.config.work_max_rounds
             ).replace('To delegate: {"action":"delegate","instruction":"specific bounded Codex task"}. ',
-                      'Delegation is no longer available. '), **params)
+                      'Delegation is no longer available. '),
+                purpose=f'work#{work_id}.final', **params)
             LOG.debug('Local Work #%s · Ragna final review: %.1f s',
                       work_id, time.monotonic() - segment_started)
             if not self._run_permitted(generation) or not self.work.active(work_id):
