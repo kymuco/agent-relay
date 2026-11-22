@@ -74,6 +74,17 @@ class WorkCardViewTests(unittest.TestCase):
         self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], "wp:d:4")
         self.assertEqual(keyboard["inline_keyboard"][0][1]["callback_data"], "wp:j:4")
 
+    def test_large_escaped_summary_stays_valid_telegram_html(self):
+        record = self.record()
+        record["result"]["developer_summary"] = ("<&\"'" * 1700) + " 3 теста пройдены"
+        detail = render_work_card(record, detail=True)
+        self.assertLessEqual(len(detail), 3800)
+        self.assertEqual(detail.count("<b>"), detail.count("</b>"))
+        self.assertEqual(detail.count("<code>"), detail.count("</code>"))
+        self.assertEqual(detail.count("<i>"), detail.count("</i>"))
+        self.assertNotIn("<&", detail)
+        self.assertNotIn("<script>", detail)
+
     def test_journal_uses_host_events_and_separates_worker_claims(self):
         content = render_work_journal(self.record()).decode("utf-8")
         self.assertIn("События AgentRelay", content)
