@@ -118,7 +118,7 @@ class NaturalWorkTests(unittest.TestCase):
             with patch("agent_relay.verify_remote_branch", return_value=True) as verify:
                 app._handle_natural_work(
                     self.message("Рагна, добавь калькулятор в github-workspace"),Queue())
-                self.assertTrue(entered.wait(3))
+                self.assertTrue(entered.wait(3), (app.work.record, api.call.call_args_list))
                 self.assertTrue(app._handle_natural_work(
                     self.message("Рагна, учти деление на ноль"),Queue()))
                 release.set()
@@ -147,7 +147,7 @@ class NaturalWorkTests(unittest.TestCase):
             with patch("agent_relay.verify_remote_branch",return_value=True):
                 app._handle_natural_work(
                     self.message("Рагна, добавь калькулятор в github-workspace"),Queue())
-                self.assertTrue(entered.wait(3))
+                self.assertTrue(entered.wait(3), (app.work.record, api.call.call_args_list))
                 app._handle_natural_work(self.message(
                     "Рагна, учти деление на ноль"),Queue())
                 release.set()
