@@ -215,6 +215,11 @@ class WorkProgressTests(unittest.TestCase):
                 while time.monotonic()<deadline and app.work.active(1):
                     time.sleep(.02)
             self.assertEqual(app.work.record["status"],"completed")
+            # WorkState finalizes before the async worker finishes editing
+            # the Telegram card; wait for that distinct observable event.
+            deadline=time.monotonic()+2
+            while time.monotonic()<deadline and app.progress.record["phase"]!="completed":
+                time.sleep(.01)
             self.assertEqual(app.progress.record["phase"],"completed")
             texts=[c.args[1]["text"] for c in api.call.call_args_list
                    if c.args[0]=="editMessageText"]
