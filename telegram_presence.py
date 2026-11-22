@@ -166,7 +166,9 @@ class WorkProgress:
 
     def _markup(self, rec: dict[str, Any]) -> dict[str, Any]:
         return work_keyboard(rec["work_id"], rec.get("view") == "detail",
-                             rec.get("result") or {})
+                             rec.get("result") or {},
+                             phase=rec.get("phase", ""),
+                             stop_pending=bool(rec.get("stop_confirm_user")))
 
     def begin(self, work_id: int, project: str, task: str,
               *, reply_message_id: int, thread_id: int | None = None,
@@ -229,6 +231,9 @@ class WorkProgress:
                             type(exc).__name__)
                 return False
             rec.update(phase=phase, note=note[:350], html=rendered)
+            if phase in _TERMINAL:
+                rec.pop("stop_confirm_user", None)
+                rec.pop("stop_confirm_until", None)
             rec.setdefault("events", []).append(journal_event(phase, note))
             rec["events"] = rec["events"][-40:]
             self._save()
@@ -298,6 +303,86 @@ class WorkProgress:
             if rec is None or rec["message_id"] != message_id:
                 return None
             return render_work_journal(rec)
+
+    def card_for_reply(self, message: dict[str, Any], *, bot_id: int) -> dict[str, Any] | None:
+        """Only Reply to our real saved Telegram card ID selects a task."""
+        reply = message.get("reply_to_message") or {}
+        chat = message.get("chat") or {}
+        quoted_bot = reply.get("from") or {}
+        mid = reply.get("message_id")
+        if (chat.get("id") != self.chat_id
+                or type(mid) is not int
+                or type(quoted_bot.get("id")) is not int
+                or quoted_bot["id"] != bot_id):
+            return None
+        with self._lock:
+            for rec in self.history.values():
+                if rec.get("message_id") == mid:
+                    return dict(rec)
+        return None
+
+    def request_stop_confirmation(self, work_id: int, message_id: int,
+                                  user_id: int) -> bool:
+        with self._lock:
+            rec = self.history.get(str(work_id))
+            if (rec is None or rec["message_id"] != message_id
+                    or rec["phase"] in _TERMINAL):
+                return False
+            already = rec.get("stop_confirm_user")
+            if already is not None and already != user_id:
+                return False
+            # Durable before an ambiguous edit: if the button becomes visible,
+            # pressing it still checks the authorized creator and short expiry.
+            rec["stop_confirm_user"] = user_id
+            rec["stop_confirm_until"] = time.time() + 60
+            self._save()
+            try:
+                self.api.call("editMessageReplyMarkup", {
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "reply_markup": self._markup(rec),
+                })
+            except Exception as exc:
+                LOG.warning("Не удалось показать подтверждение остановки (%s)",
+                            type(exc).__name__)
+                return False
+            return True
+
+    def stop_is_confirmed(self, work_id: int, message_id: int,
+                          user_id: int) -> bool:
+        with self._lock:
+            rec = self.history.get(str(work_id))
+            return bool(
+                rec is not None and rec["message_id"] == message_id
+                and rec["phase"] not in _TERMINAL
+                and type(rec.get("stop_confirm_user")) is int
+                and rec["stop_confirm_user"] == user_id
+                and isinstance(rec.get("stop_confirm_until"), (int, float))
+                and time.time() <= rec["stop_confirm_until"]
+            )
+
+    def cancel_stop_confirmation(self, work_id: int, message_id: int,
+                                 user_id: int) -> bool:
+        with self._lock:
+            rec = self.history.get(str(work_id))
+            if (rec is None or rec["message_id"] != message_id
+                    or rec["phase"] in _TERMINAL
+                    or rec.get("stop_confirm_user") != user_id):
+                return False
+            rec.pop("stop_confirm_user", None)
+            rec.pop("stop_confirm_until", None)
+            self._save()
+            try:
+                self.api.call("editMessageReplyMarkup", {
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                    "reply_markup": self._markup(rec),
+                })
+            except Exception as exc:
+                LOG.warning("Не удалось закрыть подтверждение остановки (%s)",
+                            type(exc).__name__)
+                return False
+            return True
 
     def interrupted(self, work_id: int) -> None:
         self.update(work_id, "interrupted",
