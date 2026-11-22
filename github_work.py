@@ -223,7 +223,8 @@ class BackgroundDeveloper:
 
     def run(self, *, work_id: int, project: str, repo: str, task: str,
             permitted: Callable[[], bool],
-            previous_sha: str = "") -> DeveloperReport | None:
+            previous_sha: str = "",
+            on_phase: Callable[[str], None] | None = None) -> DeveloperReport | None:
         if not permitted():
             return None
         planned = self._turn("coordinator", self.coordinator,
@@ -234,6 +235,8 @@ class BackgroundDeveloper:
         action, instruction = parse_coordinator(planned, first=True)
         if action != "delegate":
             raise ValueError("coordinator did not delegate")
+        if on_phase is not None and permitted():
+            on_phase("developer")
         raw = self._turn("developer", self.developer,
                          developer_prompt(instruction, repo=repo, work_id=work_id,
                                           previous_sha=previous_sha),
