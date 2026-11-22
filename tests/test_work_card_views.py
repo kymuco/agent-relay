@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -157,12 +159,18 @@ class TelegramCallbackTests(unittest.TestCase):
             app, api, main, coord, dev = self.app(folder)
             baseline = api.call.call_count
             self.assertTrue(app._handle_progress_callback(self.callback("wp:d:4")))
+            limit = time.monotonic() + 2
+            while app.progress.history["4"]["view"] != "detail" and time.monotonic() < limit:
+                time.sleep(.01)
             self.assertEqual(app.progress.history["4"]["view"], "detail")
             self.assertTrue(app._handle_progress_callback(self.callback("wp:c:4")))
+            limit = time.monotonic() + 2
+            while app.progress.history["4"]["view"] != "compact" and time.monotonic() < limit:
+                time.sleep(.01)
             self.assertEqual(app.progress.history["4"]["view"], "compact")
             methods = [call.args[0] for call in api.call.call_args_list[baseline:]]
-            self.assertEqual(methods, ["editMessageText","answerCallbackQuery",
-                                       "editMessageText","answerCallbackQuery"])
+            self.assertEqual(methods.count("editMessageText"), 2)
+            self.assertEqual(methods.count("answerCallbackQuery"), 2)
             main.send.assert_not_called()
             coord.send.assert_not_called()
             dev.send.assert_not_called()
@@ -196,7 +204,10 @@ class TelegramCallbackTests(unittest.TestCase):
             with patch("agent_relay.send_file", return_value={"message_id":500}) as send:
                 self.assertTrue(app._handle_progress_callback(self.callback("wp:j:4")))
                 self.assertTrue(app._handle_progress_callback(self.callback("wp:j:4")))
-            send.assert_called_once()
+                limit = time.monotonic() + 2
+                while send.call_count < 1 and time.monotonic() < limit:
+                    time.sleep(.01)
+                send.assert_called_once()
             args = send.call_args.args
             self.assertEqual(args[1], "sendDocument")
             self.assertEqual(args[2], -123)
@@ -205,10 +216,33 @@ class TelegramCallbackTests(unittest.TestCase):
             self.assertEqual(send.call_args.kwargs["reply_message_id"], 777)
             main.send.assert_not_called()
 
+    def test_slow_journal_upload_does_not_delay_emergency_stop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, api, main, coord, dev = self.app(folder)
+            entered, release = threading.Event(), threading.Event()
+            def slow_send(*args, **kwargs):
+                entered.set()
+                release.wait(3)
+            with patch("agent_relay.send_file", side_effect=slow_send) as send:
+                start = time.monotonic()
+                self.assertTrue(app._handle_progress_callback(self.callback("wp:j:4")))
+                self.assertLess(time.monotonic() - start, .8)
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(app.control.stop())
+                self.assertTrue(app.control.paused)
+                release.set()
+                limit = time.monotonic() + 2
+                while app._callback_slots._value != 3 and time.monotonic() < limit:
+                    time.sleep(.01)
+                send.assert_called_once()
+
     def test_callback_response_does_not_trigger_work_execution(self):
         with tempfile.TemporaryDirectory() as folder:
             app, api, main, coord, dev = self.app(folder)
             self.assertTrue(app._handle_progress_callback(self.callback("wp:d:4")))
+            limit = time.monotonic() + 2
+            while app.progress.history["4"]["view"] != "detail" and time.monotonic() < limit:
+                time.sleep(.01)
             self.assertEqual(app.work.record["id"], 0)
             self.assertEqual(app.work.record["status"], "idle")
 
