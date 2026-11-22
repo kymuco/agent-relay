@@ -215,6 +215,24 @@ class LocalWorkTests(unittest.TestCase):
                 codex.assert_not_called()
             self.assertEqual(app.work.record["status"], "stopped")
 
+    def test_codex_flag_order_keeps_approval_before_exec(self):
+        with tempfile.TemporaryDirectory() as folder:
+            observed = {}
+            def fake_popen(command, **kwargs):
+                observed['command'] = command
+                proc = Mock()
+                proc.communicate.return_value = (None, None)
+                proc.returncode = 0
+                return proc
+            with patch('local_codex._codex_command', return_value=['codex']):
+                with patch('local_codex.subprocess.Popen', side_effect=fake_popen):
+                    result = CodexRunner().run(Path(folder), 'Run tests', timeout=10)
+            self.assertTrue(result.success)
+            self.assertEqual(observed['command'][:4],
+                             ['codex', '--ask-for-approval', 'never', 'exec'])
+            self.assertEqual(observed['command'][-1], '-')
+
+
     def test_real_subprocess_jsonl_roundtrip_using_fake_codex(self):
         """Test actual pipes/argv/JSONL without calling a model or writing code."""
         with tempfile.TemporaryDirectory() as folder:
