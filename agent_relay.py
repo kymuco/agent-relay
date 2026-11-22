@@ -1125,82 +1125,125 @@ class AgentRelay:
         return False
 
     def _run_github_work(self, payload: tuple[int, str, str], generation: int) -> None:
-        """GitHub development in parallel with the ordinary Ragna chat."""
+        """Background GitHub work, bounded amendments, and verified remote SHA."""
         if self.work is None or self._background is None:
             return
-        work_id, project, task = payload
+        work_id, project, original_task = payload
         permitted = lambda: self._run_permitted(generation) and self.work.active(work_id)
         if not permitted():
             return
         repo = self.work_repos[project]
         stage = 'coordinator'
         try:
-            if not self.work.update(work_id, 'running', 1):
-                return
-            report = self._background.run(
-                work_id=work_id, project=project, repo=repo, task=task,
-                permitted=permitted)
-            if report is None or not permitted():
-                return
+            task = original_task
             verified = False
+            previous_sha = ''
+            report = None
             verification_note = ''
-            if report.status == 'ready':
+            rounds = 0
+            for round_no in range(1, self.config.work_max_rounds + 1):
+                if not permitted():
+                    return
+                rounds = round_no
+                if not self.work.update(
+                        work_id, 'running', round_no,
+                        note='Разработка в GitHub' if round_no == 1 else
+                             'Разработчик применяет уточнения'):
+                    return
+                stage = 'developer'
+                report = self._background.run(
+                    work_id=work_id, project=project, repo=repo, task=task,
+                    previous_sha=previous_sha, permitted=permitted)
+                if report is None or not permitted():
+                    return
+                if report.status != 'ready':
+                    verification_note = ('Worker was blocked; new changes were not '
+                                         'independently verified.')
+                    break
                 stage = 'git remote verification'
                 verified = verify_remote_branch(
-                    self.work_projects[project], repo, report.branch,
-                    report.commit_sha)
+                    self.work_projects[project], repo, report.branch, report.commit_sha)
                 if not verified:
                     raise ValueError('GitHub branch SHA does not match the worker claim')
+                if previous_sha and report.commit_sha == previous_sha:
+                    raise ValueError('Developer claimed a revision without a new commit')
+                previous_sha = report.commit_sha
                 verification_note = 'Remote Git branch and SHA independently verified.'
-                if self.config.work_local_verify:
-                    # Only the operator's allowlisted, clean dedicated checkout.
-                    stage = 'checkout verified branch'
-                    checkout_verified_commit(
-                        self.work_projects[project], report.commit_sha, report.branch)
-                    if not permitted():
-                        return
-                    stage = 'local Codex test verification'
-                    test = self.work.runner.run(
-                        self.work_projects[project],
-                        'READ-ONLY verification of the exact checked-out commit ' +
-                        report.commit_sha + '. Do not modify files. Run existing '
-                        'tests if possible; report exact commands and failures. '
-                        'Do not install dependencies, make commits or access the network.',
-                        timeout=self.config.work_timeout_seconds,
-                        sandbox='read-only')
-                    if not permitted():
-                        return
-                    verification_note += ' Codex check: ' + test.summary[:1000]
-                    if not test.success:
-                        raise RuntimeError('local Codex verification did not complete')
-            else:
-                verification_note = 'Worker was blocked; no branch was accepted.'
+                if not permitted():
+                    return
+                # Capture explicit human amendments only AFTER one worker step.
+                # The final permitted round leaves late changes pending, and
+                # atomic WorkState.finalize flags those as needs_review.
+                if round_no < self.config.work_max_rounds:
+                    amendments = self.work.take_amendments(work_id)
+                    if amendments:
+                        task = (
+                            'Continue EXACTLY the same work and branch for project ' +
+                            project + ' at previous verified commit ' + previous_sha +
+                            '. Apply these new HUMAN-authorized requirements, '
+                            'without reverting earlier changes:\n' +
+                            json.dumps(amendments, ensure_ascii=False))
+                        LOG.info('GitHub-задача #%s · передано уточнений: %s',
+                                 work_id, len(amendments))
+                        continue
+                break
+            if report is None or not permitted():
+                return
+            if verified and report.status == 'ready' and self.config.work_local_verify:
+                stage = 'checkout verified branch'
+                checkout_verified_commit(
+                    self.work_projects[project], report.commit_sha, report.branch)
+                if not permitted():
+                    return
+                stage = 'local Codex test verification'
+                test = self.work.runner.run(
+                    self.work_projects[project],
+                    'READ-ONLY verification of the exact checked-out commit ' +
+                    report.commit_sha + '. Do not modify files. Run existing '
+                    'tests if possible; report exact commands and failures. '
+                    'Do not install dependencies, make commits or access the network.',
+                    timeout=self.config.work_timeout_seconds, sandbox='read-only')
+                if not permitted():
+                    return
+                verification_note += ' Codex check: ' + test.summary[:1000]
+                if not test.success:
+                    raise RuntimeError('local Codex verification did not complete')
             stage = 'Ragna work review'
+            self.work.update(work_id, 'running', rounds, note='Ragna проверяет отчёт')
             review_data = json.dumps({
                 'developer_status': report.status,
                 'repository': report.repository,
                 'branch': report.branch,
                 'commit_sha': report.commit_sha,
                 'developer_summary': report.summary[:2200],
-                'remote_verified': verified,
+                'remote_verified': verified and report.status == 'ready',
                 'local_check': verification_note,
+                'pending_amendments': len(self.work.pending_snapshot()),
             }, ensure_ascii=False)
             message = self._background.review(
-                work_id=work_id, project=project, repo=repo, task=task,
+                work_id=work_id, project=project, repo=repo, task=original_task,
                 report=review_data, permitted=permitted)
             if message is None or not permitted():
                 return
-            status = 'completed' if verified else 'failed'
+            target_status = 'completed' if verified and report.status == 'ready' else 'failed'
             title = ('Проверен коммит ' + report.commit_sha[:12] +
                      ' в ' + report.repository + ' · ' + report.branch
-                     if verified else 'Исполнитель не подтвердил коммит')
-            if not self.work.update(work_id, status, 1, note=title):
+                     if target_status == 'completed' else 'Исполнитель не подтвердил новые изменения')
+            status = self.work.finalize(work_id, target_status, rounds, title)
+            if status is None:
                 return
+            pending = self.work.pending_snapshot()
+            warning = (
+                '\n\nВнимание: ' + str(len(pending)) +
+                ' новых уточнений не применены. Создай отдельное поручение '
+                'после завершения текущей задачи.'
+                if pending else '')
             self.api.call('sendMessage', {
                 'chat_id': self.config.chat_id,
-                'text': f'Local Work #{work_id}: {title}\n{message[:1800]}',
+                'text': f'Local Work #{work_id}: {title}\n{message[:1800]}' + warning,
             })
-            LOG.info('GitHub-задача #%s: %s', work_id, status)
+            LOG.info('GitHub-задача #%s: %s · итераций %s',
+                     work_id, status, rounds)
         except Exception as exc:
             if not permitted():
                 return
