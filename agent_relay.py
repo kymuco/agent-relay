@@ -975,15 +975,19 @@ class AgentRelay:
             params['reasoning_effort'] = self.config.effort
         previous = ''
         stage = 'planning'
+        started = time.monotonic()
         try:
             for round_no in range(1, self.config.work_max_rounds + 1):
                 if not self._run_permitted(generation) or not self.work.active(work_id):
                     return
                 self.work.update(work_id, 'running', round_no)
                 stage = 'Ragna planning'
+                segment_started = time.monotonic()
                 plan = self.client.send(
                     work_prompt(task, project, round_no=round_no, result=previous,
                                 max_rounds=self.config.work_max_rounds), **params)
+                LOG.debug('Local Work #%s · Ragna round %s: %.1f s',
+                          work_id, round_no, time.monotonic() - segment_started)
                 if not self._run_permitted(generation) or not self.work.active(work_id):
                     return
                 stage = 'Ragna decision parsing'
@@ -996,12 +1000,16 @@ class AgentRelay:
                             'chat_id': self.config.chat_id,
                             'text': f'Local Work #{work_id}\n{value}',
                         })
-                        LOG.info('Локальная задача #%s завершена', work_id)
+                        LOG.info('Локальная задача #%s завершена · %.1f с · %s запуск(ов) Codex',
+                                 work_id, time.monotonic() - started, round_no - 1)
                     return
                 LOG.debug('Local Work #%s: Codex round %s', work_id, round_no)
                 stage = 'Codex execution'
+                segment_started = time.monotonic()
                 result = runner.run(self.work_projects[project], value,
                                     timeout=self.config.work_timeout_seconds)
+                LOG.debug('Local Work #%s · Codex round %s: %.1f s',
+                          work_id, round_no, time.monotonic() - segment_started)
                 if not self._run_permitted(generation) or not self.work.active(work_id):
                     return
                 previous = result.summary
@@ -1020,11 +1028,14 @@ class AgentRelay:
             if not self._run_permitted(generation) or not self.work.active(work_id):
                 return
             stage = 'Ragna final review'
+            segment_started = time.monotonic()
             final = self.client.send(work_prompt(
                 task, project, round_no=self.config.work_max_rounds + 1,
                 result=previous, max_rounds=self.config.work_max_rounds
             ).replace('To delegate: {"action":"delegate","instruction":"specific bounded Codex task"}. ',
                       'Delegation is no longer available. '), **params)
+            LOG.debug('Local Work #%s · Ragna final review: %.1f s',
+                      work_id, time.monotonic() - segment_started)
             if not self._run_permitted(generation) or not self.work.active(work_id):
                 return
             stage = 'Ragna final decision parsing'
@@ -1037,7 +1048,8 @@ class AgentRelay:
                     'chat_id': self.config.chat_id,
                     'text': f'Local Work #{work_id}\n{text}',
                 })
-                LOG.info('Локальная задача #%s завершена', work_id)
+                LOG.info('Локальная задача #%s завершена · %.1f с · %s запуск(ов) Codex',
+                         work_id, time.monotonic() - started, self.config.work_max_rounds)
         except Exception as exc:
             if not self._run_permitted(generation) or not self.work.active(work_id):
                 return
