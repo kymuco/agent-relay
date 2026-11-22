@@ -240,12 +240,28 @@ class CodexRunner:
             "--json", "--sandbox", "workspace-write",
             "-C", str(directory), "-"
         ]
+        # The user's activated Python may not resolve inside Codex's own
+        # Windows sandbox/shell. Give it an exact operator-controlled executable
+        # path, not just the ambiguous 'python' or 'py' commands.
+        configured_python = os.getenv("WORK_PYTHON", "").strip()
+        python_binary = Path(configured_python).expanduser() if configured_python else Path(sys.executable)
+        if not python_binary.is_absolute() or not python_binary.is_file():
+            raise RuntimeError("WORK_PYTHON must be an existing absolute Python executable")
+        python_binary = python_binary.resolve(strict=True)
         prompt = (
             "You are a bounded local coding worker for a human-authorized task. "
             "Only modify files inside the current project. No git push, merge, "
             "remote publishing, secret reading, or system configuration. "
             "Do not bypass sandbox restrictions. Return a concise final summary "
-            "with changed files, tests run, and uncertainties.\n\nTASK:\n" + instruction
+            "with changed files, tests run, and uncertainties. "
+            "The configured project WORKING DIRECTORY is the repository root. "
+            "Do NOT create an extra subfolder named after the project alias. "
+            "For all Python test commands use the exact trusted interpreter path "
+            "below, in double quotes, instead of PATH lookups for python or py. "
+            "This is a preconfigured executable, not permission to edit outside "
+            "the working directory. If sandbox denies executing it, report that "
+            "honestly rather than trying alternative interpreters or bypasses. "
+            "Python interpreter: " + str(python_binary) + "\n\nTASK:\n" + instruction
         )
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
