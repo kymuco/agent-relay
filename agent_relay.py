@@ -1427,7 +1427,7 @@ class AgentRelay:
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
-                status_name = ('Есть неприменённые уточнения' if pending else
+                status_name = ('Новые уточнения не применены' if pending else
                                'Коммит подтверждён' if verified else
                                'Работа не завершена')
                 self.api.call('sendMessage', {
