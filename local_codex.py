@@ -411,9 +411,10 @@ class WorkState:
             return (not self._cancel.is_set() and self.record["id"] == id
                     and self.record["status"] in self.ACTIVE)
 
-    def stop(self) -> bool:
+    def stop(self, *, expected_id: int | None = None) -> bool:
         with self._lock:
-            if self.record["status"] not in self.ACTIVE:
+            if (self.record["status"] not in self.ACTIVE or
+                    (expected_id is not None and self.record["id"] != expected_id)):
                 return False
             self._cancel.set()
             self.record["status"] = "stopped"
