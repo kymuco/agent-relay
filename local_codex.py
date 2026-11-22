@@ -184,9 +184,11 @@ def _summary_from_jsonl(raw: bytes) -> str:
 class CodexRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._cancelled = threading.Event()
         self._process: subprocess.Popen[Any] | None = None
 
     def stop(self) -> None:
+        self._cancelled.set()
         with self._lock:
             process = self._process
         if process is not None:
@@ -206,10 +208,12 @@ class CodexRunner:
         )
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
-            proc = subprocess.Popen(command, cwd=directory, env=_child_environment(),
-                                    stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
-                                    creationflags=flags, start_new_session=os.name != "nt")
             with self._lock:
+                if self._cancelled.is_set():
+                    return CodexResult(False, "Локальная задача остановлена до запуска Codex.", None)
+                proc = subprocess.Popen(command, cwd=directory, env=_child_environment(),
+                                        stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
+                                        creationflags=flags, start_new_session=os.name != "nt")
                 self._process = proc
             try:
                 try:
@@ -276,6 +280,7 @@ class WorkState:
             if self.record["status"] in self.ACTIVE:
                 return None
             self._cancel.clear()
+            self.runner = CodexRunner()
             self.record = {"id": self.record["id"] + 1, "status": "queued",
                            "project": project, "stage": 0}
             self._write()
