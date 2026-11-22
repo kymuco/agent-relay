@@ -1370,8 +1370,14 @@ class AgentRelay:
                 text, bot_username=self.bot_username, aliases=self.config.bot_aliases)
             admitted = self.work.add_amendment(instruction, expected_id=work_id)
             if admitted:
-                self.progress.pending_amendments(
-                    work_id, len(self.work.pending_snapshot()), admitted=True)
+                # Telegram card editing can take tens of seconds. Do
+                # not block polling, especially /stop, on that API call.
+                threading.Thread(
+                    target=self.progress.pending_amendments,
+                    args=(work_id, len(self.work.pending_snapshot())),
+                    kwargs={'admitted': True},
+                    name=f'AgentRelayAmendmentCard-{work_id}', daemon=True,
+                ).start()
                 say('Учла уточнение к задаче #' + str(work_id) +
                     '. Оно сохранено и будет передано разработчику, если '
                     'останется разрешённая итерация.')
@@ -1775,7 +1781,17 @@ class AgentRelay:
                         reply_text = 'Подтверждение устарело или принадлежит другому пользователю.'
                         is_alert = True
                     elif self.work.stop(expected_id=work_id):
-                        self._schedule_progress_ui('mark_stopped', work_id, card_id)
+                        if not self._schedule_progress_ui('mark_stopped', work_id, card_id):
+                            # This one-shot fallback is bounded by the single
+                            # successful atomic stop, even when other UI slots
+                            # are occupied by slow journal uploads.
+                            threading.Thread(
+                                target=self.progress.update,
+                                args=(work_id, 'stopped'),
+                                kwargs={'note': 'Остановлена пользователем'},
+                                name=f'AgentRelayStopCard-{work_id}',
+                                daemon=True,
+                            ).start()
                         reply_text = ('Задача #' + str(work_id) + ' остановлена. '
                                       'Удалённый коммит нельзя откатить остановкой.')
                     else:
