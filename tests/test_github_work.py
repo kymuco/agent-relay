@@ -232,7 +232,7 @@ class GitHubWorkTests(unittest.TestCase):
             q = Queue()
             with patch("agent_relay.verify_remote_branch", return_value=True), \
                  patch("agent_relay.checkout_verified_commit") as checkout, \
-                 patch.object(app.work.runner, "run", return_value=CodexResult(
+                 patch("local_codex.CodexRunner.run", return_value=CodexResult(
                      True, "3 tests passed", 0)) as codex:
                 app._handle_work_command(self.message("/work@MyBot start demo Test"), q)
                 deadline = time.monotonic() + 3
