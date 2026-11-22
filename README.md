@@ -612,3 +612,48 @@ ordinary successful task completions to one updated card.
 
 Tip: if WORK_LIVE_PROGRESS=off, AgentRelay continues using ordinary
 plain result messages; no callback UI is emitted.
+
+### Task Conversation v1: Reply-to-card and confirmed stop
+
+With WORK_LIVE_PROGRESS=on and the GitHub backend enabled, replying to
+an actual Ragna task card binds that Telegram message to the card's exact
+persisted work ID, not the most recent task. Telegram sender/bot IDs and
+the exact card message_id must match. Replies to arbitrary messages,
+forwards or other assistants cannot acquire task authority.
+
+- 'Reply' -> 'Что там?' responds immediately from saved Host state,
+  without any ChatGPT model request.
+- 'Reply' -> 'Рагна, почему использовала unittest?' routes a normal
+  GPT-6 High conversation question to Ragna with bounded, read-only
+  context about precisely that card. Questions do not become a new
+  work request; they do not call Developer/Coordinator.
+- 'Reply' -> 'Добавь ещё проверку деления на ноль' is admitted into
+  the existing human amendment queue only when the exact bound task is
+  active, the caller is in WORK_ALLOWED_USER_IDS, and the project matches.
+  The card shows queued amendments, and existing WORK_MAX_ROUNDS bounds
+  whether the Developer will apply them. Late changes are not claimed
+  as completed. An old task's Reply can NEVER amend a newer task.
+- An explicit Reply mentioning a different allowlisted repository is
+  rejected without forwarding it to CWA or GitHub.
+- 'Reply' -> 'Останови работу' explains that the Stop button must
+  be used; arbitrary text does not stop the task.
+
+While active, a card includes the Telegram button 'Остановить задачу'.
+Pressing it shows 'Да, остановить' and 'Отмена' instead of immediately
+stopping. Only authorized work users can request/confirm. Confirmation
+is bound to the original exact card, task ID and requesting numeric
+Telegram human ID; it expires after 60 seconds. WorkState.stop compares
+the expected task ID atomically. Old buttons can never stop a later work.
+Stop cancels further AgentRelay steps but cannot roll back an existing
+remote GitHub commit.
+
+Telegram card edits for buttons and amendment counts are asynchronous,
+so a slow Telegram API should not hold up polling or /stop.
+No new agents, model providers, repositories, permissions, or automatic
+merges are introduced by this feature. Normal conversation and ordinary
+peer-bot routing are unchanged.
+
+Manual smoke test: create one tiny work task; while in progress Reply
+to its card with a question and then an explicit amendment. Verify the
+pending count and resulting review. Press Stop on a fresh long-running
+task, cancel once, then confirm; check it never changes a different task.
