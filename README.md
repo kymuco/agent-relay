@@ -567,3 +567,48 @@ compatibility. Normal Rich Messages for model responses are unchanged.
 CHAT_TYPING and WORK_LIVE_PROGRESS are both off by default; enable
 one or both in .env. They don't require another model, new CWA
 conversations or a Codex API key.
+
+### Three Telegram work-card detail levels (when WORK_LIVE_PROGRESS=on)
+
+New GitHub tasks have a single task card, updated in place.
+On success, the compact card itself shows the result, confirmed commit
+and any test count explicitly reported by the trusted GitHub Developer.
+AgentRelay no longer duplicates the entire Coordinator transcript into
+the group after a successful card edit.
+
+Inline buttons below each card:
+
+- Подробнее: edit the SAME card with bounded Developer summary, filenames,
+  test results, remote branch/SHA, and verification details.
+- Свернуть: return the SAME card to its compact format.
+- Журнал: send a separate agentrelay-work-N.txt with saved Host stage
+  events, time stamps, a bounded Developer report, and verification metadata.
+- GitHub: link to the specific verified commit, shown only for validated
+  repository/commit identifiers and verified remote SHA.
+
+Buttons are display-only and never start, stop, merge or modify tasks.
+Telegram callback_query updates are independently checked against the
+numeric allowlisted human user, the configured group chat, the exact
+original Telegram card message_id, and a persisted task ID. Other
+users/bots or fake/stale callbacks receive no document and cannot edit
+the card. Repeated journal downloads have a 20-second cooldown.
+
+The task-card state file also stores a bounded history of the last
+30 task cards, so their buttons survive AgentRelay restart and continue
+working after another job begins. Older records are pruned in FIFO ID
+order; initial legacy cards without buttons remain as they were.
+History is local data and never grants execution authority.
+
+Technical journal contents are intentionally narrow: no CWA secrets,
+full prompts, raw source code, or unfiltered model/tool transcripts.
+Developer-reported test success is shown naturally in the user card;
+the technical journal separately records its source as Developer and
+the Host's own remote SHA verification.
+
+If a Telegram status-card edit fails or a card ID was not captured,
+AgentRelay sends one concise fallback result instead of retrying
+an ambiguous edit. This avoids a missing completion while keeping
+ordinary successful task completions to one updated card.
+
+Tip: if WORK_LIVE_PROGRESS=off, AgentRelay continues using ordinary
+plain result messages; no callback UI is emitted.
