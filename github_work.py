@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from local_codex import normalize_decision_envelope, _unique_json_object
+from local_codex import normalize_decision_envelope, _unique_json_object, _child_environment
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _BRANCH = re.compile(r"^(?!-)(?!.*(?:\.\.|@\{|\\|//|[\x00-\x20~^:?*\[\]]))"
@@ -112,7 +112,8 @@ class DeveloperReport:
     summary: str
 
 
-def parse_developer(text: str, *, expected_repo: str) -> DeveloperReport:
+def parse_developer(text: str, *, expected_repo: str,
+                    expected_branch: str | None = None) -> DeveloperReport:
     data = strict_object(text)
     expected = {"status", "repository", "branch", "commit_sha", "summary"}
     if set(data) != expected or data.get("status") not in ("ready", "blocked"):
@@ -127,6 +128,8 @@ def parse_developer(text: str, *, expected_repo: str) -> DeveloperReport:
                 or data["branch"].endswith(("/", ".", ".lock"))
                 or not _SHA.fullmatch(data["commit_sha"])):
             raise ValueError("developer report has invalid Git identity")
+        if expected_branch is not None and data["branch"] != expected_branch:
+            raise ValueError("developer returned a different branch than authorized")
     elif data["branch"] or data["commit_sha"]:
         raise ValueError("blocked developer may not claim a branch or commit")
     return DeveloperReport(**data)
@@ -161,8 +164,9 @@ def developer_prompt(instruction: str, *, repo: str, work_id: int) -> str:
         "[AgentRelay / GitHub developer worker] The human authorized bounded "
         "development within exactly this GitHub repository: " + repo + ". "
         "Use your GitHub connector to inspect it and, if available and authorized "
-        "by your tool approval policies, create an isolated work branch and "
-        "commit only the requested source changes. Do NOT merge, publish releases, "
+        "by your tool approval policies, create EXACTLY this isolated work branch: "
+        + ("agentrelay/work-" + str(work_id)) + ". Commit only the requested "
+        "source changes to it. Do NOT merge, publish releases, "
         "modify repository settings, force push, or access other repositories. "
         "Do not assume tool access: if connector actions are unavailable, or any "
         "tool requires new approval, return blocked honestly instead of claiming "
@@ -204,8 +208,11 @@ class BackgroundDeveloper:
         if conversation:
             params["conversation"] = conversation
         result = self.send(prompt, purpose=f"work#{work_id}.{lane}", client=client, **params)
+        returned_id = response_conversation_id(result)
         if not conversation:
-            self.registry.remember(lane, response_conversation_id(result))
+            self.registry.remember(lane, returned_id)
+        elif returned_id != conversation:
+            raise ValueError("CWA returned a different conversation ID; refusing to continue")
         return str(getattr(result, "text", "") or "")
 
     def run(self, *, work_id: int, project: str, repo: str, task: str,
@@ -225,7 +232,8 @@ class BackgroundDeveloper:
                          work_id=work_id)
         if not permitted():
             return None
-        report = parse_developer(raw, expected_repo=repo)
+        report = parse_developer(
+            raw, expected_repo=repo, expected_branch="agentrelay/work-" + str(work_id))
         return report
 
     def review(self, *, work_id: int, project: str, repo: str,
@@ -259,6 +267,7 @@ def verify_remote_branch(workdir: Path, repo: str, branch: str, sha: str,
     def git(*args: str) -> str:
         proc = subprocess.run(["git", "-C", str(workdir), *args],
                               capture_output=True, text=True, timeout=timeout,
+                              env={**_child_environment(), "GIT_TERMINAL_PROMPT": "0"},
                               check=False)
         if proc.returncode != 0:
             raise RuntimeError("git verification command failed")
@@ -278,6 +287,7 @@ def checkout_verified_commit(workdir: Path, sha: str, branch: str,
     def git(*args: str) -> str:
         proc = subprocess.run(["git", "-C", str(workdir), *args],
                               capture_output=True, text=True, timeout=timeout,
+                              env={**_child_environment(), "GIT_TERMINAL_PROMPT": "0"},
                               check=False)
         if proc.returncode != 0:
             raise RuntimeError("git local checkout failed")
