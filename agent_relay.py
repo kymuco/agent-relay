@@ -798,27 +798,37 @@ class AgentRelay:
                 except Exception as exc:
                     LOG.warning('Голос недоступен (%s), отправляю текст', type(exc).__name__)
             if not voice_delivered:
-                for index, part in enumerate(parts):
+                if use_rich_message(text, mode=self.config.telegram_rich_mode,
+                                    from_bot=sender_is_bot):
                     if not self._run_permitted(run_generation):
                         return
-                    markup = markdown_to_telegram_html(part)
-                    valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096
-                    outgoing: dict[str, Any] = {
-                        'chat_id': self.config.chat_id,
-                        'text': markup if valid_html_size else part,
-                    }
-                    if valid_html_size:
-                        outgoing['parse_mode'] = 'HTML'
-                    # For long replies only the final chunk wakes the peer. Earlier
-                    # chunks are plain group messages, not multiple model triggers.
-                    if (index == 0 and not sender_is_bot) or (index == len(parts)-1 and peer_reply_out):
-                        outgoing['reply_parameters'] = {
-                            'message_id': message['message_id'],
-                            'allow_sending_without_reply': True,
+                    self.api.call('sendRichMessage', rich_payload(
+                        text, chat_id=self.config.chat_id,
+                        reply_message_id=message['message_id'],
+                        thread_id=message.get('message_thread_id')))
+                    LOG.debug('Telegram Rich Message отправлено')
+                else:
+                    for index, part in enumerate(parts):
+                        if not self._run_permitted(run_generation):
+                            return
+                        markup = markdown_to_telegram_html(part)
+                        valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096
+                        outgoing: dict[str, Any] = {
+                            'chat_id': self.config.chat_id,
+                            'text': markup if valid_html_size else part,
                         }
-                    if message.get('message_thread_id'):
-                        outgoing['message_thread_id'] = message['message_thread_id']
-                    self.api.call('sendMessage', outgoing)
+                        if valid_html_size:
+                            outgoing['parse_mode'] = 'HTML'
+                        # For long replies only the final chunk wakes the peer. Earlier
+                        # chunks are plain group messages, not multiple model triggers.
+                        if (index == 0 and not sender_is_bot) or (index == len(parts)-1 and peer_reply_out):
+                            outgoing['reply_parameters'] = {
+                                'message_id': message['message_id'],
+                                'allow_sending_without_reply': True,
+                            }
+                        if message.get('message_thread_id'):
+                            outgoing['message_thread_id'] = message['message_thread_id']
+                        self.api.call('sendMessage', outgoing)
             if not self._run_permitted(run_generation):
                 return
             if not sender_is_bot and self.config.media_enabled:
