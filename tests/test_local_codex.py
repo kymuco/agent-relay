@@ -1,6 +1,7 @@
 """Local Codex orchestration security, state, and lifecycle tests."""
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -9,7 +10,7 @@ from queue import Queue
 from unittest.mock import Mock, patch
 
 from agent_relay import AgentRelay, Config
-from local_codex import (CodexResult, WorkState, parse_projects,
+from local_codex import (CodexResult, CodexRunner, WorkState, parse_projects,
                          parse_work_command, parse_orchestrator_decision,
                          _summary_from_jsonl, _child_environment)
 
@@ -179,6 +180,23 @@ class LocalWorkTests(unittest.TestCase):
                 self.assertFalse(th.is_alive())
                 codex.assert_not_called()
             self.assertEqual(app.work.record["status"], "stopped")
+
+    def test_real_subprocess_jsonl_roundtrip_using_fake_codex(self):
+        """Test actual pipes/argv/JSONL without calling a model or writing code."""
+        with tempfile.TemporaryDirectory() as folder:
+            fake_code = (
+                "import sys,json;"
+                "task=sys.stdin.buffer.read().decode('utf-8');"
+                "print(json.dumps({'type':'item.completed','item':"
+                "{'type':'agent_message','text':'received task: '+task[-14:]}}))"
+            )
+            with patch("local_codex._codex_command",
+                       return_value=[sys.executable, "-c", fake_code]):
+                runner = CodexRunner()
+                result = runner.run(Path(folder), "test stdin request", timeout=8)
+            self.assertTrue(result.success)
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("stdin request", result.summary)
 
     def test_emergency_stop_cancels_work(self):
         with tempfile.TemporaryDirectory() as folder:
