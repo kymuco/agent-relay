@@ -355,12 +355,14 @@ class WorkState:
             self._write()
             return True
 
-    def add_amendment(self, text: str, *, limit: int = 4) -> bool:
+    def add_amendment(self, text: str, *, limit: int = 4,
+                      expected_id: int | None = None) -> bool:
         """Persist an explicit human change request; never silently drop it."""
         if not isinstance(text, str) or not 1 <= len(text.strip()) <= 1600:
             return False
         with self._lock:
-            if self._cancel.is_set() or self.record["status"] not in self.ACTIVE:
+            if (self._cancel.is_set() or self.record["status"] not in self.ACTIVE
+                    or (expected_id is not None and self.record["id"] != expected_id)):
                 return False
             pending = self.record.setdefault("pending_amendments", [])
             if not isinstance(pending, list) or len(pending) >= limit:
