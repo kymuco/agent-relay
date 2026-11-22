@@ -499,3 +499,36 @@ have been delivered. Set the option back to off if needed.
 Both options are independent. They add no new CWA model, auth or agents.
 All CWA conversations still explicitly request gpt-6 and high.
 All local work still requires numeric user and project/repository allowlists.
+
+### Generated images in Telegram (async readback)
+
+Natural requests such as 'Рагна, сгенерируй картинку кота',
+'Рагна, сделай мне изображение города' or 'Рагна, нарисуй кота'
+now trigger the image-delivery path when MEDIA_ENABLED=on.
+The ChatGPT send still requests GPT-6 High; actual image generation is
+up to the product's available capabilities. AgentRelay cannot assume
+an image was created from the assistant's text alone.
+
+After the CWA chat turn, AgentRelay polls CANONICAL read-only image
+observations in a separate CWA client for a bounded period (about
+71 seconds total). This does not block normal Ragna replies. Once a
+new ready image is observed, its generated artifact bytes are verified
+through CWA handoff, then sent as Telegram photo or document.
+An immediate empty observation is NOT proof the image failed.
+If no ready artifact appears, Ragna reports that it was not confirmed;
+the user can later check with /images@ragnacobot without rerunning
+generation. The command only checks the image already requested.
+Images observed in the conversation before the request are excluded.
+The read-only polling does not run image generation again.
+
+Important: if Telegram upload completion is ambiguous, the image is
+marked as already attempted and is NOT automatically sent a second
+time. A later generation request supersedes any previous monitor;
+the initial image may still be present in ChatGPT history.
+The monitor stops on /stop, /resume epoch change, or AgentRelay shutdown.
+Use LOG_LEVEL=debug for intent recognition, discovery counts and
+transfer outcome without logging prompts, generated content or tokens.
+
+This path is experimental because the CWA readback and generated
+artifact handoff depend on changing ChatGPT consumer endpoints.
+MEDIA_ENABLED=off disables image delivery; MAX_MEDIA_MB limits size.
