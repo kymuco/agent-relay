@@ -9,11 +9,12 @@ from __future__ import annotations
 import re
 from typing import Literal, Mapping
 
-TaskReplyKind = Literal["amend", "status", "question", "stop_info"]
+TaskReplyKind = Literal["amend", "status", "question", "stop_info", "foreign_project"]
 _AMEND = re.compile(
     r"^(?:пожалуйста[\s,]+)?"
     r"(?:учти|не забудь|добавь(?:\s+(?:ещё|еще|также))?|"
     r"исправь|доработай|поправь|измени|предусмотри|"
+    r"создай|сделай|обнови|реализуй|перепиши|замени|"
     r"проверь также|и\s+(?:ещё|еще)|(?:ещё|еще)|"
     r"уточнение\s*:)(?=\s|$)", re.I)
 _QUESTION = re.compile(
@@ -70,7 +71,7 @@ def classify_task_reply(text: str, *, bot_username: str,
             for term in (alias, repo, repo.rsplit("/", 1)[-1]):
                 if re.search(r"(?<![\w-])" + re.escape(term) + r"(?![\w-])",
                              body, re.I):
-                    return "question"  # Never amend a different repository.
+                    return "foreign_project"  # Refuse instead of sending work-like text to CWA.
         return "amend"
     return "question"
 
