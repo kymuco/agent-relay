@@ -124,6 +124,10 @@ class TaskReplyTests(unittest.TestCase):
                 time.sleep(.01)
             self.assertEqual(app.progress.record["pending_changes"], 1)
             self.assertEqual(queue.qsize(), 0)
+            deadline = time.monotonic() + 2
+            while ("Уточнения в очереди" not in app.progress.record["html"]
+                   and time.monotonic() < deadline):
+                time.sleep(.01)
             self.assertIn("Уточнения в очереди",
                           app.progress.record["html"])
             main.send.assert_not_called()
