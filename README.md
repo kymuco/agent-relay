@@ -454,3 +454,48 @@ tasks, independently of other people allowed to chat with Ragna.
 worker conversation, but CWA's Direct HTTP path does not independently
 guarantee connector execution/approval parity with the website. Validate
 the first real branch creation and GitHub SHA before trusting live execution.
+
+### Natural conversation and Telegram Rich Messages (opt-in)
+
+Ragna now favors natural short replies in everyday chat; for technical
+explanations, use structured formatting without forcing headings everywhere.
+
+Enable natural work with `NATURAL_WORK_ENABLED=on` only when both
+`WORK_ENABLED=on` and `WORK_EXECUTOR=github` are already configured.
+An authorized human can address Ragna, use an imperative, and name a
+single allowlisted project alias or its repository short name:
+
+    Рагна, создай калькулятор и тесты в github-workspace
+
+Questions such as 'Рагна, как думаешь, стоит ли создать калькулятор?'
+remain ordinary conversation. Ambiguous project references and
+unaddressed group chat cannot trigger work. The classifier deliberately
+does not treat 'да, давай' or old quoted messages as authority.
+The explicit /work command remains available for other phrasings.
+
+While a GitHub job is running, the allowed human can add requirements:
+
+    Рагна, учти деление на ноль
+    Рагна, добавь ещё тест ошибок
+
+The Host stores amendments durably until the next worker checkpoint.
+The existing persistent coordinator and developer chats attempt the
+update on the SAME task branch, and the remote SHA is verified again.
+The allowed number of developer passes is WORK_MAX_ROUNDS (default 2).
+If an amendment arrives too late or the iteration budget is exhausted,
+the job is marked needs_review, and unprocessed changes are explicitly
+reported; they are not silently claimed to have been implemented.
+No cancelled/ambiguous CWA sends are replayed automatically, and
+stopping AgentRelay cannot undo a remote commit already created.
+
+Telegram supports native Rich Messages. Set TELEGRAM_RICH_MODE=auto
+to send only structured Markdown replies (headings, lists, code blocks,
+tables) using sendRichMessage with rich_message.markdown. Ordinary chat
+and inter-bot handoffs keep their existing sendMessage HTML behavior.
+Default off is conservative: if Telegram rejects a rich send, AgentRelay
+does not automatically resend because an ambiguous write may already
+have been delivered. Set the option back to off if needed.
+
+Both options are independent. They add no new CWA model, auth or agents.
+All CWA conversations still explicitly request gpt-6 and high.
+All local work still requires numeric user and project/repository allowlists.
