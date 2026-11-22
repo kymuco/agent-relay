@@ -471,6 +471,7 @@ class AgentRelay:
         self.progress = (WorkProgress(api, config.chat_id, config.work_progress_file)
                          if config.work_live_progress and config.work_enabled
                          and config.work_executor == 'github' else None)
+        self._journal_reply_cooldown: dict[tuple[int, int], float] = {}
         self._background = None
         if config.work_enabled and config.work_executor == 'github':
             if coordinator_client is None or developer_client is None:
@@ -1219,7 +1220,8 @@ class AgentRelay:
                 self.progress.begin(
                     background_id, project, task,
                     reply_message_id=message['message_id'],
-                    thread_id=message.get('message_thread_id'))
+                    thread_id=message.get('message_thread_id'),
+                    repo=self.work_repos.get(project, ''))
             except Exception as exc:
                 # The initial send may already have reached Telegram. Never
                 # create a duplicate status message after an ambiguous send.
@@ -1412,34 +1414,46 @@ class AgentRelay:
             status = self.work.finalize(work_id, target_status, rounds, title)
             if status is None:
                 return
-            if self.progress is not None:
-                self.progress.update(work_id, status, note=title)
             pending = self.work.pending_snapshot()
-            warning = (
-                '\n\nВнимание: ' + str(len(pending)) +
-                ' новых уточнений не применены. Создай отдельное поручение '
-                'после завершения текущей задачи.'
-                if pending else '')
-            self.api.call('sendMessage', {
-                'chat_id': self.config.chat_id,
-                'text': f'Local Work #{work_id}: {title}\n{message[:1800]}' + warning,
-            })
+            card_updated = False
+            if self.progress is not None:
+                self.progress.result(
+                    work_id, developer_summary=report.summary,
+                    coordinator_summary=message, repository=report.repository,
+                    branch=report.branch, commit_sha=report.commit_sha,
+                    remote_verified=verified and report.status == 'ready',
+                    local_check=verification_note,
+                    pending_amendments=len(pending))
+                card_updated = self.progress.update(work_id, status, note=title)
+            if not card_updated:
+                # One short fallback when no status card is available.
+                status_name = ('Есть неприменённые уточнения' if pending else
+                               'Коммит подтверждён' if verified else
+                               'Работа не завершена')
+                self.api.call('sendMessage', {
+                    'chat_id': self.config.chat_id,
+                    'text': (f'Задача #{work_id}: {status_name}. ' +
+                             (title[:220] if verified else message[:380])),
+                })
             LOG.info('GitHub-задача #%s: %s · итераций %s',
                      work_id, status, rounds)
         except Exception as exc:
             if not permitted():
                 return
             self.work.update(work_id, 'failed', note='Ошибка этапа: ' + stage[:100])
-            if self.progress is not None:
-                self.progress.update(work_id, 'failed', note='Сбой на этапе ' + stage[:80])
+            status_edited = (
+                self.progress.update(work_id, 'failed',
+                                     note='Сбой на этапе ' + stage[:80])
+                if self.progress is not None else False)
             LOG.error('GitHub-задача #%s: ошибка на этапе %s (%s)',
                       work_id, stage, type(exc).__name__)
-            self.api.call('sendMessage', {
-                'chat_id': self.config.chat_id,
-                'text': (f'Local Work #{work_id}: сбой на этапе {stage} '
-                         f'({type(exc).__name__}); повтор отключён. '
-                         'Локальный код и удалённые изменения требуют проверки.'),
-            })
+            if not status_edited:
+                self.api.call('sendMessage', {
+                    'chat_id': self.config.chat_id,
+                    'text': (f'Задача #{work_id}: сбой на этапе {stage} '
+                             f'({type(exc).__name__}); повтор отключён. '
+                             'Результаты требуют проверки.'),
+                })
 
     def _run_local_work(self, payload: tuple[int, str, str], generation: int) -> None:
         """Single serialized orchestration loop in the existing CWA worker."""
