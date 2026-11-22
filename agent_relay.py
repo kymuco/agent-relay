@@ -24,6 +24,8 @@ from local_codex import (WorkState, parse_projects, parse_work_command,
 from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
                          verify_remote_branch, checkout_verified_commit)
 from natural_work import route_natural_work
+from telegram_presence import TypingPulse, WorkProgress
+from contextlib import nullcontext
 from telegram_presentation import use_rich_message, rich_payload
 from relay_logging import LOG, configure_logging
 from catchup import make_catchup_prompt, parse_catchup_decision, select_catchup
@@ -130,6 +132,9 @@ class Config:
     work_local_verify: bool = False
     natural_work_enabled: bool = False
     telegram_rich_mode: str = 'off'
+    chat_typing: bool = False
+    work_live_progress: bool = False
+    work_progress_file: str = '.agent-relay-progress.json'
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -195,6 +200,10 @@ class Config:
         telegram_rich_mode = os.getenv('TELEGRAM_RICH_MODE', 'off').strip().lower()
         if telegram_rich_mode not in ('off', 'auto'):
             raise ValueError('TELEGRAM_RICH_MODE must be off or auto')
+        chat_typing = os.getenv('CHAT_TYPING', 'off').strip().lower() in ('on', '1', 'true')
+        work_live_progress = os.getenv('WORK_LIVE_PROGRESS', 'off').strip().lower() in ('on', '1', 'true')
+        if work_live_progress and (not work_enabled or work_executor != 'github'):
+            raise ValueError('WORK_LIVE_PROGRESS requires WORK_ENABLED=on and WORK_EXECUTOR=github')
         if natural_work_enabled and (not work_enabled or work_executor != 'github'):
             raise ValueError('NATURAL_WORK_ENABLED requires WORK_ENABLED=on and WORK_EXECUTOR=github')
         if work_executor not in ('codex', 'github'):
@@ -252,6 +261,9 @@ class Config:
             work_local_verify=work_local_verify,
             natural_work_enabled=natural_work_enabled,
             telegram_rich_mode=telegram_rich_mode,
+            chat_typing=chat_typing,
+            work_live_progress=work_live_progress,
+            work_progress_file=os.getenv('WORK_PROGRESS_FILE', '.agent-relay-progress.json'),
         )
 
 
@@ -456,6 +468,9 @@ class AgentRelay:
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
+        self.progress = (WorkProgress(api, config.chat_id, config.work_progress_file)
+                         if config.work_live_progress and config.work_enabled
+                         and config.work_executor == 'github' else None)
         self._background = None
         if config.work_enabled and config.work_executor == 'github':
             if coordinator_client is None or developer_client is None:
@@ -700,8 +715,8 @@ class AgentRelay:
         if control_command:
             if control_command == 'stop':
                 changed = self.control.stop()
-                if self.work is not None:
-                    self.work.stop()
+                if self.work is not None and self.work.stop() and self.progress is not None:
+                    self.progress.update(self.work.record['id'], 'stopped')
                 self._stop_peer_reply()
                 self.pending_image_baseline = None
                 with self._image_transfer_lock:
@@ -881,7 +896,13 @@ class AgentRelay:
         try:
             if not self._run_permitted(run_generation):
                 return
-            result = self._cwa_send(prompt, purpose='chat', **params)
+            typing_scope = (
+                TypingPulse(self.api, self.config.chat_id,
+                            thread_id=message.get('message_thread_id'),
+                            permitted=lambda: self._run_permitted(run_generation))
+                if self.config.chat_typing else nullcontext())
+            with typing_scope:
+                result = self._cwa_send(prompt, purpose='chat', **params)
             # A stop during CWA can never be rolled back. The answer is
             # discarded even if /resume has been received in the meantime.
             if not self._run_permitted(run_generation):
@@ -1145,12 +1166,17 @@ class AgentRelay:
             return True
         verb, project, task = parsed
         reply = ''
+        background_thread = None
+        background_id = None
         if not self.config.work_enabled or self.work is None:
             reply = 'Локальная работа отключена. Настрой WORK_ENABLED и WORK_PROJECTS.'
         elif verb == 'status':
             reply = self.work.status()
         elif verb == 'stop':
-            reply = ('Локальная задача остановлена.' if self.work.stop()
+            stopped = self.work.stop()
+            if stopped and self.progress is not None:
+                self.progress.update(self.work.record['id'], 'stopped')
+            reply = ('Локальная задача остановлена.' if stopped
                      else 'Сейчас нет выполняемой локальной задачи.')
         elif verb == 'start':
             if self.control.paused:
@@ -1169,7 +1195,8 @@ class AgentRelay:
                             target=self._run_github_work,
                             args=((work_id, project, task), self.control.generation()),
                             name=f'AgentRelayGitHubWork-{work_id}', daemon=True)
-                        thread.start()
+                        background_thread = thread
+                        background_id = work_id
                         reply = (f'Приняла задачу по проекту {project}. '
                                  'Передала её разработчику и сообщу, когда проверю результат.'
                                  if natural else
@@ -1187,6 +1214,19 @@ class AgentRelay:
         else:
             reply = ('Команды: /work@' + self.bot_username +
                      ' start <проект> <задача> · status · stop')
+        if background_thread is not None and self.progress is not None:
+            try:
+                self.progress.begin(
+                    background_id, project, task,
+                    reply_message_id=message['message_id'],
+                    thread_id=message.get('message_thread_id'))
+            except Exception as exc:
+                # The initial send may already have reached Telegram. Never
+                # create a duplicate status message after an ambiguous send.
+                LOG.warning('Не удалось сохранить статус задачи (%s)',
+                            type(exc).__name__)
+            background_thread.start()
+            return True
         self.api.call('sendMessage', {
             'chat_id': self.config.chat_id, 'text': reply,
             'reply_parameters': {
@@ -1194,6 +1234,8 @@ class AgentRelay:
                 'allow_sending_without_reply': True,
             },
         })
+        if background_thread is not None:
+            background_thread.start()
         return True
 
     def _handle_natural_work(
@@ -1277,10 +1319,15 @@ class AgentRelay:
                         note='Разработка в GitHub' if round_no == 1 else
                              'Разработчик применяет уточнения'):
                     return
+                if self.progress is not None:
+                    self.progress.update(
+                        work_id, 'coordinator' if round_no == 1 else 'revision')
                 stage = 'developer'
                 report = self._background.run(
                     work_id=work_id, project=project, repo=repo, task=task,
-                    previous_sha=previous_sha, permitted=permitted)
+                    previous_sha=previous_sha, permitted=permitted,
+                    on_phase=(lambda phase: self.progress.update(work_id, phase))
+                             if self.progress is not None else None)
                 if report is None or not permitted():
                     return
                 if report.status != 'ready':
@@ -1288,6 +1335,8 @@ class AgentRelay:
                                          'independently verified.')
                     break
                 stage = 'git remote verification'
+                if self.progress is not None:
+                    self.progress.update(work_id, 'verify')
                 verified = verify_remote_branch(
                     self.work_projects[project], repo, report.branch, report.commit_sha)
                 if not verified:
@@ -1323,6 +1372,8 @@ class AgentRelay:
                 if not permitted():
                     return
                 stage = 'local Codex test verification'
+                if self.progress is not None:
+                    self.progress.update(work_id, 'local_test')
                 test = self.work.runner.run(
                     self.work_projects[project],
                     'READ-ONLY verification of the exact checked-out commit ' +
@@ -1337,6 +1388,8 @@ class AgentRelay:
                     raise RuntimeError('local Codex verification did not complete')
             stage = 'Ragna work review'
             self.work.update(work_id, 'running', rounds, note='Ragna проверяет отчёт')
+            if self.progress is not None:
+                self.progress.update(work_id, 'review')
             review_data = json.dumps({
                 'developer_status': report.status,
                 'repository': report.repository,
@@ -1359,6 +1412,8 @@ class AgentRelay:
             status = self.work.finalize(work_id, target_status, rounds, title)
             if status is None:
                 return
+            if self.progress is not None:
+                self.progress.update(work_id, status, note=title)
             pending = self.work.pending_snapshot()
             warning = (
                 '\n\nВнимание: ' + str(len(pending)) +
@@ -1375,6 +1430,8 @@ class AgentRelay:
             if not permitted():
                 return
             self.work.update(work_id, 'failed', note='Ошибка этапа: ' + stage[:100])
+            if self.progress is not None:
+                self.progress.update(work_id, 'failed', note='Сбой на этапе ' + stage[:80])
             LOG.error('GitHub-задача #%s: ошибка на этапе %s (%s)',
                       work_id, stage, type(exc).__name__)
             self.api.call('sendMessage', {
@@ -1495,6 +1552,9 @@ class AgentRelay:
             })
 
     def serve(self) -> None:
+        if (self.progress is not None and self.work is not None and
+                self.work.record.get('status') == 'interrupted'):
+            self.progress.interrupted(self.work.record['id'])
         # One non-reentrant CWA worker; poll Telegram independently for
         # /stop and /resume even while generation or speech is in progress.
         work_queue: queue.Queue[tuple[dict[str, Any], int]] = queue.Queue(maxsize=32)
