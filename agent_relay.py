@@ -1347,6 +1347,11 @@ class AgentRelay:
 
         work_id = card['work_id']
         active = self.work.active(work_id)
+        if kind == 'foreign_project':
+            say('Эта карточка относится к проекту ' + str(card.get('project'))[:70] +
+                '. Изменения для другого проекта нужно оформить отдельным поручением. '
+                'Ничего не отправляла разработчику.')
+            return True
         if kind == 'stop_info':
             say('Остановить именно задачу #' + str(work_id) +
                 ' можно кнопкой «Остановить задачу» в её карточке. '
