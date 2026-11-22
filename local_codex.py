@@ -232,12 +232,15 @@ class CodexRunner:
         if process is not None:
             _kill_tree(process)
 
-    def run(self, directory: Path, instruction: str, *, timeout: int) -> CodexResult:
+    def run(self, directory: Path, instruction: str, *, timeout: int,
+            sandbox: str = "workspace-write") -> CodexResult:
+        if sandbox not in ("workspace-write", "read-only"):
+            raise ValueError("Codex sandbox must be workspace-write or read-only")
         # Approval is a TOP-LEVEL Codex flag. Placing it after "exec"
         # is rejected by supported Codex CLI versions.
         command = _codex_command() + [
             "--ask-for-approval", "never", "exec",
-            "--json", "--sandbox", "workspace-write",
+            "--json", "--sandbox", sandbox,
             "-C", str(directory), "-"
         ]
         # The user's activated Python may not resolve inside Codex's own
