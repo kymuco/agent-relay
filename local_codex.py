@@ -65,23 +65,49 @@ def parse_work_command(text: str, bot_username: str) -> tuple[str, str, str] | N
     return ("help", "", "")
 
 
-def parse_orchestrator_decision(text: str, *, first: bool) -> tuple[str, str]:
-    """Accept one JSON object (optionally in a single JSON fence), then validate it.
+_JSON_FENCE = re.compile(r"\x60{3}(?:json)?[ \t]*\r?\n(.*?)\r?\n\x60{3}", re.I | re.S)
+_ESCAPE_ENVELOPE = re.compile(r"<escape>(.*?)</escape>", re.S)
+_CODEBLOCK_ENVELOPE = re.compile(
+    r"<(?P<tag>codeblock)(?P<attrs>(?:\s+(?:language|lang)\s*=\s*(?:\"json\"|'json'|json)|\s+id\s*=\s*(?:\"[A-Za-z0-9_-]{1,80}\"|'[A-Za-z0-9_-]{1,80}'))*)\s*>"
+    r"(?P<body>.*?)</(?P=tag)>", re.I | re.S,
+)
 
-    ChatGPT occasionally wraps an otherwise valid JSON decision in a Markdown
-    code fence. Accept that presentation wrapper only, never arbitrary text
-    surrounding a JSON fragment, and never relax the action/schema limits.
+
+def normalize_decision_envelope(text: str) -> str:
+    """Remove only a complete, known presentation wrapper around JSON.
+
+    Codexia faced the same issue with literal <escape> wrappers. Do not
+    extract embedded JSON from arbitrary prose or remove unknown tags.
     """
     if not isinstance(text, str):
         raise ValueError("Ragna work decision is not text")
     raw = text.strip().lstrip("\ufeff").strip()
-    fence = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```",
-                         raw, flags=re.I | re.S)
-    if fence:
-        raw = fence.group(1).strip()
+    for _ in range(3):
+        wrapped = (_JSON_FENCE.fullmatch(raw)
+                   or _ESCAPE_ENVELOPE.fullmatch(raw)
+                   or _CODEBLOCK_ENVELOPE.fullmatch(raw))
+        if wrapped is None:
+            break
+        raw = (wrapped.group("body") if "body" in wrapped.groupdict()
+               else wrapped.group(1)).strip()
+    return raw
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("Ragna work decision has duplicate JSON keys")
+        result[name] = value
+    return result
+
+
+def parse_orchestrator_decision(text: str, *, first: bool) -> tuple[str, str]:
+    """Accept one strictly validated JSON decision, with documented wrappers."""
+    raw = normalize_decision_envelope(text)
     try:
-        data = json.loads(raw)
-    except ValueError as exc:
+        data = json.loads(raw, object_pairs_hook=_unique_json_object)
+    except (ValueError, TypeError) as exc:
         raise ValueError("Ragna response is not one valid JSON object") from exc
     if not isinstance(data, dict):
         raise ValueError("Ragna work decision must be an object")
