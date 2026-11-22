@@ -127,6 +127,40 @@ class GitHubWorkTests(unittest.TestCase):
             self.assertEqual(ChatRegistry(str(Path(folder)/"chats.json")).ids,
                              {"coordinator": "coord-1", "developer": "dev-1"})
 
+    def test_task_branch_identity_is_exact_not_existing_branch(self):
+        with tempfile.TemporaryDirectory() as folder:
+            coordinator, developer = Mock(), Mock()
+            coordinator.send.return_value = response(
+                '{"action":"delegate","instruction":"Fix code"}', 'coord-1')
+            developer.send.return_value = response(
+                '{"status":"ready","repository":"owner/demo",'
+                '"branch":"main","commit_sha":"' + 'a'*40 + '"'
+                ',"summary":"Existing branch is not a new commit"}', 'dev-1')
+            store = ChatRegistry(str(Path(folder) / 'chats.json'))
+            runner = BackgroundDeveloper(
+                coordinator, developer, store,
+                lambda prompt, *, client, **kwargs: client.send(prompt, **kwargs))
+            with self.assertRaisesRegex(ValueError, 'different branch'):
+                runner.run(work_id=3, project='demo', repo='owner/demo',
+                           task='Fix', permitted=lambda: True)
+            self.assertIn('agentrelay/work-3', developer.send.call_args.args[0])
+
+    def test_cwa_changed_conversation_id_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            coordinator, developer = Mock(), Mock()
+            registry = ChatRegistry(str(Path(folder) / 'chats.json'))
+            registry.remember('coordinator', 'coord-original')
+            coordinator.send.return_value = response(
+                '{"action":"delegate","instruction":"do work"}', 'unexpected-conversation')
+            worker = BackgroundDeveloper(
+                coordinator, developer, registry,
+                lambda prompt, *, client, **kwargs: client.send(prompt, **kwargs))
+            with self.assertRaisesRegex(ValueError, 'different conversation ID'):
+                worker.run(work_id=1, project='demo', repo='owner/demo',
+                           task='fix', permitted=lambda: True)
+            self.assertEqual(registry.get('coordinator'), 'coord-original')
+            developer.send.assert_not_called()
+
     def test_strict_worker_evidence_prevents_untrusted_repo_or_fake_sha(self):
         good = json.dumps({"status":"ready","repository":"owner/demo",
                            "branch":"feat/fix", "commit_sha":"a"*40,
