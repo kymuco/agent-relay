@@ -27,7 +27,18 @@ ARTIFACT_EXTS = TEXT_EXTS | {'.pdf', '.png', '.jpg', '.jpeg', '.webp', '.zip', '
 INBOUND_DOCUMENT_EXTS = TEXT_EXTS | {'.pdf', '.docx', '.png', '.jpeg', '.jpg', '.webp'}
 UNSUPPORTED_MEDIA_KINDS = ('animation', 'video', 'video_note', 'sticker', 'audio')
 _FILENAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_. -]{0,119}$')
-_IMAGE_INTENT = re.compile(r'(?i)(?:нарисуй|сгенерируй\s+(?:изображени|картинк|иллюстрац)|создай\s+(?:изображени|картинк)|generate\s+(?:an?\s+)?image|draw\s+(?:a\s+)?)')
+_IMAGE_INTENT = re.compile(
+    r"(?iu)(?:"
+    r"\bнарису(?:й|йте|й мне)\b"
+    r"|\b(?:сгенерируй|сгенерируйте|сгенерировать|сгенерируешь|"
+    r"генерируй|генерировать|создай|создайте|сделай|сделайте|"
+    r"сделать|нарисовать|нарисуй)\b[^\n.!?]{0,100}?"
+    r"\b(?:картинк\w*|изображени\w*|иллюстраци\w*|рисунк\w*|"
+    r"арт\b|арт\w*|фотографи\w*|обложк\w*|постер\w*)\b"
+    r"|\b(?:generate|create|draw|make)\b[^\n.!?]{0,90}?"
+    r"\b(?:image|picture|illustration|artwork|drawing)\b"
+    r")"
+)
 _SANDBOX_FILE = re.compile(r'sandbox:/mnt/data/([A-Za-z0-9][A-Za-z0-9_.-]{0,119})')
 
 
