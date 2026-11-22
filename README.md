@@ -352,3 +352,30 @@ someone allowed to chat with Ragna is not automatically allowed to
 modify your local files. Unauthorized /work commands are ignored.
 
 Example in local .env: WORK_ALLOWED_USER_IDS=123456789
+
+#### Python test runner and work timings
+
+On Windows, Codex's own shell may not resolve `python` or `py`, even when
+AgentRelay is started in an activated `.venv`. The gateway now supplies
+an exact trusted Python executable to the Codex worker, defaulting to
+the Python running AgentRelay itself. To override, configure an existing
+absolute interpreter path in local `.env`:
+
+    WORK_PYTHON=W:\dev\agent-relay\.venv\Scripts\python.exe
+
+Codex is told to use that executable for tests, and to create files
+directly in the configured project workspace, not a nested alias folder.
+OS sandbox rules may still block an external interpreter; verify this
+on your local Windows version rather than disabling isolation.
+
+With `LOG_LEVEL=debug`, log entries now separate **Ragna decision latency**
+from **Codex execution duration**. Normal logging only shows the final
+total duration and the number of Codex rounds. The 2-round budget is a
+maximum, not a requirement: Ragna can finish after the first round.
+Set `WORK_MAX_ROUNDS=1` for simpler tasks at the cost of losing an
+automatic correction pass. `CATCHUP_MODE=off` skips startup catch-up
+and its additional ChatGPT review request, if that trade-off is desired.
+
+Successful orchestration means the workflow finished, **not** that tests
+passed: check Codex's exact test results. A report of zero tests passed
+must not be treated as a verified implementation.
