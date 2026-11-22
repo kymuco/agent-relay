@@ -472,6 +472,7 @@ class AgentRelay:
                          if config.work_live_progress and config.work_enabled
                          and config.work_executor == 'github' else None)
         self._journal_reply_cooldown: dict[tuple[int, int], float] = {}
+        self._callback_slots = threading.BoundedSemaphore(3)
         self._background = None
         if config.work_enabled and config.work_executor == 'github':
             if coordinator_client is None or developer_client is None:
@@ -1565,6 +1566,41 @@ class AgentRelay:
                          'Повтор отключён; проверь статус и файлы проекта.'),
             })
 
+    def _schedule_progress_ui(self, action: str, work_id: int,
+                              message_id: int, data: bytes | None = None) -> bool:
+        """Bounded display-only UI lane. Never block Telegram polling or /stop."""
+        if self.progress is None or not self._callback_slots.acquire(blocking=False):
+            return False
+
+        def perform() -> None:
+            try:
+                if action == 'journal':
+                    if data is None or self._shutdown.is_set() or self.control.paused:
+                        return
+                    send_file(self.config.telegram_token, 'sendDocument',
+                              self.config.chat_id, data,
+                              f'agentrelay-work-{work_id}.txt',
+                              reply_message_id=message_id)
+                else:
+                    self.progress.open_view(
+                        work_id, message_id, detail=action == 'd')
+            except Exception as exc:
+                # Upload/edit may have succeeded despite timeout: no retry.
+                LOG.warning('Telegram UI операция не подтверждена (%s)',
+                            type(exc).__name__)
+            finally:
+                self._callback_slots.release()
+
+        try:
+            threading.Thread(
+                target=perform, name=f'AgentRelayWorkUI-{work_id}',
+                daemon=True,
+            ).start()
+        except Exception:
+            self._callback_slots.release()
+            return False
+        return True
+
     def _handle_progress_callback(self, update: dict[str, Any]) -> bool:
         """Read-only Telegram card buttons, bound to an exact persisted message."""
         callback = update.get('callback_query')
@@ -1611,19 +1647,17 @@ class AgentRelay:
                         if not data:
                             reply_text = 'Журнал пока пуст.'
                         else:
-                            # Claim the upload BEFORE a potentially ambiguous
-                            # Telegram send: no automatic duplicate delivery.
-                            self._journal_reply_cooldown[key] = now
-                            send_file(self.config.telegram_token, 'sendDocument',
-                                      self.config.chat_id, data,
-                                      f'agentrelay-work-{work_id}.txt',
-                                      reply_message_id=card_id)
-                            reply_text = 'Журнал отправлен отдельным файлом.'
+                            if self._schedule_progress_ui('journal', work_id, card_id, data):
+                                # Claim the request BEFORE ambiguous upload.
+                                self._journal_reply_cooldown[key] = now
+                                reply_text = 'Отправляю журнал отдельным файлом.'
+                            else:
+                                reply_text = 'Обработка кнопок занята, повтори позже.'
                 else:
-                    opened = self.progress.open_view(
-                        work_id, card_id, detail=match.group(1) == 'd')
-                    reply_text = ('Карточка обновлена.' if opened else
-                                  'Не удалось обновить карточку.')
+                    opened = self._schedule_progress_ui(
+                        match.group(1), work_id, card_id)
+                    reply_text = ('Открываю карточку.' if opened else
+                                  'Обработка кнопок занята, повтори позже.')
         except Exception as exc:
             LOG.warning('Telegram callback не завершён (%s)', type(exc).__name__)
             reply_text = 'Не удалось подтвердить действие. Повторять не буду.'
