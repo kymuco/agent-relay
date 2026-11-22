@@ -315,7 +315,7 @@ class WorkState:
                         type(saved.get("id")) is not int or saved["id"] < 0 or
                         saved.get("status") not in {
                             "idle", "queued", "running", "completed", "failed",
-                            "stopped", "interrupted"} or
+                            "stopped", "interrupted", "needs_review"} or
                         not isinstance(saved.get("project"), str) or
                         type(saved.get("stage")) is not int):
                     raise ValueError("invalid saved work state")
@@ -354,6 +354,46 @@ class WorkState:
             self.record.update(status=status, stage=stage, note=note[:350])
             self._write()
             return True
+
+    def add_amendment(self, text: str, *, limit: int = 4) -> bool:
+        """Persist an explicit human change request; never silently drop it."""
+        if not isinstance(text, str) or not 1 <= len(text.strip()) <= 1600:
+            return False
+        with self._lock:
+            if self._cancel.is_set() or self.record["status"] not in self.ACTIVE:
+                return False
+            pending = self.record.setdefault("pending_amendments", [])
+            if not isinstance(pending, list) or len(pending) >= limit:
+                return False
+            pending.append(text.strip())
+            self._write()
+            return True
+
+    def take_amendments(self, id: int) -> list[str]:
+        """At-most-once dispatch: durably remove before sending to a worker."""
+        with self._lock:
+            if self.record["id"] != id or self._cancel.is_set():
+                return []
+            pending = self.record.get("pending_amendments", [])
+            if not isinstance(pending, list):
+                return []
+            self.record["pending_amendments"] = []
+            self._write()
+            return list(pending)
+
+    def finalize(self, id: int, status: str, stage: int, note: str) -> str | None:
+        """Finish atomically; surface late amendments instead of losing them."""
+        with self._lock:
+            if (self.record["id"] != id or self._cancel.is_set()
+                    or self.record["status"] not in self.ACTIVE):
+                return None
+            pending = self.record.get("pending_amendments", [])
+            real_status = "needs_review" if pending else status
+            if pending:
+                note += f"; {len(pending)} уточн. ожидают нового поручения"
+            self.record.update(status=real_status, stage=stage, note=note[:350])
+            self._write()
+            return real_status
 
     def active(self, id: int) -> bool:
         with self._lock:
