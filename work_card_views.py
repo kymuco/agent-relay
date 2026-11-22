@@ -24,9 +24,9 @@ _PHASE_LABELS = {
     "stopped": "⏹ Задача остановлена",
     "interrupted": "⚠️ Прервана",
 }
-_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_REPO = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]+$")
 _SHA = re.compile(r"^[a-f0-9]{40}$", re.I)
-_FILENAME = re.compile(r"(?<![\w./\\-])([A-Za-z0-9][\w.-]{0,70}\.(?:py|js|ts|tsx|jsx|json|md|html|css|yml|yaml|go|rs|java|sh|ps1))(?![\w./\\-])", re.I)
+_FILENAME = re.compile(r"(?<![\w./\\-])([A-Za-z0-9][\w.-]{0,70}\.(?:py|js|ts|tsx|jsx|json|md|html|css|yml|yaml|go|rs|java|sh|ps1))(?!(?:[\w/\\-]|\.[A-Za-z0-9]))", re.I)
 _TESTS_RU = re.compile(r"(?iu)\b(\d{1,5})\s*(?:unittest[\s-]*)?тест(?:а|ов|ы)?\b.{0,65}?\b(?:пройдены|пройдено|прошли|успешн\w*)")
 _TESTS_EN = re.compile(r"(?i)\b(\d{1,5})\s+(?:unittest\s+)?tests?\s+(?:passed|successful|succeeded)\b")
 _TESTS_RAN = re.compile(r"(?i)\bRan\s+(\d{1,5})\s+tests?\b.{0,150}?\bOK\b", re.S)
@@ -47,6 +47,18 @@ def _worker_test_count(text: str) -> int | None:
         if match:
             return int(match.group(1))
     return None
+
+
+def _tests_label(count: int) -> str:
+    tail = count % 100
+    last = count % 10
+    if tail % 100 in (11, 12, 13, 14):
+        return f"{count} тестов пройдено"
+    if last == 1:
+        return f"{count} тест пройден"
+    if last in (2, 3, 4):
+        return f"{count} теста пройдены"
+    return f"{count} тестов пройдено"
 
 
 def _files(text: str) -> list[str]:
@@ -104,7 +116,7 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
             elif worker:
                 lines.append("\n" + _h(worker, 180))
             if tests is not None:
-                lines.append(f"✅ {tests} тестов пройдены")
+                lines.append("✅ " + _tests_label(tests))
             if result.get("remote_verified"):
                 lines.append("✅ Коммит подтверждён на GitHub")
         elif phase in ("needs_review", "failed", "stopped", "interrupted"):
@@ -121,7 +133,7 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
         if worker:
             lines.extend(["", "<b>Результат разработчика:</b>", _h(worker, 1150)])
         if tests is not None:
-            lines.append(f"\n✅ {tests} тестов пройдены")
+            lines.append("\n✅ " + _tests_label(tests))
         if result.get("remote_verified"):
             lines.append("✅ Коммит подтверждён на GitHub")
         elif phase not in ("queued", "coordinator", "developer"):
