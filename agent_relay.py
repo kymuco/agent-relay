@@ -1090,7 +1090,7 @@ class AgentRelay:
         for page in range(100):
             updates = self.api.call('getUpdates', {
                 'offset': self.cursor.offset, 'timeout': 0, 'limit': 100,
-                'allowed_updates': ['message'],
+                'allowed_updates': ['message', 'callback_query'],
             }, timeout=15)
             if not updates:
                 break
@@ -1565,6 +1565,81 @@ class AgentRelay:
                          'Повтор отключён; проверь статус и файлы проекта.'),
             })
 
+    def _handle_progress_callback(self, update: dict[str, Any]) -> bool:
+        """Read-only Telegram card buttons, bound to an exact persisted message."""
+        callback = update.get('callback_query')
+        if not isinstance(callback, dict):
+            return False
+        raw_data = callback.get('data')
+        if not isinstance(raw_data, str) or not raw_data.startswith('wp:'):
+            return False
+        callback_id = callback.get('id')
+        if not isinstance(callback_id, str) or not callback_id:
+            return True
+        reply_text = 'Кнопка недоступна.'
+        is_alert = False
+        try:
+            sender = callback.get('from') or {}
+            message = callback.get('message') or {}
+            chat = message.get('chat') or {}
+            match = re.fullmatch(r'wp:([dcj]):([1-9][0-9]{0,8})', raw_data)
+            if (self.progress is None or match is None
+                    or chat.get('id') != self.config.chat_id
+                    or chat.get('type') not in ('group', 'supergroup')
+                    or type(message.get('message_id')) is not int
+                    or type(sender.get('id')) is not int
+                    or sender.get('is_bot')
+                    or sender['id'] not in self.config.allowed_user_ids):
+                reply_text = 'Нет доступа к этой карточке.'
+                is_alert = True
+            else:
+                work_id = int(match.group(2))
+                card_id = message['message_id']
+                saved = self.progress.card(work_id, card_id)
+                if saved is None:
+                    reply_text = 'Карточка устарела или не найдена.'
+                elif match.group(1) == 'j':
+                    # Journal contains bounded Host events and summary fields,
+                    # never raw prompts, credentials or worker tool transcripts.
+                    key = (sender['id'], work_id)
+                    now = time.monotonic()
+                    last_sent = self._journal_reply_cooldown.get(key, 0.0)
+                    if now - last_sent < 20.0:
+                        reply_text = 'Журнал уже запрашивался недавно.'
+                    else:
+                        data = self.progress.journal_bytes(work_id, card_id)
+                        if not data:
+                            reply_text = 'Журнал пока пуст.'
+                        else:
+                            # Claim the upload BEFORE a potentially ambiguous
+                            # Telegram send: no automatic duplicate delivery.
+                            self._journal_reply_cooldown[key] = now
+                            send_file(self.config.telegram_token, 'sendDocument',
+                                      self.config.chat_id, data,
+                                      f'agentrelay-work-{work_id}.txt',
+                                      reply_message_id=card_id)
+                            reply_text = 'Журнал отправлен отдельным файлом.'
+                else:
+                    opened = self.progress.open_view(
+                        work_id, card_id, detail=match.group(1) == 'd')
+                    reply_text = ('Карточка обновлена.' if opened else
+                                  'Не удалось обновить карточку.')
+        except Exception as exc:
+            LOG.warning('Telegram callback не завершён (%s)', type(exc).__name__)
+            reply_text = 'Не удалось подтвердить действие. Повторять не буду.'
+        finally:
+            try:
+                self.api.call('answerCallbackQuery', {
+                    'callback_query_id': callback_id,
+                    'text': reply_text[:190],
+                    'show_alert': is_alert,
+                    'cache_time': 0,
+                }, timeout=10)
+            except Exception as exc:
+                LOG.debug('Telegram callback ack недоступен (%s)',
+                          type(exc).__name__)
+        return True
+
     def serve(self) -> None:
         if (self.progress is not None and self.work is not None and
                 self.work.record.get('status') == 'interrupted'):
@@ -1598,7 +1673,7 @@ class AgentRelay:
         first_launch = self.cursor.offset == 0
         if first_launch:
             # First launch: do not respond to mentions left in an old group backlog.
-            prior = self.api.call('getUpdates', {'offset': -1, 'timeout': 0, 'allowed_updates': ['message']})
+            prior = self.api.call('getUpdates', {'offset': -1, 'timeout': 0, 'allowed_updates': ['message', 'callback_query']})
             if prior:
                 self.cursor.advance(max(int(item['update_id']) for item in prior) + 1)
         else:
@@ -1620,13 +1695,15 @@ class AgentRelay:
                 updates = self.api.call('getUpdates', {
                     'offset': self.cursor.offset,
                     'timeout': 30,
-                    'allowed_updates': ['message'],
+                    'allowed_updates': ['message', 'callback_query'],
                 }, timeout=45)
                 for item in updates:
                     update_id = int(item['update_id'])
                     if update_id < self.cursor.offset:
                         continue
                     self.cursor.advance(update_id + 1)
+                    if self._handle_progress_callback(item):
+                        continue
                     message = item.get('message') or {}
                     if self._control_command(message):
                         # A human emergency command outranks a running worker.
