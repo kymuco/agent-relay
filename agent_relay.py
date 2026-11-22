@@ -974,16 +974,19 @@ class AgentRelay:
         if self.config.effort:
             params['reasoning_effort'] = self.config.effort
         previous = ''
+        stage = 'planning'
         try:
             for round_no in range(1, self.config.work_max_rounds + 1):
                 if not self._run_permitted(generation) or not self.work.active(work_id):
                     return
                 self.work.update(work_id, 'running', round_no)
+                stage = 'Ragna planning'
                 plan = self.client.send(
                     work_prompt(task, project, round_no=round_no, result=previous,
                                 max_rounds=self.config.work_max_rounds), **params)
                 if not self._run_permitted(generation) or not self.work.active(work_id):
                     return
+                stage = 'Ragna decision parsing'
                 action, value = parse_orchestrator_decision(
                     str(plan.text or ''), first=(round_no == 1))
                 if action == 'finish':
@@ -996,6 +999,7 @@ class AgentRelay:
                         LOG.info('Локальная задача #%s завершена', work_id)
                     return
                 LOG.debug('Local Work #%s: Codex round %s', work_id, round_no)
+                stage = 'Codex execution'
                 result = runner.run(self.work_projects[project], value,
                                     timeout=self.config.work_timeout_seconds)
                 if not self._run_permitted(generation) or not self.work.active(work_id):
@@ -1015,6 +1019,7 @@ class AgentRelay:
             # delegation is accepted when the configured budget is exhausted.
             if not self._run_permitted(generation) or not self.work.active(work_id):
                 return
+            stage = 'Ragna final review'
             final = self.client.send(work_prompt(
                 task, project, round_no=self.config.work_max_rounds + 1,
                 result=previous, max_rounds=self.config.work_max_rounds
@@ -1022,6 +1027,7 @@ class AgentRelay:
                       'Delegation is no longer available. '), **params)
             if not self._run_permitted(generation) or not self.work.active(work_id):
                 return
+            stage = 'Ragna final decision parsing'
             action, text = parse_orchestrator_decision(str(final.text or ''), first=False)
             if action != 'finish':
                 raise ValueError('Work reached its delegation limit without an итог')
@@ -1036,12 +1042,16 @@ class AgentRelay:
             if not self._run_permitted(generation) or not self.work.active(work_id):
                 return
             self.work.update(work_id, 'failed')
-            LOG.error('Локальная задача #%s не завершена (%s)', work_id, type(exc).__name__)
+            problem = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            LOG.error('Локальная задача #%s: сбой на этапе %s (%s)',
+                      work_id, stage, problem)
+            user_problem = ('не удалось разобрать решение Ragna (нужен JSON)'
+                            if isinstance(exc, ValueError) and 'Ragna' in stage
+                            else f'ошибка на этапе {stage} ({type(exc).__name__})')
             self.api.call('sendMessage', {
                 'chat_id': self.config.chat_id,
-                'text': (f'Local Work #{work_id}: задача остановилась '
-                         f'({type(exc).__name__}). Проверь проект; '
-                         'автоматический повтор отключён.'),
+                'text': (f'Local Work #{work_id}: {user_problem}. '
+                         'Повтор отключён; проверь статус и файлы проекта.'),
             })
 
     def serve(self) -> None:
