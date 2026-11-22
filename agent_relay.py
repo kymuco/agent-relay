@@ -21,6 +21,8 @@ from typing import Any
 from agent_control import ControlState
 from local_codex import (WorkState, parse_projects, parse_work_command,
                          parse_orchestrator_decision, work_prompt)
+from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
+                         verify_remote_branch, checkout_verified_commit)
 from relay_logging import LOG, configure_logging
 from catchup import make_catchup_prompt, parse_catchup_decision, select_catchup
 from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff, trusted_sender
@@ -97,8 +99,8 @@ class Config:
     peers: frozenset[str]
     allowed_user_ids: frozenset[int] = frozenset()
     peer_bot_ids: frozenset[int] = frozenset()
-    model: str = ''
-    effort: str = ''
+    model: str = 'gpt-6'
+    effort: str = 'high'
     state_file: str = '.agent-relay-state.json'
     control_file: str = '.agent-relay-control.json'
     min_interval_seconds: float = 2.0
@@ -120,6 +122,10 @@ class Config:
     work_state_file: str = '.agent-relay-work.json'
     work_timeout_seconds: int = 600
     work_max_rounds: int = 2
+    work_executor: str = 'codex'
+    work_repos: str = ''
+    work_chat_state_file: str = '.agent-relay-work-chats.json'
+    work_local_verify: bool = False
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -169,11 +175,20 @@ class Config:
             raise ValueError('CATCHUP_MAX_REPLIES must be 0 or 1')
         if not 1 <= catchup_max_age_minutes <= 1440:
             raise ValueError('CATCHUP_MAX_AGE_MINUTES must be between 1 and 1440')
+        requested_model = os.getenv('CWA_MODEL', 'gpt-6').strip().lower() or 'gpt-6'
+        requested_effort = os.getenv('CWA_REASONING_EFFORT', 'high').strip().lower() or 'high'
+        if requested_model != 'gpt-6' or requested_effort != 'high':
+            raise ValueError('AgentRelay is pinned to CWA_MODEL=gpt-6 and CWA_REASONING_EFFORT=high')
         work_enabled = os.getenv('WORK_ENABLED', 'off').strip().lower() in ('on', 'true', '1')
         work_allowed = numeric_ids(os.getenv('WORK_ALLOWED_USER_IDS', ''), 'WORK_ALLOWED_USER_IDS')
         work_projects = os.getenv('WORK_PROJECTS', '').strip()
         work_timeout = int(os.getenv('WORK_TIMEOUT_SECONDS', '600'))
         work_max_rounds = int(os.getenv('WORK_MAX_ROUNDS', '2'))
+        work_executor = os.getenv('WORK_EXECUTOR', 'codex').strip().lower()
+        work_repos = os.getenv('WORK_REPOS', '').strip()
+        work_local_verify = os.getenv('WORK_LOCAL_VERIFY', 'off').strip().lower() in ('on', '1', 'true')
+        if work_executor not in ('codex', 'github'):
+            raise ValueError('WORK_EXECUTOR must be codex or github')
         if not 30 <= work_timeout <= 3600:
             raise ValueError('WORK_TIMEOUT_SECONDS must be between 30 and 3600')
         if not 1 <= work_max_rounds <= 3:
@@ -182,6 +197,10 @@ class Config:
             raise ValueError('WORK_ENABLED requires WORK_PROJECTS with at least one existing directory')
         if work_enabled and not work_allowed:
             raise ValueError('WORK_ENABLED requires explicit WORK_ALLOWED_USER_IDS')
+        if work_enabled and work_executor == 'github':
+            mapped = parse_repositories(work_repos)
+            if not mapped or not set(parse_projects(work_projects)).issubset(mapped):
+                raise ValueError('WORK_REPOS must map every allowed local project to a GitHub repository')
         if not work_allowed.issubset(allowed):
             raise ValueError('WORK_ALLOWED_USER_IDS must be a subset of ALLOWED_USER_IDS')
         if interval < 0:
@@ -194,8 +213,8 @@ class Config:
             peers=peers,
             allowed_user_ids=allowed,
             peer_bot_ids=bot_ids,
-            model=os.getenv('CWA_MODEL', '').strip(),
-            effort=os.getenv('CWA_REASONING_EFFORT', '').strip(),
+            model='gpt-6',
+            effort='high',
             state_file=os.getenv('STATE_FILE', '.agent-relay-state.json'),
             control_file=os.getenv('CONTROL_FILE', '.agent-relay-control.json'),
             min_interval_seconds=interval,
@@ -217,6 +236,10 @@ class Config:
             work_state_file=os.getenv('WORK_STATE_FILE', '.agent-relay-work.json'),
             work_timeout_seconds=work_timeout,
             work_max_rounds=work_max_rounds,
+            work_executor=work_executor,
+            work_repos=work_repos,
+            work_chat_state_file=os.getenv('WORK_CHAT_STATE_FILE', '.agent-relay-work-chats.json'),
+            work_local_verify=work_local_verify,
         )
 
 
@@ -395,7 +418,8 @@ class Cursor:
 
 
 class AgentRelay:
-    def __init__(self, config: Config, api: Any, client: Any):
+    def __init__(self, config: Config, api: Any, client: Any,
+                 coordinator_client: Any = None, developer_client: Any = None):
         self.config = config
         self.api = api
         self.client = client
@@ -403,6 +427,17 @@ class AgentRelay:
         self.control = ControlState(config.control_file)
         self.work_projects = parse_projects(config.work_projects) if config.work_enabled else {}
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
+        self.work_repos = (parse_repositories(config.work_repos)
+                           if config.work_enabled and config.work_executor == 'github' else {})
+        self._background = None
+        if config.work_enabled and config.work_executor == 'github':
+            if coordinator_client is None or developer_client is None:
+                raise ValueError('GitHub work requires separate CWA clients')
+            if client is coordinator_client or client is developer_client:
+                raise ValueError('GitHub work clients must be independent from Telegram chat')
+            self._background = BackgroundDeveloper(
+                coordinator_client, developer_client,
+                ChatRegistry(config.work_chat_state_file), self._cwa_send)
         self._shutdown = threading.Event()
         self.last_send_time = float('-inf')
         self._cwa_request_lock = threading.Lock()
@@ -432,19 +467,23 @@ class AgentRelay:
     def _run_permitted(self, generation: int) -> bool:
         return not self._shutdown.is_set() and self.control.permits(generation)
 
-    def _cwa_send(self, prompt: str, *, purpose: str, **params: Any) -> Any:
+    def _cwa_send(self, prompt: str, *, purpose: str,
+                  client: Any = None, **params: Any) -> Any:
         """Log each outbound CWA chat turn without leaking prompt or credentials.
 
         A unique ID pairs dispatch/completion lines, and elapsed time includes
         the full CWA send. This is not low-level HTTP or token-stream tracing.
         """
+        # No implicit CWA defaults (which can be Instant rather than High).
+        params['model'] = 'gpt-6'
+        params['reasoning_effort'] = 'high'
         with self._cwa_request_lock:
             self._cwa_request_counter += 1
             request_id = self._cwa_request_counter
         started = time.monotonic()
-        LOG.debug('CWA #%s → %s · отправка запроса', request_id, purpose)
+        LOG.debug('CWA #%s → %s · GPT-6 High · отправка запроса', request_id, purpose)
         try:
-            result = self.client.send(prompt, **params)
+            result = (client if client is not None else self.client).send(prompt, **params)
         except Exception as exc:
             LOG.debug('CWA #%s × %s · ошибка %s · %.1f с',
                       request_id, purpose, type(exc).__name__,
@@ -962,14 +1001,25 @@ class AgentRelay:
                 if work_id is None:
                     reply = 'Уже выполняется задача. ' + self.work.status()
                 else:
-                    try:
-                        work_queue.put_nowait(({'_local_work': (work_id, project, task)},
-                                               self.control.generation()))
-                        reply = f'Local Work #{work_id}: Ragna получила задачу для {project}.'
-                        LOG.info('Локальная задача #%s начата · %s', work_id, project)
-                    except queue.Full:
-                        self.work.update(work_id, 'failed')
-                        reply = 'Очередь заполнена; запуск отменён.'
+                    if self.config.work_executor == 'github':
+                        # Independent work clients + thread leave the primary
+                        # ChatGPT/Telegram worker free for ordinary dialogue.
+                        thread = threading.Thread(
+                            target=self._run_github_work,
+                            args=((work_id, project, task), self.control.generation()),
+                            name=f'AgentRelayGitHubWork-{work_id}', daemon=True)
+                        thread.start()
+                        reply = f'Local Work #{work_id}: Ragna передала задачу фоновому разработчику.'
+                        LOG.info('Фоновая GitHub-задача #%s начата · %s', work_id, project)
+                    else:
+                        try:
+                            work_queue.put_nowait(({'_local_work': (work_id, project, task)},
+                                                   self.control.generation()))
+                            reply = f'Local Work #{work_id}: Ragna получила задачу для {project}.'
+                            LOG.info('Локальная задача #%s начата · %s', work_id, project)
+                        except queue.Full:
+                            self.work.update(work_id, 'failed')
+                            reply = 'Очередь заполнена; запуск отменён.'
         else:
             reply = ('Команды: /work@' + self.bot_username +
                      ' start <проект> <задача> · status · stop')
@@ -981,6 +1031,96 @@ class AgentRelay:
             },
         })
         return True
+
+    def _run_github_work(self, payload: tuple[int, str, str], generation: int) -> None:
+        """GitHub development in parallel with the ordinary Ragna chat."""
+        if self.work is None or self._background is None:
+            return
+        work_id, project, task = payload
+        permitted = lambda: self._run_permitted(generation) and self.work.active(work_id)
+        if not permitted():
+            return
+        repo = self.work_repos[project]
+        stage = 'coordinator'
+        try:
+            if not self.work.update(work_id, 'running', 1):
+                return
+            report = self._background.run(
+                work_id=work_id, project=project, repo=repo, task=task,
+                permitted=permitted)
+            if report is None or not permitted():
+                return
+            verified = False
+            verification_note = ''
+            if report.status == 'ready':
+                stage = 'git remote verification'
+                verified = verify_remote_branch(
+                    self.work_projects[project], repo, report.branch,
+                    report.commit_sha)
+                if not verified:
+                    raise ValueError('GitHub branch SHA does not match the worker claim')
+                verification_note = 'Remote Git branch and SHA independently verified.'
+                if self.config.work_local_verify:
+                    # Only the operator's allowlisted, clean dedicated checkout.
+                    stage = 'checkout verified branch'
+                    checkout_verified_commit(
+                        self.work_projects[project], report.commit_sha, report.branch)
+                    if not permitted():
+                        return
+                    stage = 'local Codex test verification'
+                    test = self.work.runner.run(
+                        self.work_projects[project],
+                        'READ-ONLY verification of the exact checked-out commit ' +
+                        report.commit_sha + '. Do not modify files. Run existing '
+                        'tests if possible; report exact commands and failures. '
+                        'Do not install dependencies, make commits or access the network.',
+                        timeout=self.config.work_timeout_seconds,
+                        sandbox='read-only')
+                    if not permitted():
+                        return
+                    verification_note += ' Codex check: ' + test.summary[:1000]
+                    if not test.success:
+                        raise RuntimeError('local Codex verification did not complete')
+            else:
+                verification_note = 'Worker was blocked; no branch was accepted.'
+            stage = 'Ragna work review'
+            review_data = json.dumps({
+                'developer_status': report.status,
+                'repository': report.repository,
+                'branch': report.branch,
+                'commit_sha': report.commit_sha,
+                'developer_summary': report.summary[:2200],
+                'remote_verified': verified,
+                'local_check': verification_note,
+            }, ensure_ascii=False)
+            message = self._background.review(
+                work_id=work_id, project=project, repo=repo, task=task,
+                report=review_data, permitted=permitted)
+            if message is None or not permitted():
+                return
+            status = 'completed' if verified else 'failed'
+            if not self.work.update(work_id, status, 1):
+                return
+            title = ('Проверен коммит ' + report.commit_sha[:12] +
+                     ' в ' + report.repository + ' · ' + report.branch
+                     if verified else 'Исполнитель не подтвердил коммит')
+            self.api.call('sendMessage', {
+                'chat_id': self.config.chat_id,
+                'text': f'Local Work #{work_id}: {title}\n{message[:1800]}',
+            })
+            LOG.info('GitHub-задача #%s: %s', work_id, status)
+        except Exception as exc:
+            if not permitted():
+                return
+            self.work.update(work_id, 'failed')
+            LOG.error('GitHub-задача #%s: ошибка на этапе %s (%s)',
+                      work_id, stage, type(exc).__name__)
+            self.api.call('sendMessage', {
+                'chat_id': self.config.chat_id,
+                'text': (f'Local Work #{work_id}: сбой на этапе {stage} '
+                         f'({type(exc).__name__}); повтор отключён. '
+                         'Локальный код и удалённые изменения требуют проверки.'),
+            })
 
     def _run_local_work(self, payload: tuple[int, str, str], generation: int) -> None:
         """Single serialized orchestration loop in the existing CWA worker."""
@@ -1205,7 +1345,13 @@ def main() -> None:
         from chatgpt_web_adapter import BrowserlessHTTPClient
         api = Telegram(config.telegram_token)
         client = BrowserlessHTTPClient(auth_file=config.auth_file)
-        app = AgentRelay(config, api, client)
+        coordinator_client = developer_client = None
+        if config.work_enabled and config.work_executor == 'github':
+            coordinator_client = BrowserlessHTTPClient(auth_file=config.auth_file)
+            developer_client = BrowserlessHTTPClient(auth_file=config.auth_file)
+        app = AgentRelay(config, api, client,
+                         coordinator_client=coordinator_client,
+                         developer_client=developer_client)
         app.serve()
     except KeyboardInterrupt:
         if app is not None:
