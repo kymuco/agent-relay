@@ -136,6 +136,27 @@ class CatchupTests(unittest.TestCase):
             self.assertFalse(any(x.args[0] == 'sendMessage'
                                  for x in api.call.call_args_list))
 
+    def test_off_mode_drains_old_updates_without_replaying(self):
+        # This mode must NOT fall back to executing old mentions one-by-one.
+        import dataclasses
+        with tempfile.TemporaryDirectory() as folder:
+            api, cwa = Mock(), Mock()
+            cfg = dataclasses.replace(self.config(folder), catchup_mode='off')
+            prior = self.msg('@MyBot old?', 1, at=20000)
+            api.call.side_effect = [
+                {'id': 5, 'username': 'MyBot'},  # getMe
+                {'url': ''},  # getWebhookInfo
+                [prior],  # startup backlog
+                [],  # end startup drain
+                KeyboardInterrupt(),  # live poll exits
+            ]
+            with patch('builtins.print'):
+                app = AgentRelay(cfg, api, cwa)
+                with patch('agent_relay.time.time', return_value=20060):
+                    app.serve()
+            cwa.send.assert_not_called()
+            self.assertEqual(app.cursor.offset, prior['update_id'] + 1)
+
     def test_drain_backlog_advances_cursor_without_calling_model(self):
         with tempfile.TemporaryDirectory() as folder:
             api, cwa = Mock(), Mock()

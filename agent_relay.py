@@ -878,9 +878,12 @@ class AgentRelay:
             prior = self.api.call('getUpdates', {'offset': -1, 'timeout': 0, 'allowed_updates': ['message']})
             if prior:
                 self.cursor.advance(max(int(item['update_id']) for item in prior) + 1)
-        elif self.config.catchup_mode == 'smart':
+        else:
+            # Always drain history on restart: off means skip backlog, not
+            # replay every stale command as a fresh CWA request.
             fresh = self._drain_startup_backlog(startup_epoch)
-            if self._catchup_history and not self.control.paused:
+            if (self.config.catchup_mode == 'smart' and self._catchup_history
+                    and not self.control.paused):
                 work_queue.put_nowait(({'_catchup_batch': self._catchup_history},
                                        self.control.generation()))
             for update in fresh:

@@ -248,6 +248,9 @@ your setup, set `CATCHUP_MODE=off` until you have a tool-disabled
 read-only model path. An emergency `/stop` or `/resume` sent while
 offline is applied silently in chronological order before catch-up.
 A first-ever launch retains the old protective behavior (skip backlog).
+`CATCHUP_MODE=off` also drains and skips old messages instead of replaying
+all past mentions, but it does not summarize them. Newly arriving messages
+still receive normal responses.
 
 A human can send `/catchup@YourBot` to retry the stored startup review
 if it produced no reply (the in-memory snapshot disappears at restart).
