@@ -109,12 +109,16 @@ class NaturalWorkTests(unittest.TestCase):
                 return resp('{"status":"ready","repository":"kymuco/github-workspace",'
                             '"branch":"agentrelay/work-1","commit_sha":"' +
                             "a"*40 + '","summary":"Initial"}',"d")
-            dev.send.side_effect = [
+            worker_answers = iter((
                 first,
-                resp('{"status":"ready","repository":"kymuco/github-workspace",'
-                     '"branch":"agentrelay/work-1","commit_sha":"' +
-                     "b"*40 + '","summary":"Revised"}',"d"),
-            ]
+                lambda *args, **kwargs: resp(
+                    '{"status":"ready","repository":"kymuco/github-workspace",'
+                    '"branch":"agentrelay/work-1","commit_sha":"' +
+                    "b"*40 + '","summary":"Revised"}',"d"),
+            ))
+            def dev_reply(*args, **kwargs):
+                return next(worker_answers)(*args, **kwargs)
+            dev.send.side_effect = dev_reply
             with patch("agent_relay.verify_remote_branch", return_value=True) as verify:
                 app._handle_natural_work(
                     self.message("Рагна, добавь калькулятор в github-workspace"),Queue())
@@ -138,8 +142,12 @@ class NaturalWorkTests(unittest.TestCase):
                 entered.set()
                 release.wait(4)
                 return resp('{"action":"finish","message":"Done."}',"c")
-            coord.send.side_effect=[
-                resp('{"action":"delegate","instruction":"code"}',"c"),finish]
+            coordinator_calls = iter((
+                lambda *args, **kwargs: resp(
+                    '{"action":"delegate","instruction":"code"}',"c"),
+                finish,
+            ))
+            coord.send.side_effect = lambda *a, **k: next(coordinator_calls)(*a, **k)
             dev.send.return_value=resp(
                 '{"status":"ready","repository":"kymuco/github-workspace",'
                 '"branch":"agentrelay/work-1","commit_sha":"' +
