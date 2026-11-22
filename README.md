@@ -390,3 +390,67 @@ conversation IDs, auth data, or exception messages. Normal logs remain quiet.
 The local rotating file also includes these debug events. This is useful
 for seeing whether a slowdown is in Ragna/CWA or the subsequent Codex task.
 Note: this does not capture CWA-internal tool invocations or HTTP retries.
+
+### Ragna background GitHub developer + coordinator (opt-in)
+
+The primary Telegram/ChatGPT Ragna conversation remains responsive while a
+**separate Ragna-work coordinator** delegates an authorized task to a
+**separate GitHub developer ChatGPT conversation**. Both are persistent:
+their IDs are saved in `.agent-relay-work-chats.json` (ignored by Git).
+Each lane has its own BrowserlessHTTPClient instance. The main Ragna chat,
+work coordinator, developer, and catch-up all explicitly request
+`model="gpt-6", reasoning_effort="high"` on every ChatGPT send.
+An existing conversation's historical creation model cannot be retroactively
+changed. The CWA request flags are explicit but platform/server model
+selection has not been independently attested.
+
+To try the new worker route, provide a **real GitHub repository you own**
+and a dedicated clean local checkout of that very repository with a matching
+GitHub `origin`. Do NOT authorize a directory with secrets or unrelated data.
+
+    WORK_ENABLED=on
+    WORK_EXECUTOR=github
+    WORK_ALLOWED_USER_IDS=<your-numeric-telegram-user-id>
+    WORK_PROJECTS=demo=W:\dev\your-separate-github-test-checkout
+    WORK_REPOS=demo=<owner>/<actual-repository-name>
+    WORK_CHAT_STATE_FILE=.agent-relay-work-chats.json
+    WORK_LOCAL_VERIFY=off
+
+Then launch `python agent_relay.py` and send:
+
+    /work@ragnacobot start demo Create a small harmless feature in a new
+    branch and report its exact GitHub commit SHA. Do not merge or publish.
+
+The worker conversation is **created lazily on the first task**, not at
+process startup. The coordinator gives the worker one authorized task;
+the developer is instructed to use its GitHub connector and return strict
+`status`, `repository`, `branch`, `commit_sha`, `summary` JSON. An unavailable
+connector or required new approval is a **blocked** result, never success.
+AgentRelay independently compares the claimed branch/SHA with the remote
+ref through `git ls-remote` using the local checkout's allowlisted GitHub
+origin. No worker statement alone is treated as proof.
+
+With `WORK_LOCAL_VERIFY=off` (default) no checkout, local code execution
+or Codex run occurs. A successfully verified GitHub branch is reported to
+Ragna and you for review. With `WORK_LOCAL_VERIFY=on`, AgentRelay first
+rejects a dirty working tree, fetches the EXACT branch and SHA, switches
+the separate checkout to that commit, and invokes Codex with a `read-only`
+sandbox to attempt tests. This opt-in may execute UNTRUSTED REPO CODE;
+only use it in an isolated machine/workspace that you control. A sandbox
+or prompts alone cannot guarantee arbitrary test code is harmless.
+Run the new GitHub mode in a separate disposable checkout, not in AgentRelay
+or another sensitive project.
+
+Background work is independent from ordinary Ragna chat, but CWA's shared
+account and private protocol have not been verified for simultaneous
+high-effort requests on the user's Windows system. Cancellation discards
+any late response; it cannot reverse a GitHub commit already produced by
+the remote worker. No automatic retry after ambiguous CWA writes, no
+automatic merge/push-to-default-branch, and no automatic resumed task on restart.
+Only your explicitly listed `WORK_ALLOWED_USER_IDS` can start or stop local
+tasks, independently of other people allowed to chat with Ragna.
+
+**Tool boundary:** consumer ChatGPT connectors might be present in the new
+worker conversation, but CWA's Direct HTTP path does not independently
+guarantee connector execution/approval parity with the website. Validate
+the first real branch creation and GitHub SHA before trusting live execution.
