@@ -909,7 +909,8 @@ class AgentRelay:
                         # A human emergency command outranks a running worker.
                         self.process_update(item, preadvanced=True)
                     elif self._manual_catchup_command(message):
-                        if not self.control.paused and not self._catchup_replied and self._catchup_history:
+                        if (self.config.catchup_mode == 'smart' and not self.control.paused
+                                and not self._catchup_replied and self._catchup_history):
                             try:
                                 work_queue.put_nowait(({'_catchup_batch': self._catchup_history},
                                                        self.control.generation()))

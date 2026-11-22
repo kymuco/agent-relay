@@ -142,6 +142,8 @@ class CatchupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             api, cwa = Mock(), Mock()
             cfg = dataclasses.replace(self.config(folder), catchup_mode='off')
+            # Existing cursor distinguishes actual restart from first launch.
+            Path(cfg.state_file).write_text('{"offset":1}', encoding='utf-8')
             prior = self.msg('@MyBot old?', 1, at=20000)
             api.call.side_effect = [
                 {'id': 5, 'username': 'MyBot'},  # getMe
