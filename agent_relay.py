@@ -386,7 +386,7 @@ class AgentRelay:
         LOG.info('Запущен @%s · группа %s · Ctrl+C для остановки',
                  self.bot_username, config.chat_id)
         if self.control.paused:
-            LOG.warning('Бот на паузе: отправь /resume@%s', self.bot_username)
+            LOG.warning('Сохранена пауза с прошлого запуска. Для продолжения: /resume@%s', self.bot_username)
 
     def shutdown(self) -> None:
         """Stop pending worker output without persisting /stop."""
@@ -479,7 +479,8 @@ class AgentRelay:
             else:
                 changed = self.control.resume()
                 status = 'Продолжаю работу.' if changed else 'Уже работаю.'
-            LOG.info('Аварийный режим: %s', 'пауза' if control_command == 'stop' else 'работает')
+            LOG.info('Бот приостановлен командой /stop' if control_command == 'stop'
+                     else 'Бот возобновил работу')
             self.api.call('sendMessage', {
                 'chat_id': self.config.chat_id, 'text': status,
                 'reply_parameters': {'message_id': message['message_id'],
