@@ -223,7 +223,7 @@ class WorkProgressTests(unittest.TestCase):
             self.assertTrue(any("Проверяю ветку" in t for t in texts))
             self.assertTrue(any("Коммит подтверждён" in t for t in texts))
             self.assertEqual(len([c for c in api.call.call_args_list
-                                  if c.args[0]=="sendMessage"]),2)
+                                  if c.args[0]=="sendMessage"]),1)
 
 
 if __name__ == "__main__":
