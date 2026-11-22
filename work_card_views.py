@@ -129,6 +129,10 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
     lines = [f"<b>Задача #{work_id} · {project}</b>", _PHASE_LABELS[phase], "",
              f"<i>{task}</i>"]
     if not detail:
+        queued_changes = record.get("pending_changes", 0)
+        if (phase not in {"completed", "failed", "stopped", "interrupted"}
+                and type(queued_changes) is int and queued_changes > 0):
+            lines.append(f"📌 Уточнения в очереди: {queued_changes}")
         if phase == "completed":
             if files:
                 lines.append("\nФайлы: " + ", ".join(f"<code>{_h(name, 75)}</code>" for name in files[:3]))
@@ -145,6 +149,9 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
         elif phase != "queued":
             lines.append("\nМожно продолжать общение с Ragna.")
     else:
+        queued_changes = record.get("pending_changes", 0)
+        if type(queued_changes) is int and queued_changes > 0:
+            lines.append(f"📌 Уточнения в очереди: {queued_changes}")
         lines.extend(["", "<b>Подробности</b>"])
         if files:
             lines.append("<b>Файлы:</b>")
