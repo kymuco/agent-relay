@@ -212,6 +212,9 @@ def main(argv: list[str] | None = None) -> int:
         validate_local_config()
         print("[AgentRelay] Starting bot (Ctrl+C to stop)...", flush=True)
         return subprocess.call([str(python), str(ROOT / "agent_relay.py")], cwd=ROOT, env=env)
+    except KeyboardInterrupt:
+        # Ctrl+C reaches both wrapper and child on Windows. No wrapper traceback.
+        return 0
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, zipfile.BadZipFile) as exc:
         print(f"[AgentRelay] Setup stopped: {exc}", file=sys.stderr, flush=True)
         return 1
