@@ -364,7 +364,8 @@ class WorkProgress:
                     or rec["phase"] in _TERMINAL):
                 return False
             already = rec.get("stop_confirm_user")
-            if already is not None and already != user_id:
+            if (already is not None and already != user_id and
+                    time.time() < rec.get("stop_confirm_until", 0)):
                 return False
             # Durable before an ambiguous edit: if the button becomes visible,
             # pressing it still checks the authorized creator and short expiry.
