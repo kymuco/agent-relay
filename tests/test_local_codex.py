@@ -274,6 +274,34 @@ class LocalWorkTests(unittest.TestCase):
             self.assertEqual(observed['command'][-1], '-')
 
 
+    def test_codex_receives_explicit_python_path_and_workspace_root(self):
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            prompts = []
+            class FakeProcess:
+                returncode = 0
+                def communicate(self, input=None, timeout=None):
+                    prompts.append(input.decode('utf-8'))
+                    return (None, None)
+            with patch('local_codex._codex_command', return_value=['codex']):
+                with patch('local_codex.subprocess.Popen', return_value=FakeProcess()):
+                    with patch.dict(os.environ, {'WORK_PYTHON': sys.executable}):
+                        result = CodexRunner().run(project, 'Run unittest', timeout=8)
+            self.assertTrue(result.success)
+            self.assertEqual(len(prompts), 1)
+            self.assertIn(str(Path(sys.executable).resolve()), prompts[0])
+            self.assertIn('Do NOT create an extra subfolder', prompts[0])
+            self.assertIn('Run unittest', prompts[0])
+
+    def test_invalid_explicit_python_is_rejected_before_spawning(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('local_codex._codex_command', return_value=['codex']):
+                with patch('local_codex.subprocess.Popen') as spawned:
+                    with patch.dict(os.environ, {'WORK_PYTHON': str(Path(folder) / 'missing.exe')}):
+                        with self.assertRaisesRegex(RuntimeError, 'WORK_PYTHON'):
+                            CodexRunner().run(Path(folder), 'test', timeout=8)
+                    spawned.assert_not_called()
+
     def test_real_subprocess_jsonl_roundtrip_using_fake_codex(self):
         """Test actual pipes/argv/JSONL without calling a model or writing code."""
         with tempfile.TemporaryDirectory() as folder:
