@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+from collections import deque
 import threading
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_control import ControlState
+from catchup import make_catchup_prompt, parse_catchup_decision, select_catchup
 from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff, trusted_sender
 from relay_media import (attachment_info, artifact_filenames, find_new_images,
                          generated_image_keys, markdown_to_telegram_html,
@@ -105,6 +107,10 @@ class Config:
     media_auto_reply: bool = True
     voice_reply_mode: str = 'on_voice'
     max_media_bytes: int = 10 * 1024 * 1024
+    catchup_mode: str = 'smart'
+    catchup_max_messages: int = 100
+    catchup_max_replies: int = 1
+    catchup_max_age_minutes: int = 180
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -142,6 +148,18 @@ class Config:
             raise ValueError('VOICE_REPLY_MODE must be off, on_voice, or always')
         if not 1 <= max_media_mb <= 10:
             raise ValueError('MAX_MEDIA_MB must be between 1 and 10')
+        catchup_mode = os.getenv('CATCHUP_MODE', 'smart').strip().lower()
+        catchup_max_messages = int(os.getenv('CATCHUP_MAX_MESSAGES', '100'))
+        catchup_max_replies = int(os.getenv('CATCHUP_MAX_REPLIES', '1'))
+        catchup_max_age_minutes = int(os.getenv('CATCHUP_MAX_AGE_MINUTES', '180'))
+        if catchup_mode not in ('off', 'smart'):
+            raise ValueError('CATCHUP_MODE must be off or smart')
+        if not 1 <= catchup_max_messages <= 100:
+            raise ValueError('CATCHUP_MAX_MESSAGES must be between 1 and 100')
+        if catchup_max_replies not in (0, 1):
+            raise ValueError('CATCHUP_MAX_REPLIES must be 0 or 1')
+        if not 1 <= catchup_max_age_minutes <= 1440:
+            raise ValueError('CATCHUP_MAX_AGE_MINUTES must be between 1 and 1440')
         if interval < 0:
             raise ValueError('MIN_INTERVAL_SECONDS must not be negative')
         return cls(
@@ -165,6 +183,10 @@ class Config:
             media_auto_reply=media_auto_reply,
             voice_reply_mode=voice_reply_mode,
             max_media_bytes=max_media_mb * 1024 * 1024,
+            catchup_mode=catchup_mode,
+            catchup_max_messages=catchup_max_messages,
+            catchup_max_replies=catchup_max_replies,
+            catchup_max_age_minutes=catchup_max_age_minutes,
         )
 
 
@@ -351,6 +373,8 @@ class AgentRelay:
         self.control = ControlState(config.control_file)
         self.last_send_time = float('-inf')
         self.group_context = GroupAwareness(config.group_context_limit)
+        self._catchup_history: list[dict[str, Any]] = []
+        self._catchup_replied = False
         self.peer_reply_id: int | None = None
         self.peer_reply_expires_at = 0.0
         self.pending_image_baseline: set[tuple[str, str]] | None = None
@@ -718,6 +742,110 @@ class AgentRelay:
                 self._stop_peer_reply()
             print(f'Update {update_id} stopped; {type(exc).__name__}. No retry.', file=sys.stderr)
 
+    def _handle_catchup(self, updates: list[dict[str, Any]], generation: int) -> None:
+        if self.config.catchup_max_replies == 0 or not self.control.permits(generation):
+            return
+        plan = select_catchup(
+            updates, chat_id=self.config.chat_id, bot_id=self.bot_id,
+            bot_username=self.bot_username, allowed_users=self.config.allowed_user_ids,
+            peers=self.config.peers, peer_ids=self.config.peer_bot_ids,
+            aliases=self.config.bot_aliases, is_addressed=is_addressed,
+            now_epoch=int(time.time()), max_age_minutes=self.config.catchup_max_age_minutes,
+            max_messages=self.config.catchup_max_messages)
+        if plan is None:
+            return
+        prompt = make_catchup_prompt(plan)
+        params: dict[str, Any] = {'conversation': self.config.conversation_id}
+        if self.config.model:
+            params['model'] = self.config.model
+        if self.config.effort:
+            params['reasoning_effort'] = self.config.effort
+        try:
+            result = self.client.send(prompt, **params)
+            if not self.control.permits(generation) or self._catchup_replied:
+                return
+            output = parse_catchup_decision(str(result.text or ''))
+            if output is None:
+                return
+            # Catch-up never routes to a peer or triggers a tool. One plain
+            # Telegram response maximum; do not execute historical messages.
+            self.api.call('sendMessage', {
+                'chat_id': self.config.chat_id,
+                'text': output,
+                'reply_parameters': {
+                    'message_id': plan.reply_to_message_id,
+                    'allow_sending_without_reply': True,
+                },
+            })
+            self._catchup_replied = True
+            print(f'Catch-up answered once ({plan.included} messages)', flush=True)
+        except Exception as exc:
+            # Ambiguous CWA writes must never be retried automatically.
+            print(f'Catch-up stopped: {type(exc).__name__}; no retry',
+                  file=sys.stderr)
+
+    def _drain_startup_backlog(self, startup_epoch: int) -> list[dict[str, Any]]:
+        """Consume pending updates without replaying historical requests.
+
+        Only actual new messages (dated after startup) can reach the regular
+        worker. Preserve at most max_messages for a single catch-up decision.
+        """
+        history: deque[dict[str, Any]] = deque(maxlen=self.config.catchup_max_messages)
+        fresh: list[dict[str, Any]] = []
+        for page in range(100):
+            updates = self.api.call('getUpdates', {
+                'offset': self.cursor.offset, 'timeout': 0, 'limit': 100,
+                'allowed_updates': ['message'],
+            }, timeout=15)
+            if not updates:
+                break
+            for item in updates:
+                update_id = int(item['update_id'])
+                if update_id < self.cursor.offset:
+                    continue
+                self.cursor.advance(update_id + 1)
+                message = item.get('message') or {}
+                control = self._control_command(message)
+                if control:
+                    # Respect human stop/resume written while offline, but
+                    # do not respond to each historical command.
+                    if control == 'stop':
+                        self.control.stop()
+                        self._stop_peer_reply()
+                        self.pending_image_baseline = None
+                    else:
+                        self.control.resume()
+                    continue
+                date = message.get('date')
+                if type(date) is int and date > startup_epoch:
+                    fresh.append(item)
+                    continue
+                if (message.get('chat') or {}).get('id') == self.config.chat_id and (
+                    trusted_sender(message, self.config.allowed_user_ids,
+                                   self.config.peers, self.config.peer_bot_ids,
+                                   self.bot_id)
+                ):
+                    history.append(item)
+                    if (type(date) is int and date >= startup_epoch -
+                            self.config.catchup_max_age_minutes * 60):
+                        self.group_context.remember(message)
+        else:
+            raise RuntimeError('Startup backlog exceeded 100 pages; refusing to replay')
+        self._catchup_history = list(history)
+        return fresh
+
+    def _manual_catchup_command(self, message: dict[str, Any]) -> bool:
+        if (message.get('chat') or {}).get('id') != self.config.chat_id:
+            return False
+        if not trusted_sender(message, self.config.allowed_user_ids,
+                              self.config.peers, self.config.peer_bot_ids, self.bot_id):
+            return False
+        if (message.get('from') or {}).get('is_bot'):
+            return False
+        text = str(message.get('text') or '').strip().split(maxsplit=1)
+        return bool(text and text[0].lower() ==
+                    f'/catchup@{self.bot_username}'.lower())
+
     def serve(self) -> None:
         # One non-reentrant CWA worker; poll Telegram independently for
         # /stop and /resume even while generation or speech is in progress.
@@ -728,8 +856,11 @@ class AgentRelay:
                 update, generation = work_queue.get()
                 try:
                     if self.control.permits(generation):
-                        self.process_update(update, preadvanced=True,
-                                            expected_generation=generation)
+                        if '_catchup_batch' in update:
+                            self._handle_catchup(update['_catchup_batch'], generation)
+                        else:
+                            self.process_update(update, preadvanced=True,
+                                                expected_generation=generation)
                 except Exception as exc:
                     print(f'Worker update failed: {type(exc).__name__}', file=sys.stderr)
                 finally:
@@ -739,11 +870,24 @@ class AgentRelay:
         info = self.api.call('getWebhookInfo')
         if info.get('url'):
             raise RuntimeError('Telegram webhook is set; remove it before starting long polling')
-        if self.cursor.offset == 0:
+        startup_epoch = int(time.time())
+        first_launch = self.cursor.offset == 0
+        if first_launch:
             # First launch: do not respond to mentions left in an old group backlog.
             prior = self.api.call('getUpdates', {'offset': -1, 'timeout': 0, 'allowed_updates': ['message']})
             if prior:
                 self.cursor.advance(max(int(item['update_id']) for item in prior) + 1)
+        elif self.config.catchup_mode == 'smart':
+            fresh = self._drain_startup_backlog(startup_epoch)
+            if self._catchup_history and not self.control.paused:
+                work_queue.put_nowait(({'_catchup_batch': self._catchup_history},
+                                       self.control.generation()))
+            for update in fresh:
+                if not self.control.paused:
+                    try:
+                        work_queue.put_nowait((update, self.control.generation()))
+                    except queue.Full:
+                        print('Startup fresh queue full; update dropped', file=sys.stderr)
         while True:
             try:
                 updates = self.api.call('getUpdates', {
@@ -756,9 +900,22 @@ class AgentRelay:
                     if update_id < self.cursor.offset:
                         continue
                     self.cursor.advance(update_id + 1)
-                    if self._control_command(item.get('message') or {}):
+                    message = item.get('message') or {}
+                    if self._control_command(message):
                         # A human emergency command outranks a running worker.
                         self.process_update(item, preadvanced=True)
+                    elif self._manual_catchup_command(message):
+                        if not self.control.paused and not self._catchup_replied and self._catchup_history:
+                            try:
+                                work_queue.put_nowait(({'_catchup_batch': self._catchup_history},
+                                                       self.control.generation()))
+                            except queue.Full:
+                                print('Catchup request dropped: queue full', file=sys.stderr)
+                        else:
+                            self.api.call('sendMessage', {
+                                'chat_id': self.config.chat_id,
+                                'text': 'Нет необработанной пропущенной беседы для восстановления.',
+                            })
                     elif not self.control.paused:
                         try:
                             work_queue.put_nowait((item, self.control.generation()))

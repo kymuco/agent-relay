@@ -224,3 +224,34 @@ Stop state is persisted in `CONTROL_FILE=.agent-relay-control.json` and
 survives process restart. The stopped bot discards new requests until resume.
 Unlike `/stoprelay` (which only closes a bot-to-bot session), `/stop`
 disables all AI responses and aborts session continuity.
+
+### Smart Catch-up after offline downtime
+
+With `CATCHUP_MODE=smart` (default), a previously launched bot drains
+Telegram updates waiting at startup **without calling CWA for each old
+mention**. It gathers up to 100 recent trusted text/caption messages from
+the selected group (within `CATCHUP_MAX_AGE_MINUTES=180`), including subsequent
+human and peer messages to determine whether earlier questions were resolved.
+It requests exactly one read-only *recovery review* in its existing CWA
+conversation, and sends **at most one** plain Telegram reply if the model
+returns a valid `{"decision":"reply","text":"..."}` JSON object.
+If it returns `{"decision":"silent","text":""}`, it stays silent.
+The reply never adds `/relay@` or a handoff marker, so no automatic old
+bot-to-bot conversation is restarted.
+
+Historical commands and action requests are redacted from the review prompt,
+and are NEVER replayed as actions. Old attachments are not downloaded.
+A model instruction asks for zero tools, but CWA Direct HTTP does not
+provide a hard no-tools switch; do not rely on this text-only instruction
+as a security boundary for connected external tools. If this matters to
+your setup, set `CATCHUP_MODE=off` until you have a tool-disabled
+read-only model path. An emergency `/stop` or `/resume` sent while
+offline is applied silently in chronological order before catch-up.
+A first-ever launch retains the old protective behavior (skip backlog).
+
+A human can send `/catchup@YourBot` to retry the stored startup review
+if it produced no reply (the in-memory snapshot disappears at restart).
+New messages arriving **after** startup are processed normally. Telegram
+may not deliver every group message, depending on privacy settings.
+Only retained Telegram Bot API updates can be reviewed; full historical
+group chat backfill is not available.
