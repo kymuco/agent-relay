@@ -207,9 +207,12 @@ class CodexRunner:
             _kill_tree(process)
 
     def run(self, directory: Path, instruction: str, *, timeout: int) -> CodexResult:
+        # Approval is a TOP-LEVEL Codex flag. Placing it after "exec"
+        # is rejected by supported Codex CLI versions.
         command = _codex_command() + [
-            "exec", "--json", "--sandbox", "workspace-write",
-            "--ask-for-approval", "never", "-C", str(directory), "-"
+            "--ask-for-approval", "never", "exec",
+            "--json", "--sandbox", "workspace-write",
+            "-C", str(directory), "-"
         ]
         prompt = (
             "You are a bounded local coding worker for a human-authorized task. "
