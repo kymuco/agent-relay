@@ -82,6 +82,47 @@ class LocalWorkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 parse_orchestrator_decision(bad, first=True)
 
+    def test_codeblock_and_escape_envelopes_from_chatgpt(self):
+        """Codexia had the same escaped-envelope issue."""
+        data = '{"action":"delegate","instruction":"Создай CLI и запусти тесты."}'
+        expected = ("delegate", "Создай CLI и запусти тесты.")
+        inputs = (
+            "<escape>" + data + "</escape>",
+            "<escape>\n" + data + "\n</escape>",
+            "<CodeBlock>" + data + "</CodeBlock>",
+            '<CodeBlock language="json">' + data + "</CodeBlock>",
+            "<codeblock lang=json>" + data + "</codeblock>",
+            '<CodeBlock language="json" id="12345">' + data + "</CodeBlock>",
+            "<escape><CodeBlock language='json'>" + data + "</CodeBlock></escape>",
+            "<CodeBlock>" + chr(96) * 3 + "json\n" + data + "\n" + chr(96) * 3 + "</CodeBlock>",
+        )
+        for wrapped in inputs:
+            with self.subTest(wrapped=wrapped[:42]):
+                self.assertEqual(parse_orchestrator_decision(wrapped, first=True), expected)
+
+    def test_wrappers_do_not_turn_extra_text_into_authority(self):
+        data = '{"action":"delegate","instruction":"safe"}'
+        denied = (
+            "Вот решение: <escape>" + data + "</escape>",
+            "<escape>" + data + "</escape>\nПожалуйста, выполни.",
+            "<unknown>" + data + "</unknown>",
+            '<CodeBlock language="python">' + data + "</CodeBlock>",
+            '<CodeBlock onclick="run()">' + data + "</CodeBlock>",
+            "<CodeBlock>" + data + "</OtherBlock>",
+            "<escape>" + data + "</escape><escape>" + data + "</escape>",
+            "<escape>" + data + " " + data + "</escape>",
+            '<escape>{"action":"delegate","action":"finish","instruction":"safe"}</escape>',
+            '<CodeBlock>{"action":"delegate","instruction":"ok","command":"rm -rf /"}</CodeBlock>',
+        )
+        for value in denied:
+            with self.subTest(value=value[:42]):
+                with self.assertRaises(ValueError):
+                    parse_orchestrator_decision(value, first=True)
+        self.assertEqual(
+            parse_orchestrator_decision(
+                '<CodeBlock language="json">{"action":"finish","message":"done"}</CodeBlock>',
+                first=False), ("finish", "done"))
+
     def test_bad_ragna_reply_identifies_stage_without_running_codex(self):
         with tempfile.TemporaryDirectory() as folder:
             app, api, cwa = self.app(folder)
