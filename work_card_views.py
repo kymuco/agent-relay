@@ -88,13 +88,25 @@ def github_commit_url(result: dict[str, Any]) -> str | None:
     return None
 
 
-def work_keyboard(work_id: int, detail: bool, result: dict[str, Any]) -> dict[str, Any]:
+def work_keyboard(work_id: int, detail: bool, result: dict[str, Any],
+                  *, phase: str = "", stop_pending: bool = False) -> dict[str, Any]:
     action = "c" if detail else "d"
     label = "Свернуть" if detail else "Подробнее"
     rows = [[
         {"text": label, "callback_data": f"wp:{action}:{int(work_id)}"},
         {"text": "Журнал", "callback_data": f"wp:j:{int(work_id)}"},
     ]]
+    if phase in {"queued", "coordinator", "developer", "revision",
+                 "verify", "local_test", "review"}:
+        if stop_pending:
+            rows.append([
+                {"text": "⏹ Да, остановить", "callback_data": f"wp:y:{int(work_id)}"},
+                {"text": "Отмена", "callback_data": f"wp:n:{int(work_id)}"},
+            ])
+        else:
+            rows.append([
+                {"text": "⏹ Остановить задачу", "callback_data": f"wp:s:{int(work_id)}"},
+            ])
     link = github_commit_url(result)
     if link:
         rows.append([{"text": "GitHub", "url": link}])
