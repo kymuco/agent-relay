@@ -218,7 +218,13 @@ class TelegramCallbackTests(unittest.TestCase):
                 limit = time.monotonic() + 2
                 while send.call_count < 1 and time.monotonic() < limit:
                     time.sleep(.01)
-                send.assert_called_once()
+                self.assertEqual(send.call_count, 1,
+                                 "callback replies: " + str([
+                                     x.args[1].get("text") for x in api.call.call_args_list
+                                     if x.args[0] == "answerCallbackQuery"
+                                 ]) + "; journal bytes: " + str(
+                                     bool(app.progress.journal_bytes(4, 777)))
+                                 + "; paused: " + str(app.control.paused))
             args = send.call_args.args
             self.assertEqual(args[1], "sendDocument")
             self.assertEqual(args[2], -123)
