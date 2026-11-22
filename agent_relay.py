@@ -1668,8 +1668,9 @@ class AgentRelay:
             })
 
     def _schedule_progress_ui(self, action: str, work_id: int,
-                              message_id: int, data: bytes | None = None) -> bool:
-        """Bounded display-only UI lane. Never block Telegram polling or /stop."""
+                              message_id: int, data: bytes | None = None,
+                              user_id: int | None = None) -> bool:
+        """Bounded Telegram UI lane. Card edits never block emergency polling."""
         if self.progress is None or not self._callback_slots.acquire(blocking=False):
             return False
 
@@ -1682,6 +1683,15 @@ class AgentRelay:
                               self.config.chat_id, data,
                               f'agentrelay-work-{work_id}.txt',
                               reply_message_id=message_id)
+                elif action == 'stop_prompt' and user_id is not None:
+                    self.progress.request_stop_confirmation(
+                        work_id, message_id, user_id)
+                elif action == 'stop_cancel' and user_id is not None:
+                    self.progress.cancel_stop_confirmation(
+                        work_id, message_id, user_id)
+                elif action == 'mark_stopped':
+                    self.progress.update(
+                        work_id, 'stopped', note='Остановлена по подтверждению пользователя')
                 else:
                     self.progress.open_view(
                         work_id, message_id, detail=action == 'd')
@@ -1703,7 +1713,7 @@ class AgentRelay:
         return True
 
     def _handle_progress_callback(self, update: dict[str, Any]) -> bool:
-        """Read-only Telegram card buttons, bound to an exact persisted message."""
+        """Telegram card views and confirmed stop, bound to an exact task."""
         callback = update.get('callback_query')
         if not isinstance(callback, dict):
             return False
@@ -1719,7 +1729,7 @@ class AgentRelay:
             sender = callback.get('from') or {}
             message = callback.get('message') or {}
             chat = message.get('chat') or {}
-            match = re.fullmatch(r'wp:([dcj]):([1-9][0-9]{0,8})', raw_data)
+            match = re.fullmatch(r'wp:([dcjsyn]):([1-9][0-9]{0,8})', raw_data)
             if (self.progress is None or match is None
                     or chat.get('id') != self.config.chat_id
                     or chat.get('type') not in ('group', 'supergroup')
@@ -1735,6 +1745,41 @@ class AgentRelay:
                 saved = self.progress.card(work_id, card_id)
                 if saved is None:
                     reply_text = 'Карточка устарела или не найдена.'
+                elif match.group(1) in ('s', 'n', 'y'):
+                    action = match.group(1)
+                    if (self.work is None
+                            or sender['id'] not in self.config.work_allowed_user_ids):
+                        reply_text = 'Нет права останавливать задачи.'
+                        is_alert = True
+                    elif action == 's':
+                        if not self.work.active(work_id):
+                            reply_text = 'Эта задача уже не выполняется.'
+                        elif self._schedule_progress_ui(
+                                'stop_prompt', work_id, card_id,
+                                user_id=sender['id']):
+                            reply_text = 'Подтверди остановку на карточке.'
+                        else:
+                            reply_text = 'Кнопки заняты, повтори позже.'
+                    elif action == 'n':
+                        if self.progress.stop_is_confirmed(
+                                work_id, card_id, sender['id']):
+                            queued = self._schedule_progress_ui(
+                                'stop_cancel', work_id, card_id,
+                                user_id=sender['id'])
+                            reply_text = ('Подтверждение закрывается.' if queued else
+                                          'Кнопки заняты, повтори позже.')
+                        else:
+                            reply_text = 'Подтверждение не найдено или устарело.'
+                    elif not self.progress.stop_is_confirmed(
+                            work_id, card_id, sender['id']):
+                        reply_text = 'Подтверждение устарело или принадлежит другому пользователю.'
+                        is_alert = True
+                    elif self.work.stop(expected_id=work_id):
+                        self._schedule_progress_ui('mark_stopped', work_id, card_id)
+                        reply_text = ('Задача #' + str(work_id) + ' остановлена. '
+                                      'Удалённый коммит нельзя откатить остановкой.')
+                    else:
+                        reply_text = 'Задача уже завершилась; новая работа не затронута.'
                 elif match.group(1) == 'j':
                     # Journal contains bounded Host events and summary fields,
                     # never raw prompts, credentials or worker tool transcripts.
