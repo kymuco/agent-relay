@@ -346,11 +346,12 @@ class WorkState:
             self._write()
             return self.record["id"]
 
-    def update(self, id: int, status: str, stage: int = 0) -> bool:
+    def update(self, id: int, status: str, stage: int = 0,
+               note: str = "") -> bool:
         with self._lock:
             if self.record["id"] != id or self._cancel.is_set():
                 return False
-            self.record.update(status=status, stage=stage)
+            self.record.update(status=status, stage=stage, note=note[:350])
             self._write()
             return True
 
@@ -374,5 +375,7 @@ class WorkState:
             record = dict(self.record)
         if record["id"] == 0:
             return "Локальных задач пока не было."
-        return (f"Local Work #{record['id']} · {record['status']} · "
-                f"{record['project']} · этап {record['stage']}")
+        status = (f"Local Work #{record['id']} · {record['status']} · "
+                  f"{record['project']} · этап {record['stage']}")
+        note = record.get("note", "")
+        return status + (" · " + note if isinstance(note, str) and note else "")
