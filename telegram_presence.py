@@ -304,6 +304,41 @@ class WorkProgress:
                 return None
             return render_work_journal(rec)
 
+    def pending_amendments(self, work_id: int, count: int,
+                           *, admitted: bool = False) -> bool:
+        """Show exact WorkState queue count; record accepted changes as an event."""
+        if type(count) is not int or count < 0 or count > 4:
+            return False
+        with self._lock:
+            rec = self.record
+            if (rec is None or rec["work_id"] != work_id
+                    or rec["phase"] in _TERMINAL):
+                return False
+            rec["pending_changes"] = count
+            if admitted:
+                rec.setdefault("events", []).append(
+                    journal_event("revision", "Получено уточнение к задаче"))
+                rec["events"] = rec["events"][-40:]
+            # Preserve factual queue state even if Telegram edit is ambiguous.
+            self._save()
+            rendered = self._render(rec)
+            if rendered == rec.get("html"):
+                return True
+            try:
+                self.api.call("editMessageText", {
+                    "chat_id": self.chat_id,
+                    "message_id": rec["message_id"],
+                    "text": rendered, "parse_mode": "HTML",
+                    "reply_markup": self._markup(rec),
+                })
+            except Exception as exc:
+                LOG.warning("Не удалось показать очередь уточнений (%s)",
+                            type(exc).__name__)
+                return True
+            rec["html"] = rendered
+            self._save()
+            return True
+
     def card_for_reply(self, message: dict[str, Any], *, bot_id: int) -> dict[str, Any] | None:
         """Only Reply to our real saved Telegram card ID selects a task."""
         reply = message.get("reply_to_message") or {}
