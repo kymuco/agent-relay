@@ -395,6 +395,17 @@ class WorkState:
             self._write()
             return real_status
 
+    def active_project(self) -> str | None:
+        with self._lock:
+            if (not self._cancel.is_set() and
+                    self.record["status"] in self.ACTIVE):
+                return str(self.record["project"])
+            return None
+
+    def pending_snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self.record.get("pending_amendments", []))
+
     def active(self, id: int) -> bool:
         with self._lock:
             return (not self._cancel.is_set() and self.record["id"] == id
