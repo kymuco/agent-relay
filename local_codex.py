@@ -66,11 +66,23 @@ def parse_work_command(text: str, bot_username: str) -> tuple[str, str, str] | N
 
 
 def parse_orchestrator_decision(text: str, *, first: bool) -> tuple[str, str]:
-    """Fail closed on non-JSON, extra fields, or an unbounded instruction."""
+    """Accept one JSON object (optionally in a single JSON fence), then validate it.
+
+    ChatGPT occasionally wraps an otherwise valid JSON decision in a Markdown
+    code fence. Accept that presentation wrapper only, never arbitrary text
+    surrounding a JSON fragment, and never relax the action/schema limits.
+    """
+    if not isinstance(text, str):
+        raise ValueError("Ragna work decision is not text")
+    raw = text.strip().lstrip("\ufeff").strip()
+    fence = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```",
+                         raw, flags=re.I | re.S)
+    if fence:
+        raw = fence.group(1).strip()
     try:
-        data = json.loads(text.strip())
-    except (ValueError, AttributeError, TypeError) as exc:
-        raise ValueError("Ragna did not return a valid work decision") from exc
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError("Ragna response is not one valid JSON object") from exc
     if not isinstance(data, dict):
         raise ValueError("Ragna work decision must be an object")
     action = data.get("action")
