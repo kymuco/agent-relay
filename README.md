@@ -293,3 +293,52 @@ temporarily for update IDs and per-reply diagnostics; `quiet` shows just
 warnings/errors. The diagnostic file is rotated (three files of up to
 512 KiB each), logging event metadata but never Telegram message bodies,
 CWA prompts, or credentials. Set `LOG_FILE=off` to disable file logging.
+
+### Ragna + local Codex CLI (experimental, opt-in)
+
+AgentRelay supports explicit, authorized delegation from Ragna to Codex CLI.
+Only allowed humans in the configured Telegram group can start local work.
+Ordinary messages, peer bots, historical catch-up, and model output cannot start work.
+
+1. Install and sign into the official Codex CLI on this PC; check: `codex --version`.
+2. Prepare a separate, disposable or trusted Git checkout with NO `.env`,
+   `auth_data.json`, private keys, credentials or private files.
+3. Add to AgentRelay's LOCAL `.env` (do not commit this file):
+
+    WORK_ENABLED=on
+    WORK_PROJECTS=demo=W:\dev\agentrelay-codex-sandbox
+    WORK_STATE_FILE=.agent-relay-work.json
+    WORK_TIMEOUT_SECONDS=600
+    WORK_MAX_ROUNDS=2
+
+4. Start Ragna with `python agent_relay.py`.
+5. In the Telegram group, as an allowed human:
+
+    /work@ragnacobot start demo Найди один небольшой баг и исправь его, затем запусти тесты.
+
+Use `/work@ragnacobot status` to inspect current work and
+`/work@ragnacobot stop` to interrupt it. The global `/stop@ragnacobot`
+also cancels local work. `/resume` never automatically replays stopped work.
+
+Ragna uses her EXISTING CWA ChatGPT conversation to plan and review each
+Codex iteration. Codex receives only bounded delegation text and is
+launched non-interactively with `exec --json --sandbox workspace-write`
+and `--ask-for-approval never`. At most two coding iterations are permitted
+by default. Codex work changes files in the selected local workspace;
+there is NO automatic git push, commit, merge, or system-wide shell API.
+Inspect git diff before accepting changes.
+
+Security: The operator-selected workspace is a routing allowlist, not
+an OS security boundary. Verify Windows Codex sandbox enforcement on your
+installed Codex version. Codex prompts forbid network publishing, touching
+secrets, and leaving the workspace, but text alone cannot enforce that.
+Existing CWA chats may also have live connected tools; the Gateway cannot
+hard-disable those ChatGPT connectors by prompting alone. Never opt in
+for a checkout containing secrets or for a machine session with excessive
+rights. Child Codex processes do NOT inherit AgentRelay's Telegram and CWA
+environment variables, and a CMD npm launcher is bypassed for safer argv.
+
+Work status is saved to `.agent-relay-work.json` and never automatically
+replayed after an interruption/restart. CWA and Codex work is serialized
+through one worker; `/work status`, `/work stop` and `/stop` bypass it.
+Mocked CI tests cover this flow; live Codex + Telegram testing is still required.

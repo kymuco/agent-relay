@@ -12,3 +12,5 @@ auth_data.json
 .env.tmp
 .runtime/
 logs/
+.agent-relay-work.json
+.agent-relay-work.json.tmp
