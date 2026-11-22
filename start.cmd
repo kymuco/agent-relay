@@ -17,6 +17,5 @@ set "status=%ERRORLEVEL%"
 if not "%status%"=="0" (
     echo.
     echo AgentRelay setup or launch stopped. Check the message above.
-    pause
 )
 exit /b %status%

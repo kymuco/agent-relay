@@ -11,3 +11,4 @@ auth_data.json
 .agent-relay-control.json.tmp
 .env.tmp
 .runtime/
+logs/

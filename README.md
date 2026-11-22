@@ -258,3 +258,38 @@ New messages arriving **after** startup are processed normally. Telegram
 may not deliver every group message, depending on privacy settings.
 Only retained Telegram Bot API updates can be reviewed; full historical
 group chat backfill is not available.
+
+### Fast daily startup (no start.cmd, no double Ctrl+C)
+
+After your initial setup, launch AgentRelay directly from PowerShell:
+
+```powershell
+cd W:\dev\agent-relay
+.\.venv\Scripts\python.exe .\agent_relay.py
+```
+
+With an active `(.venv)`, `python agent_relay.py` works too. The new
+`.\run.ps1` does the same single-process launch, provided your PowerShell
+script policy allows local scripts. If in doubt, use the direct Python command
+above: no batch process, no CMD `Terminate batch job? [Y/N]` prompt.
+The bot now adds the previously installed `.runtime/node.exe` to PATH itself.
+No bootstrap, dependency check, or Node version probe runs at every start.
+
+`Ctrl+C` stops the bot with a single clean shutdown line. Active pending
+worker output is invalidated without persisting a Telegram `/stop` state.
+`start.cmd --setup-only` remains the initial setup and update command.
+Legacy `start.cmd` still exists but may show Windows batch termination prompts.
+
+#### Logs
+
+```ini
+LOG_LEVEL=normal
+LOG_FILE=logs/agentrelay.log
+```
+
+At `normal` the console reports start, stop, catch-up summary, emergency
+pauses, and important failures — **not every reply or update**. Use `debug`
+temporarily for update IDs and per-reply diagnostics; `quiet` shows just
+warnings/errors. The diagnostic file is rotated (three files of up to
+512 KiB each), logging event metadata but never Telegram message bodies,
+CWA prompts, or credentials. Set `LOG_FILE=off` to disable file logging.
