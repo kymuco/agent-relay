@@ -379,3 +379,14 @@ and its additional ChatGPT review request, if that trade-off is desired.
 Successful orchestration means the workflow finished, **not** that tests
 passed: check Codex's exact test results. A report of zero tests passed
 must not be treated as a verified implementation.
+
+### CWA request lifecycle diagnostics (debug)
+
+`LOG_LEVEL=debug` now reports each actual outbound CWA **chat turn** (not
+low-level HTTP calls) with a local request number, purpose (`chat`,
+`catchup`, `work#N.planM`, `work#N.final`), dispatch time, completion
+status, and duration. It does **not** print prompt text, model response,
+conversation IDs, auth data, or exception messages. Normal logs remain quiet.
+The local rotating file also includes these debug events. This is useful
+for seeing whether a slowdown is in Ragna/CWA or the subsequent Codex task.
+Note: this does not capture CWA-internal tool invocations or HTTP retries.
