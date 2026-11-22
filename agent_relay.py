@@ -539,7 +539,8 @@ class AgentRelay:
 
     def _send_ready_images(self, baseline: set[tuple[str, str]],
                            reply_message_id: int | None = None,
-                           run_generation: int | None = None) -> int:
+                           run_generation: int | None = None,
+                           monitor_serial: int | None = None) -> int:
         """Transfer only NEW, uniquely identified ready images.
 
         Single transfer lock prevents simultaneous /images and background
@@ -547,6 +548,9 @@ class AgentRelay:
         ambiguous Telegram publish, never retried automatically.
         """
         with self._image_transfer_lock:
+            if (monitor_serial is not None and
+                    monitor_serial != self._image_monitor_serial):
+                return 0
             observations = find_new_images(
                 self.image_client, self.config.conversation_id, baseline)
             LOG.debug('Изображения · готовых новых файлов: %s', len(observations))
@@ -592,10 +596,12 @@ class AgentRelay:
             with self._image_transfer_lock:
                 if serial != self._image_monitor_serial:
                     return  # A newer explicit generation request superseded it.
+            with self._image_transfer_lock:
+                claimed_before = len(self._image_claimed)
             try:
                 count = self._send_ready_images(
                     baseline, reply_message_id=reply_message_id,
-                    run_generation=generation)
+                    run_generation=generation, monitor_serial=serial)
                 if count:
                     with self._image_transfer_lock:
                         if serial == self._image_monitor_serial:
@@ -605,11 +611,23 @@ class AgentRelay:
                 # A failed Telegram HTTP send can have been delivered despite
                 # the exception: claimed file IDs cannot be resent automatically.
                 LOG.warning('Изображение пока не доставлено (%s)', type(exc).__name__)
-                # Distinguish failure after a claimed send from a read failure.
-                # On an ambiguous send, stop auto-polling this same request.
+                # On a potentially ambiguous Telegram send, stop retrying.
                 with self._image_transfer_lock:
-                    attempted = any(key not in baseline for key in self._image_claimed)
+                    attempted = len(self._image_claimed) > claimed_before
                 if attempted:
+                    try:
+                        self.api.call('sendMessage', {
+                            'chat_id': self.config.chat_id,
+                            'text': ('Не удалось подтвердить доставку изображения. '
+                                     'Возможно, оно уже отправилось; проверь чат. '
+                                     'Я не буду автоматически отправлять его повторно.'),
+                            'reply_parameters': {
+                                'message_id': reply_message_id,
+                                'allow_sending_without_reply': True,
+                            },
+                        })
+                    except Exception:
+                        pass
                     return
         if not self._run_permitted(generation):
             return
@@ -632,11 +650,11 @@ class AgentRelay:
 
     def _start_image_monitor(
         self, baseline: set[tuple[str, str]],
-        *, reply_message_id: int, generation: int,
+        *, reply_message_id: int, generation: int, serial: int,
     ) -> None:
         with self._image_transfer_lock:
-            self._image_monitor_serial += 1
-            serial = self._image_monitor_serial
+            if serial != self._image_monitor_serial:
+                return
         LOG.info('Ожидание изображения · запуск фоновой проверки · baseline=%s',
                  len(baseline))
         threading.Thread(
@@ -832,7 +850,12 @@ class AgentRelay:
         generation_requested = (self.config.media_enabled and not sender_is_bot
                                 and wants_generated_image(text_in))
         before_images = None
+        image_serial = None
         if generation_requested:
+            with self._image_transfer_lock:
+                self._image_monitor_serial += 1
+                image_serial = self._image_monitor_serial
+                self.pending_image_baseline = None
             LOG.info('Запрос на генерацию изображения распознан')
             prompt += ('\n[AgentRelay / image delivery]\n'
                        'The human is asking you to CREATE an image, not just '
@@ -944,7 +967,7 @@ class AgentRelay:
                     if before_images is not None:
                         self._start_image_monitor(
                             before_images, reply_message_id=message['message_id'],
-                            generation=run_generation)
+                            generation=run_generation, serial=image_serial)
                     else:
                         self.api.call('sendMessage', {
                             'chat_id': self.config.chat_id,
