@@ -19,7 +19,8 @@ class ImageDeliveryTests(unittest.TestCase):
             frozenset(), allowed_user_ids=frozenset({10}),
             state_file=str(Path(folder) / "state.json"),
             control_file=str(Path(folder) / "control.json"),
-            min_interval_seconds=0, media_enabled=True, media_auto_reply=False)
+            min_interval_seconds=0, media_enabled=True, media_auto_reply=False,
+            bot_aliases=("Рагна",))
         return AgentRelay(config, api, main, image_client=image_client), api, main, image_client
 
     def update(self, text):
