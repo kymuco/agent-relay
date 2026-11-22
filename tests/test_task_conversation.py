@@ -40,9 +40,12 @@ class ClassifierTests(unittest.TestCase):
         for text in ("Почему unittest?", "А если использовать pytest?",
                      "Можно ли добавить кеш?", "Добавь ещё тест?",
                      "Не добавляй больше тестов", "А что если исправим это?",
-                     "Рагна, расскажи о результате", "добавь ещё в other-project файл"):
+                     "Рагна, расскажи о результате"):
             with self.subTest(text=text):
                 self.assertEqual(self.route(text), "question")
+        self.assertEqual(self.route("добавь ещё в other-project файл"),
+                         "foreign_project")
+        self.assertEqual(self.route("создай дополнительный тест"), "amend")
         self.assertEqual(self.route("Что там?"), "status")
         self.assertEqual(self.route("на каком этапе"), "status")
         self.assertEqual(self.route("останови работу"), "stop_info")
@@ -187,6 +190,24 @@ class TaskReplyTests(unittest.TestCase):
                 "update_id": 33, "message": msg}))
             self.assertIn("Задача #1", api.call.call_args.args[1]["text"])
             main.send.assert_not_called()
+
+    def test_foreign_project_instruction_never_reaches_cwa_or_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, api, main, coord, dev = self.app(directory)
+            msg = reply_text("Добавь ещё в other-project файл")
+            queue = Queue()
+            # The repository allowlist deliberately contains more than one
+            # project; the Reply must never switch away from its bound card.
+            app.work_repos["other"] = "example/other-project"
+            self.assertTrue(app._handle_task_reply(msg, queue, update={
+                "update_id": 43, "message": msg}))
+            self.assertEqual(app.work.pending_snapshot(), [])
+            self.assertEqual(queue.qsize(), 0)
+            main.send.assert_not_called()
+            coord.send.assert_not_called()
+            dev.send.assert_not_called()
+            self.assertIn("другого проекта",
+                          api.call.call_args.args[1]["text"])
 
     def test_stop_replies_do_not_stop_work_without_button(self):
         with tempfile.TemporaryDirectory() as directory:
