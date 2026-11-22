@@ -75,6 +75,7 @@ class CatchupTests(unittest.TestCase):
         self.assertIsNone(parse_catchup_decision('{"decision":"silent","text":""}'))
         self.assertIsNone(parse_catchup_decision('Привет!'))
         self.assertIsNone(parse_catchup_decision('{"decision":"reply","text":"/relay@FriendBot go"}'))
+        self.assertIsNone(parse_catchup_decision('{"decision":"reply","text":"@FriendBot продолжай"}'))
         self.assertIsNone(parse_catchup_decision('{"decision":"reply","text":"[[handoff:FriendBot]]"}'))
         self.assertEqual(parse_catchup_decision('{"decision":"reply","text":"Есть идея."}'),
                          'Есть идея.')

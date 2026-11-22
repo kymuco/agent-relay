@@ -20,7 +20,7 @@ _ACTION = re.compile(
     r'|merge|push|commit|deploy|delete|execute|run|modify|create\s+(?:a\s+)?(?:pr|branch))\b',
     re.I,
 )
-_MARKER = re.compile(r'(\[\[|/relay@|/stop|/resume|/voice|/both)', re.I)
+_MARKER = re.compile(r'(\[\[|/relay@|/stop|/resume|/voice|/both|@[A-Za-z][A-Za-z0-9_]{4,31}\b)', re.I)
 
 
 @dataclass(frozen=True)
