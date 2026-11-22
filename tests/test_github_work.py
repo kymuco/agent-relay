@@ -101,7 +101,7 @@ class GitHubWorkTests(unittest.TestCase):
             ]
             d.send.side_effect = [
                 response('{"status":"ready","repository":"owner/demo",'
-                         '"branch":"feat/test","commit_sha":"' + "a"*40 +
+                         '"branch":"agentrelay/work-1","commit_sha":"' + "a"*40 +
                          '","summary":"Committed."}', "dev-1"),
                 response('{"status":"blocked","repository":"owner/demo",'
                          '"branch":"","commit_sha":"","summary":"No auth."}', "dev-1"),
@@ -171,7 +171,7 @@ class GitHubWorkTests(unittest.TestCase):
                 entered.set()
                 release.wait(3)
                 return response('{"status":"ready","repository":"owner/demo",'
-                                '"branch":"feat/x","commit_sha":"' + "a"*40 +
+                                '"branch":"agentrelay/work-1","commit_sha":"' + "a"*40 +
                                 '","summary":"Committed."}', "dev-1")
             developer.send.side_effect = work_send
             with patch("agent_relay.verify_remote_branch", return_value=True) as verified:
@@ -205,7 +205,7 @@ class GitHubWorkTests(unittest.TestCase):
                 entered.set()
                 release.wait(3)
                 return response('{"status":"ready","repository":"owner/demo",'
-                                '"branch":"feat/x","commit_sha":"' + "a"*40 +
+                                '"branch":"agentrelay/work-1","commit_sha":"' + "a"*40 +
                                 '","summary":"Done"}', "dev-1")
             developer.send.side_effect = pending
             q = Queue()
@@ -227,7 +227,7 @@ class GitHubWorkTests(unittest.TestCase):
             ]
             developer.send.return_value = response(
                 '{"status":"ready","repository":"owner/demo",'
-                '"branch":"feat/x","commit_sha":"' + "a"*40 +
+                '"branch":"agentrelay/work-1","commit_sha":"' + "a"*40 +
                 '","summary":"One commit"}', "d")
             q = Queue()
             with patch("agent_relay.verify_remote_branch", return_value=True), \
