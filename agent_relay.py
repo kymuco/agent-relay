@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from agent_control import ControlState
+from local_codex import (WorkState, parse_projects, parse_work_command,
+                         parse_orchestrator_decision, work_prompt)
 from relay_logging import LOG, configure_logging
 from catchup import make_catchup_prompt, parse_catchup_decision, select_catchup
 from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff, trusted_sender
@@ -112,6 +114,11 @@ class Config:
     catchup_max_messages: int = 100
     catchup_max_replies: int = 1
     catchup_max_age_minutes: int = 180
+    work_enabled: bool = False
+    work_projects: str = ''
+    work_state_file: str = '.agent-relay-work.json'
+    work_timeout_seconds: int = 600
+    work_max_rounds: int = 2
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -161,6 +168,16 @@ class Config:
             raise ValueError('CATCHUP_MAX_REPLIES must be 0 or 1')
         if not 1 <= catchup_max_age_minutes <= 1440:
             raise ValueError('CATCHUP_MAX_AGE_MINUTES must be between 1 and 1440')
+        work_enabled = os.getenv('WORK_ENABLED', 'off').strip().lower() in ('on', 'true', '1')
+        work_projects = os.getenv('WORK_PROJECTS', '').strip()
+        work_timeout = int(os.getenv('WORK_TIMEOUT_SECONDS', '600'))
+        work_max_rounds = int(os.getenv('WORK_MAX_ROUNDS', '2'))
+        if not 30 <= work_timeout <= 3600:
+            raise ValueError('WORK_TIMEOUT_SECONDS must be between 30 and 3600')
+        if not 1 <= work_max_rounds <= 3:
+            raise ValueError('WORK_MAX_ROUNDS must be between 1 and 3')
+        if work_enabled and not parse_projects(work_projects):
+            raise ValueError('WORK_ENABLED requires WORK_PROJECTS with at least one existing directory')
         if interval < 0:
             raise ValueError('MIN_INTERVAL_SECONDS must not be negative')
         return cls(
@@ -188,6 +205,11 @@ class Config:
             catchup_max_messages=catchup_max_messages,
             catchup_max_replies=catchup_max_replies,
             catchup_max_age_minutes=catchup_max_age_minutes,
+            work_enabled=work_enabled,
+            work_projects=work_projects,
+            work_state_file=os.getenv('WORK_STATE_FILE', '.agent-relay-work.json'),
+            work_timeout_seconds=work_timeout,
+            work_max_rounds=work_max_rounds,
         )
 
 
@@ -372,6 +394,8 @@ class AgentRelay:
         self.client = client
         self.cursor = Cursor(config.state_file)
         self.control = ControlState(config.control_file)
+        self.work_projects = parse_projects(config.work_projects) if config.work_enabled else {}
+        self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self._shutdown = threading.Event()
         self.last_send_time = float('-inf')
         self.group_context = GroupAwareness(config.group_context_limit)
@@ -392,6 +416,8 @@ class AgentRelay:
         """Stop pending worker output without persisting /stop."""
         if not self._shutdown.is_set():
             self._shutdown.set()
+            if self.work is not None:
+                self.work.stop()
             LOG.info('Остановлен.')
 
     def _run_permitted(self, generation: int) -> bool:
@@ -472,6 +498,8 @@ class AgentRelay:
         if control_command:
             if control_command == 'stop':
                 changed = self.control.stop()
+                if self.work is not None:
+                    self.work.stop()
                 self._stop_peer_reply()
                 self.pending_image_baseline = None
                 status = ('Остановлен. Для продолжения отправь /resume.'
@@ -826,6 +854,8 @@ class AgentRelay:
                     # do not respond to each historical command.
                     if control == 'stop':
                         self.control.stop()
+                        if self.work is not None:
+                            self.work.stop()
                         self._stop_peer_reply()
                         self.pending_image_baseline = None
                     else:
@@ -861,6 +891,150 @@ class AgentRelay:
         return bool(text and text[0].lower() ==
                     f'/catchup@{self.bot_username}'.lower())
 
+    def _handle_work_command(
+        self, message: dict[str, Any],
+        work_queue: queue.Queue[tuple[dict[str, Any], int]]
+    ) -> bool:
+        """Handle targeted /work commands before the CWA worker.
+
+        Only trusted humans may start/stop. Peer bots cannot impersonate
+        commands. Status/stop work even while CWA or Codex is blocked.
+        """
+        parsed = parse_work_command(str(message.get('text') or ''), self.bot_username)
+        if parsed is None:
+            return False
+        chat = message.get('chat') or {}
+        if chat.get('id') != self.config.chat_id or chat.get('type') not in ('group', 'supergroup'):
+            return True
+        if (not trusted_sender(message, self.config.allowed_user_ids,
+                               self.config.peers, self.config.peer_bot_ids, self.bot_id)
+                or (message.get('from') or {}).get('is_bot')):
+            return True
+        verb, project, task = parsed
+        reply = ''
+        if not self.config.work_enabled or self.work is None:
+            reply = 'Локальная работа отключена. Настрой WORK_ENABLED и WORK_PROJECTS.'
+        elif verb == 'status':
+            reply = self.work.status()
+        elif verb == 'stop':
+            reply = ('Локальная задача остановлена.' if self.work.stop()
+                     else 'Сейчас нет выполняемой локальной задачи.')
+        elif verb == 'start':
+            if self.control.paused:
+                reply = 'Ragna приостановлена. Сначала отправь /resume@' + self.bot_username
+            elif project not in self.work_projects:
+                reply = 'Проект не разрешён. Доступны: ' + ', '.join(sorted(self.work_projects))
+            else:
+                work_id = self.work.start(project)
+                if work_id is None:
+                    reply = 'Уже выполняется задача. ' + self.work.status()
+                else:
+                    try:
+                        work_queue.put_nowait(({'_local_work': (work_id, project, task)},
+                                               self.control.generation()))
+                        reply = f'Local Work #{work_id}: Ragna получила задачу для {project}.'
+                        LOG.info('Локальная задача #%s начата · %s', work_id, project)
+                    except queue.Full:
+                        self.work.update(work_id, 'failed')
+                        reply = 'Очередь заполнена; запуск отменён.'
+        else:
+            reply = ('Команды: /work@' + self.bot_username +
+                     ' start <проект> <задача> · status · stop')
+        self.api.call('sendMessage', {
+            'chat_id': self.config.chat_id, 'text': reply,
+            'reply_parameters': {
+                'message_id': message['message_id'],
+                'allow_sending_without_reply': True,
+            },
+        })
+        return True
+
+    def _run_local_work(self, payload: tuple[int, str, str], generation: int) -> None:
+        """Single serialized orchestration loop in the existing CWA worker."""
+        if self.work is None:
+            return
+        work_id, project, task = payload
+        if not self._run_permitted(generation) or not self.work.active(work_id):
+            return
+        from local_codex import CodexRunner
+        # WorkState.runner owns the active process and supports /work stop.
+        runner = self.work.runner
+        params: dict[str, Any] = {'conversation': self.config.conversation_id}
+        if self.config.model:
+            params['model'] = self.config.model
+        if self.config.effort:
+            params['reasoning_effort'] = self.config.effort
+        previous = ''
+        try:
+            for round_no in range(1, self.config.work_max_rounds + 1):
+                if not self._run_permitted(generation) or not self.work.active(work_id):
+                    return
+                self.work.update(work_id, 'running', round_no)
+                plan = self.client.send(
+                    work_prompt(task, project, round_no=round_no, result=previous,
+                                max_rounds=self.config.work_max_rounds), **params)
+                if not self._run_permitted(generation) or not self.work.active(work_id):
+                    return
+                action, value = parse_orchestrator_decision(
+                    str(plan.text or ''), first=(round_no == 1))
+                if action == 'finish':
+                    self.work.update(work_id, 'completed', round_no - 1)
+                    if self._run_permitted(generation):
+                        self.api.call('sendMessage', {
+                            'chat_id': self.config.chat_id,
+                            'text': f'Local Work #{work_id}\n{value}',
+                        })
+                        LOG.info('Локальная задача #%s завершена', work_id)
+                    return
+                LOG.debug('Local Work #%s: Codex round %s', work_id, round_no)
+                result = runner.run(self.work_projects[project], value,
+                                    timeout=self.config.work_timeout_seconds)
+                if not self._run_permitted(generation) or not self.work.active(work_id):
+                    return
+                previous = result.summary
+                if not result.success:
+                    self.work.update(work_id, 'failed', round_no)
+                    self.api.call('sendMessage', {
+                        'chat_id': self.config.chat_id,
+                        'text': (f'Local Work #{work_id}: Codex не завершил задачу. '
+                                 'Изменения могли остаться в рабочей папке. '
+                                 + result.summary[:900]),
+                    })
+                    LOG.warning('Локальная задача #%s: Codex завершился с ошибкой', work_id)
+                    return
+            # Ragna must explicitly review the last Codex result; no further
+            # delegation is accepted when the configured budget is exhausted.
+            if not self._run_permitted(generation) or not self.work.active(work_id):
+                return
+            final = self.client.send(work_prompt(
+                task, project, round_no=self.config.work_max_rounds + 1,
+                result=previous, max_rounds=self.config.work_max_rounds
+            ).replace('To delegate: {"action":"delegate","instruction":"specific bounded Codex task"}. ',
+                      'Delegation is no longer available. '), **params)
+            if not self._run_permitted(generation) or not self.work.active(work_id):
+                return
+            action, text = parse_orchestrator_decision(str(final.text or ''), first=False)
+            if action != 'finish':
+                raise ValueError('Work reached its delegation limit without an итог')
+            self.work.update(work_id, 'completed', self.config.work_max_rounds)
+            if self._run_permitted(generation):
+                self.api.call('sendMessage', {
+                    'chat_id': self.config.chat_id,
+                    'text': f'Local Work #{work_id}\n{text}',
+                })
+                LOG.info('Локальная задача #%s завершена', work_id)
+        except Exception as exc:
+            if not self._run_permitted(generation) or not self.work.active(work_id):
+                return
+            self.work.update(work_id, 'failed')
+            LOG.error('Локальная задача #%s не завершена (%s)', work_id, type(exc).__name__)
+            self.api.call('sendMessage', {
+                'chat_id': self.config.chat_id,
+                'text': (f'Local Work #{work_id}: задача остановилась '
+                         f'({type(exc).__name__}). Проверь проект; '
+                         'автоматический повтор отключён.'),
+            })
+
     def serve(self) -> None:
         # One non-reentrant CWA worker; poll Telegram independently for
         # /stop and /resume even while generation or speech is in progress.
@@ -873,6 +1047,8 @@ class AgentRelay:
                     if self._run_permitted(generation):
                         if '_catchup_batch' in update:
                             self._handle_catchup(update['_catchup_batch'], generation)
+                        elif '_local_work' in update:
+                            self._run_local_work(update['_local_work'], generation)
                         else:
                             self.process_update(update, preadvanced=True,
                                                 expected_generation=generation)
@@ -922,6 +1098,8 @@ class AgentRelay:
                     if self._control_command(message):
                         # A human emergency command outranks a running worker.
                         self.process_update(item, preadvanced=True)
+                    elif self._handle_work_command(message, work_queue):
+                        pass  # Work control bypasses CWA worker and queued text.
                     elif self._manual_catchup_command(message):
                         if (self.config.catchup_mode == 'smart' and not self.control.paused
                                 and not self._catchup_replied and self._catchup_history):
