@@ -437,10 +437,19 @@ class Cursor:
 
 class AgentRelay:
     def __init__(self, config: Config, api: Any, client: Any,
-                 coordinator_client: Any = None, developer_client: Any = None):
+                 coordinator_client: Any = None, developer_client: Any = None,
+                 image_client: Any = None):
         self.config = config
         self.api = api
         self.client = client
+        # Dedicated read-only CWA instance so eventual image discovery does
+        # not occupy the live Ragna chat client.
+        self.image_client = image_client if image_client is not None else client
+        self._image_transfer_lock = threading.Lock()
+        self._image_monitor_serial = 0
+        # Once Telegram send starts, never automatically retry its ambiguous
+        # outcome. Keep this state process-local as in the existing image path.
+        self._image_claimed: set[tuple[str, str]] = set()
         self.cursor = Cursor(config.state_file)
         self.control = ControlState(config.control_file)
         self.work_projects = parse_projects(config.work_projects) if config.work_enabled else {}
@@ -531,23 +540,110 @@ class AgentRelay:
     def _send_ready_images(self, baseline: set[tuple[str, str]],
                            reply_message_id: int | None = None,
                            run_generation: int | None = None) -> int:
-        observations = find_new_images(self.client, self.config.conversation_id, baseline)
-        delivered = 0
-        with tempfile.TemporaryDirectory(prefix='agentrelay-image-') as td:
-            for image in observations:
-                if run_generation is not None and not self._run_permitted(run_generation):
-                    return delivered
-                data = read_verified_artifact(self.client, self.config.conversation_id,
-                                              image.filename, Path(td),
-                                              max_bytes=self.config.max_media_bytes)
-                method = ('sendPhoto' if image.filename.lower().endswith(('.png', '.jpg', '.jpeg'))
-                          else 'sendDocument')
-                if run_generation is not None and not self._run_permitted(run_generation):
-                    return delivered
-                send_file(self.config.telegram_token, method, self.config.chat_id,
-                          data, image.filename, reply_message_id=reply_message_id)
-                delivered += 1
-        return delivered
+        """Transfer only NEW, uniquely identified ready images.
+
+        Single transfer lock prevents simultaneous /images and background
+        monitor from publishing duplicates. Claims are made before an
+        ambiguous Telegram publish, never retried automatically.
+        """
+        with self._image_transfer_lock:
+            observations = find_new_images(
+                self.image_client, self.config.conversation_id, baseline)
+            LOG.debug('Изображения · готовых новых файлов: %s', len(observations))
+            delivered = 0
+            with tempfile.TemporaryDirectory(prefix='agentrelay-image-') as td:
+                for image in observations:
+                    key = (image.message_id, image.filename)
+                    if key in self._image_claimed:
+                        continue
+                    if run_generation is not None and not self._run_permitted(run_generation):
+                        return delivered
+                    # Local materialization is read-only with respect to the
+                    # ChatGPT conversation. A failure here remains retryable
+                    # by later readback because Telegram was never contacted.
+                    data = read_verified_artifact(
+                        self.image_client, self.config.conversation_id,
+                        image.filename, Path(td),
+                        max_bytes=self.config.max_media_bytes)
+                    if run_generation is not None and not self._run_permitted(run_generation):
+                        return delivered
+                    method = ('sendPhoto' if image.filename.lower().endswith(
+                              ('.png', '.jpg', '.jpeg')) else 'sendDocument')
+                    self._image_claimed.add(key)
+                    # If the HTTP send is ambiguous, do NOT repeat this file.
+                    send_file(self.config.telegram_token, method, self.config.chat_id,
+                              data, image.filename, reply_message_id=reply_message_id)
+                    delivered += 1
+                    LOG.info('Изображение отправлено · способ=%s · байт=%s',
+                             method, len(data))
+            return delivered
+
+    def _monitor_generated_images(
+        self, baseline: set[tuple[str, str]], reply_message_id: int,
+        generation: int, serial: int, *,
+        intervals: tuple[float, ...] = (0, 3, 5, 8, 12, 18, 25),
+    ) -> None:
+        """Read-only, bounded follow-up; never reissue model image generation."""
+        for delay in intervals:
+            if delay and self._shutdown.wait(delay):
+                return
+            if not self._run_permitted(generation):
+                return
+            with self._image_transfer_lock:
+                if serial != self._image_monitor_serial:
+                    return  # A newer explicit generation request superseded it.
+            try:
+                count = self._send_ready_images(
+                    baseline, reply_message_id=reply_message_id,
+                    run_generation=generation)
+                if count:
+                    with self._image_transfer_lock:
+                        if serial == self._image_monitor_serial:
+                            self.pending_image_baseline = None
+                    return
+            except Exception as exc:
+                # A failed Telegram HTTP send can have been delivered despite
+                # the exception: claimed file IDs cannot be resent automatically.
+                LOG.warning('Изображение пока не доставлено (%s)', type(exc).__name__)
+                # Distinguish failure after a claimed send from a read failure.
+                # On an ambiguous send, stop auto-polling this same request.
+                with self._image_transfer_lock:
+                    attempted = any(key not in baseline for key in self._image_claimed)
+                if attempted:
+                    return
+        if not self._run_permitted(generation):
+            return
+        with self._image_transfer_lock:
+            if serial != self._image_monitor_serial or self.pending_image_baseline is None:
+                return
+        try:
+            self.api.call('sendMessage', {
+                'chat_id': self.config.chat_id,
+                'text': ('Пока нет подтверждённого готового изображения в ChatGPT. '
+                         'Генерация могла не запуститься или ещё выполняться. '
+                         'Позже можно проверить вручную: /images@' + self.bot_username),
+                'reply_parameters': {
+                    'message_id': reply_message_id,
+                    'allow_sending_without_reply': True,
+                },
+            })
+        except Exception as exc:
+            LOG.warning('Не удалось сообщить статус изображения (%s)', type(exc).__name__)
+
+    def _start_image_monitor(
+        self, baseline: set[tuple[str, str]],
+        *, reply_message_id: int, generation: int,
+    ) -> None:
+        with self._image_transfer_lock:
+            self._image_monitor_serial += 1
+            serial = self._image_monitor_serial
+        LOG.info('Ожидание изображения · запуск фоновой проверки · baseline=%s',
+                 len(baseline))
+        threading.Thread(
+            target=self._monitor_generated_images,
+            args=(baseline, reply_message_id, generation, serial),
+            name=f'AgentRelayImageMonitor-{serial}', daemon=True,
+        ).start()
 
     def _control_command(self, message: dict[str, Any]) -> str | None:
         """Control authority belongs only to allowed humans in this group."""
@@ -590,6 +686,8 @@ class AgentRelay:
                     self.work.stop()
                 self._stop_peer_reply()
                 self.pending_image_baseline = None
+                with self._image_transfer_lock:
+                    self._image_monitor_serial += 1
                 status = ('Остановлен. Для продолжения отправь /resume.'
                           if changed else 'Уже остановлен. Для продолжения отправь /resume.')
             else:
@@ -735,11 +833,21 @@ class AgentRelay:
                                 and wants_generated_image(text_in))
         before_images = None
         if generation_requested:
+            LOG.info('Запрос на генерацию изображения распознан')
+            prompt += ('\n[AgentRelay / image delivery]\n'
+                       'The human is asking you to CREATE an image, not just '
+                       'describe one. If actual image generation is available, '
+                       'use that capability. Do not claim an image was made '
+                       'unless a real generated artifact exists. The Host will '
+                       'retrieve and send verified image bytes separately.\n')
             try:
-                before_images = generated_image_keys(self.client, self.config.conversation_id)
+                before_images = generated_image_keys(
+                    self.image_client, self.config.conversation_id)
                 self.pending_image_baseline = before_images
+                LOG.debug('Изображение · исходных файлов: %s', len(before_images))
             except Exception as exc:
-                LOG.debug('Поиск изображений недоступен (%s)', type(exc).__name__)
+                LOG.warning('Не удалось получить исходный список изображений (%s)',
+                            type(exc).__name__)
         params: dict[str, Any] = {'conversation': self.config.conversation_id}
         if inbound and inbound.media:
             params['media'] = inbound.media
@@ -832,22 +940,18 @@ class AgentRelay:
             if not self._run_permitted(run_generation):
                 return
             if not sender_is_bot and self.config.media_enabled:
-                if before_images is not None:
-                    try:
-                        if not self._run_permitted(run_generation):
-                            return
-                        count = self._send_ready_images(before_images, reply_message_id=message['message_id'],
-                                                        run_generation=run_generation)
-                        if count:
-                            self.pending_image_baseline = None
-                        elif not text:
-                            self.api.call('sendMessage', {
-                                'chat_id': self.config.chat_id,
-                                'text': 'Генерация изображения запрошена, но готового файла пока нет. '
-                                        'Позже напиши /images@' + self.bot_username,
-                            })
-                    except Exception as exc:
-                        LOG.warning('Не удалось отправить изображение (%s)', type(exc).__name__)
+                if generation_requested:
+                    if before_images is not None:
+                        self._start_image_monitor(
+                            before_images, reply_message_id=message['message_id'],
+                            generation=run_generation)
+                    else:
+                        self.api.call('sendMessage', {
+                            'chat_id': self.config.chat_id,
+                            'text': ('Не могу проверить готовые изображения через CWA. '
+                                     'Проверь генерацию в чате ChatGPT; автоматическая '
+                                     'отправка в Telegram сейчас не подтверждена.'),
+                        })
                 if text:
                     with tempfile.TemporaryDirectory(prefix='agentrelay-artifact-') as td:
                         for filename in artifact_filenames(text):
@@ -1482,13 +1586,18 @@ def main() -> None:
         from chatgpt_web_adapter import BrowserlessHTTPClient
         api = Telegram(config.telegram_token)
         client = BrowserlessHTTPClient(auth_file=config.auth_file)
+        # Image observations may continue for a short bounded period after
+        # ChatGPT responds. Use an independent read client.
+        image_client = (BrowserlessHTTPClient(auth_file=config.auth_file)
+                        if config.media_enabled else None)
         coordinator_client = developer_client = None
         if config.work_enabled and config.work_executor == 'github':
             coordinator_client = BrowserlessHTTPClient(auth_file=config.auth_file)
             developer_client = BrowserlessHTTPClient(auth_file=config.auth_file)
         app = AgentRelay(config, api, client,
                          coordinator_client=coordinator_client,
-                         developer_client=developer_client)
+                         developer_client=developer_client,
+                         image_client=image_client)
         app.serve()
     except KeyboardInterrupt:
         if app is not None:
