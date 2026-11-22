@@ -118,6 +118,10 @@ class TaskReplyTests(unittest.TestCase):
                 "update_id": 30, "message": good}))
             self.assertEqual(app.work.pending_snapshot(),
                              ["добавь проверку деления на ноль"])
+            end = time.monotonic() + 2
+            while (app.progress.record.get("pending_changes") != 1
+                   and time.monotonic() < end):
+                time.sleep(.01)
             self.assertEqual(app.progress.record["pending_changes"], 1)
             self.assertEqual(queue.qsize(), 0)
             self.assertIn("Уточнения в очереди",
