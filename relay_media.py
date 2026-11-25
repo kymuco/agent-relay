@@ -409,7 +409,7 @@ def markdown_to_telegram_html(markdown: str) -> str:
         match = re.match(r'^\s*```([a-zA-Z0-9_+-]*)\s*$', line)
         if match:
             if code:
-                content = html.escape('\n'.join(code), quote=True)
+                content = html.escape('\n'.join(code[1:]), quote=True)
                 output.append('<pre><code>' + content + '</code></pre>')
                 code.clear()
                 language = ''

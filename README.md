@@ -693,3 +693,20 @@ the journal to expected intent. Verify no new task/Coordinator/Developer call.
 Check both bot profiles and /stop during CWA. ACTION_MODE=off restores legacy
 behavior, without work-state migration. NA-02 admission, execution, result
 feedback and shared tasks are NOT implemented by NA-01.
+
+## NA-01.1: response integrity
+
+This experimental branch pins CWA commit 0c0af75e (PR 259) instead of the
+older PyPI build. Run start.cmd after pulling so bootstrap installs changed
+requirements in .venv (Git and network access required). Main chat and catch-up
+request verify_final_text=True by default. It adds a read, not a model turn;
+if the completed message cannot be verified, the existing no-replay error path
+is used. Native Agency observe always verifies; CWA_VERIFY_FINAL_TEXT=off is
+an escape hatch for ordinary legacy chat only. Empty asynchronous responses
+retain the existing media lifecycle. No automatic fallback generation.
+
+Telegram HTML delivery uses source chunks, preferring complete paragraphs and
+fenced blocks; oversized or unclosed blocks use literal text. Rich Messages
+remain opt-in via TELEGRAM_RICH_MODE=auto. Use off if Telegram Rich rendering
+introduces artifacts. No automatic retry of a possibly delivered Telegram
+message. No live Telegram or authenticated CWA test is implied.

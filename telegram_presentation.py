@@ -39,3 +39,87 @@ def rich_payload(text: str, *, chat_id: int, reply_message_id: int | None = None
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
     return payload
+
+
+_FENCE_LINE = re.compile(r"^[ \t]*(\x60{3,}|~{3,})(.*)$")
+
+
+def utf16_size(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _plain_chunks(text: str, limit: int) -> list[str]:
+    chunks = []
+    while text:
+        units = 0
+        end = boundary = 0
+        for i, char in enumerate(text):
+            size = 2 if ord(char) > 0xFFFF else 1
+            if units + size > limit:
+                break
+            units += size
+            end = i + 1
+            if char.isspace():
+                boundary = end
+        if end == len(text):
+            chunks.append(text)
+            break
+        cut = boundary if boundary >= end // 2 and boundary else end
+        chunks.append(text[:cut])
+        text = text[cut:]
+    return chunks
+
+
+def _markdown_blocks(text: str) -> list[tuple[str, bool]]:
+    blocks = []
+    lines = []
+    fence = None
+    for line in text.splitlines(keepends=True):
+        match = _FENCE_LINE.match(line.rstrip("\r\n"))
+        if fence is not None:
+            lines.append(line)
+            if (match and match[1][0] == fence[0]
+                    and len(match[1]) >= len(fence) and not match[2].strip()):
+                # Only the existing renderer's triple-backtick syntax is supported.
+                blocks.append(("".join(lines), fence == chr(96) * 3 and match[1] == fence))
+                lines, fence = [], None
+            continue
+        if match:
+            if lines:
+                blocks.append(("".join(lines), True))
+            lines = [line]
+            fence = match[1]
+            continue
+        lines.append(line)
+        if not line.strip():
+            blocks.append(("".join(lines), True))
+            lines = []
+    if lines:
+        blocks.append(("".join(lines), fence is None))
+    return blocks
+
+
+def delivery_chunks(text: str, limit: int = 3800) -> list[tuple[str, bool]]:
+    """Lossless source chunks; oversized Markdown blocks degrade to literal text.
+
+    Reserve space for peer commands. Keep paragraphs and complete fences
+    together when they fit; never reinterpret a split code block as prose.
+    """
+    if not 2 <= limit <= 3900:
+        raise ValueError("invalid Telegram chunk limit")
+    output = []
+    current = ""
+    for block, formatted in _markdown_blocks(text):
+        if not formatted or utf16_size(block) > limit:
+            if current:
+                output.append((current, True))
+                current = ""
+            output.extend((part, False) for part in _plain_chunks(block, limit))
+            continue
+        if current and utf16_size(current + block) > limit:
+            output.append((current, True))
+            current = ""
+        current += block
+    if current:
+        output.append((current, True))
+    return output

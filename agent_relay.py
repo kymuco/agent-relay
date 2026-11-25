@@ -31,7 +31,7 @@ from task_conversation import (classify_task_reply, normalize_task_reply,
                                trusted_task_context)
 from work_card_views import render_work_card
 from contextlib import nullcontext
-from telegram_presentation import use_rich_message, rich_payload
+from telegram_presentation import use_rich_message, rich_payload, delivery_chunks
 from relay_logging import LOG, configure_logging
 from catchup import make_catchup_prompt, parse_catchup_decision, select_catchup
 from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff, trusted_sender
@@ -143,6 +143,7 @@ class Config:
     action_mode: str = 'off'
     action_observe_read_only_ack: bool = False
     action_observation_file: str = '.agent-relay-action-observations.json'
+    verify_final_text: bool = True
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -280,6 +281,7 @@ class Config:
             action_mode=action_mode,
             action_observe_read_only_ack=action_ack,
             action_observation_file=os.getenv('ACTION_OBSERVATION_FILE', '.agent-relay-action-observations.json'),
+            verify_final_text=os.getenv('CWA_VERIFY_FINAL_TEXT', 'on').strip().lower() not in ('off', '0', 'false'),
             work_progress_file=os.getenv('WORK_PROGRESS_FILE', '.agent-relay-progress.json'),
         )
 
@@ -544,6 +546,10 @@ class AgentRelay:
         # No implicit CWA defaults (which can be Instant rather than High).
         params['model'] = 'gpt-6'
         params['reasoning_effort'] = 'high'
+        if purpose in ('chat', 'catchup'):
+            # Observe must use verified final text even with the diagnostic escape hatch.
+            params['verify_final_text'] = (self.config.verify_final_text or
+                                           self.config.action_mode == 'observe')
         with self._cwa_request_lock:
             self._cwa_request_counter += 1
             request_id = self._cwa_request_counter
@@ -990,14 +996,16 @@ class AgentRelay:
                                   + r'(?=\s|$)\s*', '', text, count=1,
                                   flags=re.IGNORECASE).strip()
                 text = neutralize_peer_mentions(text, self.config.peers)
-            parts = split_for_telegram(text, limit=1800)
+            parts = [(part, formatted) for part, formatted in delivery_chunks(text)
+                     if part.strip()]
             if not parts:
-                parts = ['На этом остановимся.'] if ending_peer else []
+                parts = [('На этом остановимся.', True)] if ending_peer else []
             if peer_reply_out and parts:
                 # Route only the LAST chunk to avoid waking the peer multiple
                 # times for one long model response. Command is not a hint;
                 # it must appear literally at the start of Telegram text.
-                parts[-1] = f'/relay@{peer_destination} {parts[-1]}'
+                body, formatted = parts[-1]
+                parts[-1] = (f'/relay@{peer_destination} {body}', formatted)
             voice_delivered = False
             if delivery_mode == 'voice' and text and self._run_permitted(run_generation):
                 # Voice-only: synthesize and publish BEFORE any text. If either
@@ -1023,10 +1031,10 @@ class AgentRelay:
                         thread_id=message.get('message_thread_id')))
                     LOG.debug('Telegram Rich Message отправлено')
                 else:
-                    for index, part in enumerate(parts):
+                    for index, (part, formatted) in enumerate(parts):
                         if not self._run_permitted(run_generation):
                             return
-                        markup = markdown_to_telegram_html(part)
+                        markup = markdown_to_telegram_html(part) if formatted else ''
                         valid_html_size = bool(markup) and len(markup.encode('utf-16-le')) // 2 <= 4096
                         outgoing: dict[str, Any] = {
                             'chat_id': self.config.chat_id,
