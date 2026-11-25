@@ -657,3 +657,39 @@ Manual smoke test: create one tiny work task; while in progress Reply
 to its card with a question and then an explicit amendment. Verify the
 pending count and resulting review. Press Stop on a fresh long-running
 task, cancel once, then confirm; check it never changes a different task.
+
+## Native Agency 0.1 (NA-00 / NA-01)
+
+Baseline: 37ee20b9; 159 passing tests in Actions run 45049284308.
+This branch introduces main-assistant action proposals without execution.
+The primary ChatGPT turn still returns natural text; no extra classifier or CWA
+send. A single final [[agentrelay_action]] JSON trailer carries version 1, a
+fresh turn token, action and arguments, followed by [[/agentrelay_action]].
+The Host removes it before Telegram/TTS and records a local observation only.
+Supported: start_work, get_work_status, get_work_result, amend_work.
+
+To test, use ACTION_MODE=observe and ACTION_OBSERVE_READ_ONLY_ACK=on with a
+**dedicated test conversation/account whose write-capable native connectors
+are disabled or read-only**. The acknowledgement is an operator statement,
+not verification of provider permissions. A prompt alone cannot prevent
+native connector writes. Do not test against write-capable main chats.
+Keep WORK_ENABLED=on and existing project mappings for discovery.
+Observe mode bypasses legacy natural and Reply-based work classification,
+blocks explicit /work start too, and never sends proposals to executors.
+/stop, /resume, /work status, ordinary Telegram conversation, media and
+peer dialogues remain available. No proposals admitted from peers, ambient
+media, historical catch-up or users without work permissions. Observe is
+about AgentRelay work, not disabling all ChatGPT capabilities.
+
+The local journal .agent-relay-action-observations.json records the last 100
+eligible turns: no_action/proposed/rejected, source IDs and proposed arguments.
+No full prompt/response or turn token is stored. Arguments can contain sensitive
+project details; keep the file local, ignore custom paths in Git, never execute
+journal entries. Use separate state files per bot.
+
+Manual smoke: discuss a change, explicitly forbid changes, request a task,
+agree to a prior concrete plan, ask about an existing task via Reply. Compare
+the journal to expected intent. Verify no new task/Coordinator/Developer call.
+Check both bot profiles and /stop during CWA. ACTION_MODE=off restores legacy
+behavior, without work-state migration. NA-02 admission, execution, result
+feedback and shared tasks are NOT implemented by NA-01.

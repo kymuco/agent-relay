@@ -24,6 +24,8 @@ from local_codex import (WorkState, parse_projects, parse_work_command,
 from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
                          verify_remote_branch, checkout_verified_commit)
 from natural_work import route_natural_work
+from action_bridge import (ObservationJournal, action_prompt, new_turn_token,
+                           parse_action_response)
 from telegram_presence import TypingPulse, WorkProgress
 from task_conversation import (classify_task_reply, normalize_task_reply,
                                trusted_task_context)
@@ -138,6 +140,9 @@ class Config:
     chat_typing: bool = False
     work_live_progress: bool = False
     work_progress_file: str = '.agent-relay-progress.json'
+    action_mode: str = 'off'
+    action_observe_read_only_ack: bool = False
+    action_observation_file: str = '.agent-relay-action-observations.json'
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -200,6 +205,12 @@ class Config:
         work_repos = os.getenv('WORK_REPOS', '').strip()
         work_local_verify = os.getenv('WORK_LOCAL_VERIFY', 'off').strip().lower() in ('on', '1', 'true')
         natural_work_enabled = os.getenv('NATURAL_WORK_ENABLED', 'off').strip().lower() in ('on', '1', 'true')
+        action_mode = os.getenv('ACTION_MODE', 'off').strip().lower()
+        action_ack = os.getenv('ACTION_OBSERVE_READ_ONLY_ACK', 'off').strip().lower() == 'on'
+        if action_mode not in ('off', 'observe'):
+            raise ValueError('ACTION_MODE must be off or observe (NA-01 cannot execute)')
+        if action_mode == 'observe' and not action_ack:
+            raise ValueError('Observe requires a read-only test conversation and ACTION_OBSERVE_READ_ONLY_ACK=on')
         telegram_rich_mode = os.getenv('TELEGRAM_RICH_MODE', 'off').strip().lower()
         if telegram_rich_mode not in ('off', 'auto'):
             raise ValueError('TELEGRAM_RICH_MODE must be off or auto')
@@ -266,6 +277,9 @@ class Config:
             telegram_rich_mode=telegram_rich_mode,
             chat_typing=chat_typing,
             work_live_progress=work_live_progress,
+            action_mode=action_mode,
+            action_observe_read_only_ack=action_ack,
+            action_observation_file=os.getenv('ACTION_OBSERVATION_FILE', '.agent-relay-action-observations.json'),
             work_progress_file=os.getenv('WORK_PROGRESS_FILE', '.agent-relay-progress.json'),
         )
 
@@ -455,6 +469,12 @@ class AgentRelay:
                  coordinator_client: Any = None, developer_client: Any = None,
                  image_client: Any = None):
         self.config = config
+        if config.action_mode not in ('off', 'observe'):
+            raise ValueError('Unsupported action mode')
+        if config.action_mode == 'observe' and not config.action_observe_read_only_ack:
+            raise ValueError('Observe requires operator acknowledgement of read-only test conversation')
+        self.action_journal = (ObservationJournal(config.action_observation_file)
+                               if config.action_mode == 'observe' else None)
         self.api = api
         self.client = client
         # Dedicated read-only CWA instance so eventual image discovery does
@@ -895,6 +915,15 @@ class AgentRelay:
             except Exception as exc:
                 LOG.warning('Не удалось получить исходный список изображений (%s)',
                             type(exc).__name__)
+        # NA-01: the main assistant proposes actions; no executor is wired.
+        action_token = None
+        projects = {}
+        if (self.action_journal is not None and addressed and not sender_is_bot
+                and sender.get('id') in self.config.work_allowed_user_ids):
+            action_token = new_turn_token()
+            projects = {name: repo for name, repo in self.work_repos.items()
+                        if name in self.work_projects}
+            prompt += action_prompt(action_token, projects)
         params: dict[str, Any] = {'conversation': self.config.conversation_id}
         if inbound and inbound.media:
             params['media'] = inbound.media
@@ -917,11 +946,36 @@ class AgentRelay:
             if not self._run_permitted(run_generation):
                 return
             text = str(result.text or '').strip()
+            action_seen = False
+            if self.action_journal is not None:
+                observation = parse_action_response(text, token=action_token, projects=projects)
+                text, action_seen = observation.reply, observation.seen
+                if action_token is not None:
+                    try:
+                        self.action_journal.record(
+                            bot_id=self.bot_id, chat_id=self.config.chat_id,
+                            update_id=update_id, message_id=message['message_id'],
+                            user_id=sender['id'], observation=observation)
+                    except (OSError, ValueError) as exc:
+                        LOG.warning('NA-01 observation not saved (%s)', type(exc).__name__)
+                        if action_seen:
+                            text += '\n\nРежим наблюдения: действие не запущено, запись журнала не удалась.'
+                    else:
+                        LOG.info('NA-01 · update=%s · %s', update_id, observation.status)
+                        if action_seen:
+                            text += ('\n\nРежим наблюдения: предложение записано, действие не выполнено.'
+                                     if observation.status == 'proposed' else
+                                     '\n\nРежим наблюдения: некорректное предложение отклонено, действие не выполнено.')
+                elif action_seen:
+                    LOG.info('NA-01 · предложение вне разрешённого диалогового хода проигнорировано')
+                    text += '\n\nДействие не выполнено.'
+                text = text.strip()
             if not text and not generation_requested:
                 raise RuntimeError('Empty CWA response')
             ending_peer = sender_is_bot and '[[stop_dialogue]]' in text
             text = text.replace('[[stop_dialogue]]', '').strip()
-            text = explicit_handoff(text, self.config.peers, from_bot=sender_is_bot)
+            text = explicit_handoff(text, self.config.peers,
+                                    from_bot=sender_is_bot or action_seen)
             # Only a verified, active peer session may create a routing command.
             # Keep /relay@... visible as real Telegram text: a native Reply alone
             # does not always reach the other bot in a group.
@@ -1069,7 +1123,9 @@ class AgentRelay:
             if not self._run_permitted(generation) or self._catchup_replied:
                 return
             output = parse_catchup_decision(str(result.text or ''))
-            if output is None:
+            if output is not None and self.action_journal is not None:
+                output = parse_action_response(output, token=None, projects={}).reply
+            if not output:
                 return
             # Catch-up never routes to a peer or triggers a tool. One plain
             # Telegram response maximum; do not execute historical messages.
@@ -1188,7 +1244,9 @@ class AgentRelay:
             reply = ('Локальная задача остановлена.' if stopped
                      else 'Сейчас нет выполняемой локальной задачи.')
         elif verb == 'start':
-            if self.control.paused:
+            if self.action_journal is not None:
+                reply = 'NA-01: режим наблюдения, запуск задач отключён. Действие не выполнено.'
+            elif self.control.paused:
                 reply = 'Ragna приостановлена. Сначала отправь /resume@' + self.bot_username
             elif project not in self.work_projects:
                 reply = 'Проект не разрешён. Доступны: ' + ', '.join(sorted(self.work_projects))
@@ -1253,7 +1311,7 @@ class AgentRelay:
         work_queue: queue.Queue[tuple[dict[str, Any], int]]
     ) -> bool:
         """Only explicit human imperatives can route to the bounded Host work API."""
-        if (not self.config.natural_work_enabled or self.work is None
+        if (self.action_journal is not None or not self.config.natural_work_enabled or self.work is None
                 or self._background is None or self.control.paused):
             return False
         chat = message.get('chat') or {}
@@ -1323,6 +1381,19 @@ class AgentRelay:
         if card is None:
             return False
         text = str(message.get('text') or message.get('caption') or '').strip()
+        if self.action_journal is not None:
+            # Bind the exact card, but never classify/mutate from text.
+            if update is None or self.control.paused:
+                return False
+            prepared = dict(update)
+            prepared['_task_reply_context'] = trusted_task_context(card).replace(
+                'Do not start, amend or stop development from this question.',
+                'You may propose a bounded action about this exact card in observation mode only.')
+            try:
+                work_queue.put_nowait((prepared, self.control.generation()))
+            except queue.Full:
+                LOG.warning('NA-01 · очередь диалога заполнена; Reply пропущен')
+            return True
         kind = classify_task_reply(
             text, bot_username=self.bot_username,
             aliases=self.config.bot_aliases, project=str(card.get('project') or ''),

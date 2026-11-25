@@ -1,7 +1,7 @@
 name: AgentRelay Python tests
 on:
   push:
-    branches: [feat/telegram-cwa-mvp]
+    branches: [feat/telegram-cwa-mvp, feat/native-agency-v1]
   pull_request:
   workflow_dispatch:
 jobs:
