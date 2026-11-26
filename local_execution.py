@@ -167,16 +167,22 @@ def run_local_tests(source: Path, root: Path, repo: str, sha: str, workspace: di
                 code = proc.returncode
                 # Transient bounded excerpt only for opted-in diagnostics.
                 # The caller never persists this raw data in task history.
-                if failure_output is not None and code != 0:
-                    failure_output.append(raw[-16000:].decode("utf-8", errors="replace")[-4000:])
+                def retain_failure():
+                    if failure_output is not None:
+                        failure_output.append(raw[-16000:].decode("utf-8", errors="replace")[-4000:])
+                if code != 0:
+                    retain_failure()
                 count = None
                 if preset == "unittest":
                     markers = _MARKER.findall(raw)
                     if len(markers) != 1:
+                        if code == 0:
+                            retain_failure()
                         return result("failed", code) if code else result("unavailable", code)
                     count = int(markers[0][0])
                     success = markers[0][1] == b"1"
                     if code == 0 and (not success or count == 0):
+                        retain_failure()
                         return result("unavailable", code, count)
                 if code == 5 and (preset == "pytest" or count == 0):
                     return result("no_tests", code, 0)

@@ -259,8 +259,8 @@ class CodexRunner:
                if sandbox == "read-only" else
                "Only modify files inside the current project. ")
             + "No git push, merge, remote publishing, secret reading, or system configuration. "
-            "Do not bypass sandbox restrictions. Return a concise final summary "
-            "with changed files, tests run, and uncertainties. "
+            "Do not bypass sandbox restrictions. Follow the requested report format; "
+            "otherwise return a concise final summary of observations and uncertainties. "
             "The configured project WORKING DIRECTORY is the repository root. "
             "Do NOT create an extra subfolder named after the project alias. "
             "For all Python test commands use the exact trusted interpreter path "

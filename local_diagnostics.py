@@ -34,7 +34,8 @@ def parse_diagnostic_projects(raw: str, tests: Mapping[str, str]) -> frozenset[s
 
 
 def should_diagnose(execution: dict | None) -> bool:
-    return isinstance(execution, dict) and execution.get("status") in _ELIGIBLE
+    return (isinstance(execution, dict) and isinstance(execution.get("status"), str)
+            and execution["status"] in _ELIGIBLE)
 
 
 def bounded_excerpt(text: str) -> str:

@@ -41,7 +41,7 @@ class LocalRunnerTests(unittest.TestCase):
             self.assertFalse(should_run_local({"status": state}))
         self.assertTrue(should_run_local(None))
 
-    def run_fixture(self, source_text=None, *, timeout=10):
+    def run_fixture(self, source_text=None, *, timeout=10, failure_output=None):
         with tempfile.TemporaryDirectory() as d:
             directory = Path(d).resolve()
             if source_text is not None:
@@ -50,7 +50,8 @@ class LocalRunnerTests(unittest.TestCase):
                  patch.dict(os.environ, {"WORK_PYTHON": "", "WORK_CI_TOKEN": "not-for-child",
                                          "TELEGRAM_BOT_TOKEN": "not-for-child"}):
                 return run_local_tests(directory, directory, REPO, SHA, WORKSPACE,
-                                       "unittest", timeout=timeout, permitted=lambda: True)
+                                       "unittest", timeout=timeout, permitted=lambda: True,
+                                       failure_output=failure_output)
 
     def test_real_nonzero_unittest_with_restricted_environment(self):
         result = self.run_fixture(
@@ -73,6 +74,23 @@ class LocalRunnerTests(unittest.TestCase):
                          ("no_tests", 5, 0), empty)
         premature = self.run_fixture("raise SystemExit(0)\n")
         self.assertNotEqual(premature["status"], "passed")
+
+    def test_failure_excerpt_is_transient_and_bounded(self):
+        output = []
+        failed = self.run_fixture(
+            "import unittest\nclass Tests(unittest.TestCase):\n"
+            "    def test_fail(self): self.fail('fixture failure')\n",
+            failure_output=output)
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("fixture failure", output[0])
+        self.assertLessEqual(len(output[0]), 4000)
+        self.assertNotIn("fixture failure", json.dumps(failed))
+        output.clear()
+        passed = self.run_fixture(
+            "import unittest\nclass Tests(unittest.TestCase):\n"
+            "    def test_ok(self): self.assertTrue(True)\n", failure_output=output)
+        self.assertEqual(passed["status"], "passed")
+        self.assertEqual(output, [])
 
     def test_timeout_and_output_limit(self):
         timed = self.run_fixture("import time\ntime.sleep(10)\n", timeout=0)
