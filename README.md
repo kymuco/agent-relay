@@ -857,3 +857,14 @@ Logging and SQLite test handles are closed before temporary directory cleanup.
 Card tests wait for thread completion, not only an in-memory field change.
 CI runs on Linux and Windows with Python 3.11 and 3.14 and repeats with an
 explicit profile environment variable. Live Telegram/CWA tests remain manual.
+
+### NA-01.2: canonical turn identity correction
+
+CWA now verifies the exact submitted user message ID, not the inherited
+conversation user_id. Transient final read failures may trigger at most three
+read attempts; no new generation or write is issued. Native modes continue
+to require canonical verification. Debug logs expose fixed stage/reason codes
+without raw exceptions, response bodies or credentials. After pulling, run
+start.cmd --setup-only to refresh dependencies; if an older same-version CWA
+is retained, reinstall the pinned Git dependency explicitly. Live verification
+is still required.

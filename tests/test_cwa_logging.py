@@ -52,6 +52,23 @@ class CwaRequestLogTests(unittest.TestCase):
             self.assertNotIn("secret error details", output)
             self.assertNotIn("sensitive prompt", output)
 
+    def test_canonical_failure_logs_only_fixed_diagnostics(self):
+        with tempfile.TemporaryDirectory() as folder:
+            relay, cwa = self.create(folder)
+            error = RuntimeError("private response and token")
+            error.request_stage = "canonical_final_text"
+            error.reason = "missing_identity"
+            error.status_code = 503
+            cwa.send.side_effect = error
+            with self.assertLogs("agentrelay", level="DEBUG") as records:
+                with self.assertRaises(RuntimeError):
+                    relay._cwa_send("private prompt", purpose="chat")
+            output = "\n".join(records.output)
+            self.assertIn("stage=canonical_final_text · reason=missing_identity · http=503", output)
+            self.assertNotIn("private response", output)
+            self.assertNotIn("private prompt", output)
+            self.assertEqual(cwa.send.call_count, 1)
+
     def test_request_events_are_debug_only(self):
         with tempfile.TemporaryDirectory() as folder:
             relay, cwa = self.create(folder)

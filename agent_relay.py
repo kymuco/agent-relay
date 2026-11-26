@@ -687,6 +687,23 @@ class AgentRelay:
             LOG.debug('CWA #%s × %s · ошибка %s · %.1f с',
                       request_id, purpose, type(exc).__name__,
                       time.monotonic() - started)
+            stage = getattr(exc, 'request_stage', None)
+            reason = getattr(exc, 'reason', None)
+            status = getattr(exc, 'status_code', None)
+            # Fixed codes only: never log arbitrary exception strings or HTTP bodies.
+            if stage in ('canonical_final_text', 'conversation_fetch',
+                         'conversation_stream', 'conversation_prepare',
+                         'chat_requirements', 'sentinel_prepare', 'transport',
+                         'transport_timeout'):
+                safe_reason = reason if reason in (
+                    'missing_identity', 'invalid_payload', 'conversation_mismatch',
+                    'turn_not_completed_or_not_current', 'invalid_mapping',
+                    'user_mismatch_or_empty_text', 'final_not_visible_or_incomplete',
+                    'invalid_parts', 'user_ancestor_missing', 'read_failed',
+                ) else 'unknown'
+                LOG.debug('CWA #%s · stage=%s · reason=%s · http=%s',
+                          request_id, stage, safe_reason,
+                          status if type(status) is int and 100 <= status <= 599 else '-')
             raise
         LOG.debug('CWA #%s ✓ %s · ответ получен · %.1f с',
                   request_id, purpose, time.monotonic() - started)
