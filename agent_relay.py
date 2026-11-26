@@ -29,6 +29,7 @@ from action_bridge import (ObservationJournal, action_prompt, new_turn_token,
                            parse_action_response)
 from action_policy import Source, evaluate, request_digest, READ_ACTIONS
 from capability_registry import catalog_snapshot
+from github_ci import observe_ci, ci_label
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from action_dispatch import DispatchClaims
 from agent_profile import (namespace_config, profile_directory, profile_log_path,
@@ -142,6 +143,8 @@ class Config:
     work_repos: str = ''
     work_chat_state_file: str = '.agent-relay-work-chats.json'
     work_local_verify: bool = False
+    work_ci_verify: bool = False
+    work_ci_wait_seconds: int = 60
     natural_work_enabled: bool = False
     telegram_rich_mode: str = 'off'
     chat_typing: bool = False
@@ -221,6 +224,11 @@ class Config:
         work_executor = os.getenv('WORK_EXECUTOR', 'codex').strip().lower()
         work_repos = os.getenv('WORK_REPOS', '').strip()
         work_local_verify = os.getenv('WORK_LOCAL_VERIFY', 'off').strip().lower() in ('on', '1', 'true')
+        work_ci_mode = os.getenv('WORK_CI_VERIFY', 'off').strip().lower()
+        if work_ci_mode not in ('on', 'off'):
+            raise ValueError('WORK_CI_VERIFY must be on or off')
+        work_ci_verify = work_ci_mode == 'on'
+        work_ci_wait = int(os.getenv('WORK_CI_WAIT_SECONDS', '60'))
         natural_work_enabled = os.getenv('NATURAL_WORK_ENABLED', 'off').strip().lower() in ('on', '1', 'true')
         action_mode = os.getenv('ACTION_MODE', 'off').strip().lower()
         action_ack = os.getenv('ACTION_OBSERVE_READ_ONLY_ACK', 'off').strip().lower() == 'on'
@@ -294,6 +302,8 @@ class Config:
             work_repos=work_repos,
             work_chat_state_file=os.getenv('WORK_CHAT_STATE_FILE', '.agent-relay-work-chats.json'),
             work_local_verify=work_local_verify,
+            work_ci_verify=work_ci_verify,
+            work_ci_wait_seconds=work_ci_wait,
             natural_work_enabled=natural_work_enabled,
             telegram_rich_mode=telegram_rich_mode,
             chat_typing=chat_typing,
@@ -507,6 +517,10 @@ class AgentRelay:
 
     def _initialize(self, config, api, client, coordinator_client, developer_client, image_client):
         self.config = config
+        if not 0 <= config.work_ci_wait_seconds <= 300:
+            raise ValueError('WORK_CI_WAIT_SECONDS must be between 0 and 300')
+        if config.work_ci_verify and (not config.work_enabled or config.work_executor != 'github'):
+            raise ValueError('WORK_CI_VERIFY requires enabled GitHub work')
         if config.action_mode not in ('off', 'observe', 'execute'):
             raise ValueError('Unsupported action mode')
         if config.action_mode != 'off' and not config.action_observe_read_only_ack:
@@ -1870,6 +1884,7 @@ class AgentRelay:
             previous_sha = ''
             report = None
             verification_note = ''
+            ci = None
             rounds = 0
             for round_no in range(1, self.config.work_max_rounds + 1):
                 if not permitted():
@@ -1972,8 +1987,26 @@ class AgentRelay:
                     return
                 if not test.success:
                     raise RuntimeError('local Codex verification did not complete')
+            if verified and report.status == 'ready' and self.config.work_ci_verify:
+                stage = 'GitHub CI observation'
+                if self.progress is not None:
+                    self.progress.update(work_id, 'ci')
+                ci = observe_ci(repo, report.branch, report.commit_sha,
+                                wait_seconds=self.config.work_ci_wait_seconds, permitted=permitted)
+                if ci is None or not permitted():
+                    return
+                LOG.info('GitHub-задача #%s · CI=%s · runs=%s',
+                         work_id, ci['status'], ci['run_count'])
+                if not self.work.checkpoint_result(work_id, {
+                        'delegation': delegation,
+                        'developer_status': report.status, 'repository': report.repository,
+                        'branch': report.branch, 'commit_sha': report.commit_sha,
+                        'developer_summary': report.summary, 'remote_verified': True,
+                        'local_check': verification_note, 'ci': ci}):
+                    return
             stage = 'final evidence'
             review_data = json.dumps({
+                'ci': ci,
                 'delegation': delegation,
                 'developer_status': report.status,
                 'repository': report.repository,
@@ -2002,6 +2035,9 @@ class AgentRelay:
             title = ('Проверен коммит ' + report.commit_sha[:12] +
                      ' в ' + report.repository + ' · ' + report.branch
                      if target_status == 'completed' else 'Исполнитель не подтвердил новые изменения')
+            if ci is not None and ci['status'] not in ('passed', 'not_configured'):
+                target_status = 'needs_review'
+                title = 'Коммит подтверждён; ' + ci_label(ci, report.commit_sha)
             evidence = json.loads(review_data)
             evidence['coordinator_summary'] = message
             status = self.control.admit(generation, lambda: self.work.finalize(
@@ -2018,7 +2054,7 @@ class AgentRelay:
                     branch=report.branch, commit_sha=report.commit_sha,
                     remote_verified=verified and report.status == 'ready',
                     local_check=verification_note,
-                    pending_amendments=pending_count, delegation=delegation)
+                    pending_amendments=pending_count, delegation=delegation, ci=ci)
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
@@ -2028,7 +2064,9 @@ class AgentRelay:
                 self.api.call('sendMessage', {
                     'chat_id': self.config.chat_id,
                     'text': (f'Задача #{work_id}: {status_name}. ' +
-                             (title[:220] if verified else (message or report.summary)[:380])),
+                             (title[:220] if verified else (message or report.summary)[:380]) +
+                             ('\n' + ci_label(ci, report.commit_sha) if ci is not None
+                              and target_status != 'needs_review' else '')),
                 })
             LOG.info('GitHub-задача #%s: %s · итераций %s',
                      work_id, status, rounds)

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from relay_logging import LOG
+from github_ci import ci_record
 from work_card_views import (render_work_card, render_work_journal,
                              journal_event, work_keyboard)
 
@@ -74,9 +75,10 @@ _PHASES = {
     "revision": "🔁 Передаю уточнения",
     "verify": "🔎 Проверяю ветку и коммит",
     "local_test": "🧪 Проверяю код локально",
+    "ci": "🧪 Проверяю GitHub Actions",
     "review": "📝 Проверяю итоговый отчёт",
     "completed": "✅ Коммит подтверждён",
-    "needs_review": "⚠️ Есть неприменённые уточнения",
+    "needs_review": "⚠️ Требуется проверка",
     "failed": "❌ Задача не завершена",
     "stopped": "⏹ Задача остановлена",
     "interrupted": "⚠️ Прервана при перезапуске",
@@ -249,7 +251,7 @@ class WorkProgress:
     def result(self, work_id: int, *, developer_summary: str,
                coordinator_summary: str, repository: str, branch: str,
                commit_sha: str, remote_verified: bool, local_check: str = "",
-               pending_amendments: int = 0, delegation: str = "") -> bool:
+               pending_amendments: int = 0, delegation: str = "", ci=None) -> bool:
         """Save trusted worker report and Host verification as separate fields."""
         with self._lock:
             rec = self.record
@@ -266,6 +268,9 @@ class WorkProgress:
                 "local_check": str(local_check)[:750],
                 "pending_amendments": pending_amendments,
             }
+            observed = ci_record(ci, commit_sha) if remote_verified is True else None
+            if observed is not None:
+                rec["result"]["ci"] = observed
             rec.setdefault("events", []).append(
                 journal_event("review", "Отчёты и результаты сохранены"))
             rec["events"] = rec["events"][-40:]

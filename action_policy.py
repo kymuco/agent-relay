@@ -137,7 +137,7 @@ def evaluate(
         if action == "get_work_result":
             phase = bound_card.get("phase") if bound_card is not None else work.get("status")
             if phase in {"queued", "running", "coordinator", "developer",
-                         "revision", "verify", "local_test", "review", "idle"}:
+                         "revision", "verify", "local_test", "ci", "review", "idle"}:
                 return result("deny", "result_not_ready")
         return result("allow", "bounded_read")
     if action == "start_work" and active:

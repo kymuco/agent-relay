@@ -892,3 +892,21 @@ permission proof, a reservation, or an execution grant. Admission, claim and
 stop-generation checks remain authoritative. Existing v1 action names, direct
 and coordinated routes, settings and task history are unchanged. No new executor,
 local code writing, CI dispatch, plugin loading or remote delegation is enabled.
+
+### NA-06.2 — GitHub CI observation
+
+Set `WORK_CI_VERIFY=on` to enable read-only GitHub Actions observations after
+Host verifies the task branch and SHA. Public repositories can be observed without
+a token; for private repositories optionally set a fine-grained `WORK_CI_TOKEN`
+with Actions read access to the explicitly allowed repositories. Never send the
+token in Telegram or commit it. The Host uses fixed GitHub API GET endpoints,
+rejects redirects, bounds responses and verifies each run's exact SHA and branch.
+`WORK_CI_WAIT_SECONDS=60` bounds polling (0 = one snapshot; HTTP socket timeouts
+are separate). Stop/generation checks fence further requests; no dispatch/rerun.
+CI is separate from worker-reported tests and remote SHA verification. All visible
+runs succeeding means passed, not proof all required checks were triggered.
+No registered workflow is not_configured; no matching runs visible is not_run.
+Failed/incomplete/pending/unavailable/not_run finalize as needs_review while
+preserving the verified commit; not_configured and passed can complete normally.
+No automatic code repair, local fallback, or later refresh is enabled yet.
+Disabled by default for compatibility. Old task records are unchanged.
