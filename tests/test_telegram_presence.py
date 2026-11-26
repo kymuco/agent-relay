@@ -210,17 +210,14 @@ class WorkProgressTests(unittest.TestCase):
                  "from":{"id":10,"is_bot":False},
                  "text":"/work@MyBot start demo Build module"}
             with patch("agent_relay.verify_remote_branch",return_value=True):
-                app._handle_work_command(msg,Queue())
-                deadline=time.monotonic()+3
-                while time.monotonic()<deadline and app.work.active(1):
-                    time.sleep(.02)
+                self.assertTrue(app._handle_work_command(msg,Queue()))
+                # In-memory terminal state can precede the final fsync/replace.
+                # Keep the mock and temporary directory alive until thread exit.
+                self.assertTrue(app.wait_for_background(5))
             self.assertEqual(app.work.record["status"],"completed")
-            # WorkState finalizes before the async worker finishes editing
-            # the Telegram card; wait for that distinct observable event.
-            deadline=time.monotonic()+2
-            while time.monotonic()<deadline and app.progress.record["phase"]!="completed":
-                time.sleep(.01)
             self.assertEqual(app.progress.record["phase"],"completed")
+            persisted = WorkProgress(api, -123, cfg.work_progress_file)
+            self.assertEqual(persisted.record["phase"], "completed")
             texts=[c.args[1]["text"] for c in api.call.call_args_list
                    if c.args[0]=="editMessageText"]
             self.assertTrue(any("Составляю план" in t for t in texts))
