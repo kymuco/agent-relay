@@ -1,4 +1,5 @@
 """Offline bootstrap checks; no real installation or external requests."""
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,10 +43,19 @@ class BootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / ".env.example").write_text("TELEGRAM_CHAT_ID=REPLACE_ME\n", encoding="utf-8")
-            with patch.object(bootstrap, "ROOT", root):
+            with patch.object(bootstrap, "ROOT", root), patch.dict(os.environ, {}, clear=True):
                 with self.assertRaisesRegex(RuntimeError, "Created .env"):
                     bootstrap.validate_local_config()
             self.assertTrue((root / ".env").is_file())
+
+    def test_missing_explicit_env_does_not_create_legacy_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch.object(bootstrap, "ROOT", root), patch.dict(
+                    os.environ, {"AGENTRELAY_ENV_FILE": ".env.missing"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "Selected AGENTRELAY_ENV_FILE"):
+                    bootstrap.validate_local_config()
+            self.assertFalse((root / ".env").exists())
 
     def test_setup_only_does_not_start_bot(self):
         with patch.object(bootstrap, "validate_python"), \

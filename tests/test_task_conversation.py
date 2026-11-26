@@ -1,6 +1,7 @@
 """Task Conversation v1: exact Reply routing, bounded amendment and confirmed stop."""
 from __future__ import annotations
 
+from contextlib import ExitStack
 import tempfile
 import time
 import unittest
@@ -101,8 +102,9 @@ class TaskReplyTests(unittest.TestCase):
         return app, api, main, coord, dev
 
     def test_task_reply_requires_exact_bot_id_and_message_id(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             good = reply_text("Добавь ещё тест")
             self.assertIsNotNone(app.progress.card_for_reply(good, bot_id=5))
             self.assertIsNone(app.progress.card_for_reply(
@@ -113,8 +115,9 @@ class TaskReplyTests(unittest.TestCase):
                 reply_text("Добавь ещё тест", chat=-987), bot_id=5))
 
     def test_reply_amendment_applied_to_exact_work_id_not_a_new_one(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             queue = Queue()
             good = reply_text("Рагна, добавь проверку деления на ноль")
             self.assertTrue(app._handle_task_reply(good, queue, update={
@@ -137,8 +140,9 @@ class TaskReplyTests(unittest.TestCase):
             self.assertEqual(app.work.record["id"], 1)
 
     def test_old_task_reply_cannot_change_current_work(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             app.work.finalize(1, "completed", 1, "finished")
             app.progress.update(1, "completed")
             self.assertEqual(app.work.start("demo"), 2)
@@ -155,8 +159,9 @@ class TaskReplyTests(unittest.TestCase):
             main.send.assert_not_called()
 
     def test_authorized_reader_can_question_but_not_change_work(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             queue = Queue()
             msg = reply_text("Добавь ещё тест", user=12)
             self.assertTrue(app._handle_task_reply(msg, queue, update={
@@ -183,8 +188,9 @@ class TaskReplyTests(unittest.TestCase):
             dev.send.assert_not_called()
 
     def test_status_reply_is_immediate_without_model(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             msg = reply_text("Что там?")
             self.assertTrue(app._handle_task_reply(msg, Queue(), update={
                 "update_id": 33, "message": msg}))
@@ -192,8 +198,9 @@ class TaskReplyTests(unittest.TestCase):
             main.send.assert_not_called()
 
     def test_foreign_project_instruction_never_reaches_cwa_or_worker(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             msg = reply_text("Добавь ещё в other-project файл")
             queue = Queue()
             # The repository allowlist deliberately contains more than one
@@ -210,8 +217,9 @@ class TaskReplyTests(unittest.TestCase):
                           api.call.call_args.args[1]["text"])
 
     def test_stop_replies_do_not_stop_work_without_button(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             msg = reply_text("Останови задачу")
             self.assertTrue(app._handle_task_reply(msg, Queue(), update={
                 "update_id": 34, "message": msg}))
@@ -233,8 +241,9 @@ class TaskReplyTests(unittest.TestCase):
         self.assertTrue(predicate())
 
     def test_stop_button_requires_confirmation_from_same_authorized_user(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             self.assertIn("wp:s:1",
                           str(app.progress._markup(app.progress.record)))
             self.assertTrue(app._handle_progress_callback(self.callback("s")))
@@ -253,8 +262,9 @@ class TaskReplyTests(unittest.TestCase):
             dev.send.assert_not_called()
 
     def test_cancel_and_expired_confirmation_prevent_stop(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             app._handle_progress_callback(self.callback("s"))
             self._await(lambda: app.progress.stop_is_confirmed(1, 301, 10))
             app._handle_progress_callback(self.callback("n"))
@@ -269,8 +279,9 @@ class TaskReplyTests(unittest.TestCase):
             self.assertTrue(app.work.active(1))
 
     def test_stale_confirm_never_stops_new_work(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             app._handle_progress_callback(self.callback("s"))
             self._await(lambda: app.progress.stop_is_confirmed(1, 301, 10))
             app.work.finalize(1, "completed", 1, "finished")
@@ -282,8 +293,9 @@ class TaskReplyTests(unittest.TestCase):
             self.assertEqual(app.work.record["status"], "queued")
 
     def test_work_state_atomic_guards(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(directory)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             self.assertFalse(app.work.stop(expected_id=2))
             self.assertFalse(app.work.add_amendment("wrong task", expected_id=2))
             self.assertTrue(app.work.active(1))

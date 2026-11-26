@@ -844,3 +844,16 @@ Separate state and conversation ownership are not remote connector permission
 isolation. Main/coordinator native write restrictions and operator smoke tests
 still apply. No shared task ledger, cross-host lease, agent-to-agent work
 delegation or live parallel Telegram experiment is implied by this milestone.
+
+### NA-05.1: Windows and resource lifecycle hardening
+
+The Host tracks background card, image, work and typing threads. Shutdown
+fences new managed threads and waits a bounded time for pending operations;
+only after a successful drain is the named profile lease released explicitly.
+A timeout retains the lease until a subsequent successful shutdown or OS
+process exit. This does not cancel already-submitted remote calls. The polling
+worker exits after shutdown instead of waiting indefinitely on an empty queue.
+Logging and SQLite test handles are closed before temporary directory cleanup.
+Card tests wait for thread completion, not only an in-memory field change.
+CI runs on Linux and Windows with Python 3.11 and 3.14 and repeats with an
+explicit profile environment variable. Live Telegram/CWA tests remain manual.

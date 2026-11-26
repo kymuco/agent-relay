@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -99,6 +100,30 @@ class ProfilesTests(unittest.TestCase):
             self.app(self.config(), 9, "OtherBot")
         restored, *_ = self.app(self.config())
         self.assertEqual(restored.bot_id, 5)
+
+    def test_shutdown_drains_before_releasing_profile_lease(self):
+        app, *_ = self.app(self.config())
+        entered, release = threading.Event(), threading.Event()
+        def pending():
+            entered.set()
+            release.wait(5)
+            Path(app.config.state_file).write_text('{"offset": 42}', encoding="utf-8")
+        app._start_managed_thread(threading.Thread(target=pending, daemon=True))
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertFalse(app.shutdown(timeout=0))
+            with self.assertRaisesRegex(ValueError, "already running"):
+                self.app(self.config())
+            with self.assertRaisesRegex(RuntimeError, "shutting down"):
+                app._start_managed_thread(threading.Thread(target=lambda: None))
+        finally:
+            release.set()
+            self.assertTrue(app.shutdown(timeout=5))
+        self.assertIsNone(app.profile_lease)
+        self.assertTrue(app.shutdown())
+        restored, *_ = self.app(self.config())
+        self.assertEqual(restored.cursor.offset, 42)
+        self.assertTrue(restored.shutdown())
 
     def test_distinct_profiles_cannot_share_bot_or_main_chat(self):
         self.app(self.config())

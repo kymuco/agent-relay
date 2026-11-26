@@ -1,5 +1,6 @@
 """NA-04 feedback tests; no network or real GitHub writes."""
 import json
+from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
@@ -142,7 +143,7 @@ class FeedbackIntegrationTests(unittest.TestCase):
             coord.send.assert_not_called()
             dev.send.assert_not_called()
             import sqlite3
-            with sqlite3.connect(app.action_claims.path) as db:
+            with closing(sqlite3.connect(app.action_claims.path)) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM action_claims").fetchone()[0], 0)
 
     def test_active_result_denied_but_status_readable(self):

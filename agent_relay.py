@@ -38,7 +38,7 @@ from task_conversation import (classify_task_reply, normalize_task_reply,
 from work_card_views import render_work_card
 from contextlib import nullcontext
 from telegram_presentation import use_rich_message, rich_payload, delivery_chunks
-from relay_logging import LOG, configure_logging
+from relay_logging import LOG, configure_logging, close_logging
 from catchup import make_catchup_prompt, parse_catchup_decision, select_catchup
 from group_awareness import GroupAwareness, addressed_by_alias, explicit_handoff, trusted_sender
 from relay_media import (attachment_info, artifact_filenames, find_new_images,
@@ -578,6 +578,8 @@ class AgentRelay:
                 coordinator_client, developer_client,
                 registry, self._cwa_send, agent_name=self.agent_name)
         self._shutdown = threading.Event()
+        self._thread_lock = threading.Lock()
+        self._managed_threads: set[threading.Thread] = set()
         self.last_send_time = float('-inf')
         self._cwa_request_lock = threading.Lock()
         self._cwa_request_counter = 0
@@ -592,13 +594,64 @@ class AgentRelay:
         if self.control.paused:
             LOG.warning('Сохранена пауза с прошлого запуска. Для продолжения: /resume@%s', self.bot_username)
 
-    def shutdown(self) -> None:
-        """Stop pending worker output without persisting /stop."""
-        if not self._shutdown.is_set():
+    def _start_managed_thread(self, thread: threading.Thread) -> None:
+        """Track state-owning background operations before starting them."""
+        with self._thread_lock:
+            if self._shutdown.is_set():
+                raise RuntimeError('AgentRelay is shutting down')
+            self._managed_threads = {t for t in self._managed_threads if t.is_alive()}
+            self._managed_threads.add(thread)
+            try:
+                thread.start()
+            except BaseException:
+                self._managed_threads.discard(thread)
+                raise
+
+    def wait_for_background(self, timeout: float = 5.0) -> bool:
+        """Wait for actual thread exit, including durable file writes.
+
+        With shutdown set, no additional thread can be admitted. While serving,
+        this is a diagnostic/test barrier, not a guarantee of future idleness.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        current = threading.current_thread()
+        while True:
+            with self._thread_lock:
+                self._managed_threads = {t for t in self._managed_threads if t.is_alive()}
+                pending = tuple(self._managed_threads)
+            if not pending:
+                return True
+            if current in pending:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            for thread in pending:
+                thread.join(max(0.0, deadline - time.monotonic()))
+
+    def shutdown(self, timeout: float = 2.0) -> bool:
+        """Fence new work, drain local operations, then release profile lease.
+
+        A remote request may still be in flight. On timeout keep the lease
+        until a later successful drain or OS process exit; never pretend that
+        the remote operation has been cancelled.
+        """
+        with self._thread_lock:
+            first = not self._shutdown.is_set()
             self._shutdown.set()
-            if self.work is not None:
-                self.work.stop()
+        if first and self.work is not None:
+            self.work.stop()
+        drained = self.wait_for_background(timeout)
+        if drained:
+            with self._thread_lock:
+                if self.profile_lease is not None:
+                    self.profile_lease.close()
+                    self.profile_lease = None
+        elif first:
+            LOG.warning('Фоновые операции ещё завершаются; блокировка профиля сохранена.')
+        if first:
             LOG.info('Остановлен.')
+        return drained
 
     def _run_permitted(self, generation: int) -> bool:
         return not self._shutdown.is_set() and self.control.permits(generation)
@@ -776,11 +829,11 @@ class AgentRelay:
                 return
         LOG.info('Ожидание изображения · запуск фоновой проверки · baseline=%s',
                  len(baseline))
-        threading.Thread(
+        self._start_managed_thread(threading.Thread(
             target=self._monitor_generated_images,
             args=(baseline, reply_message_id, generation, serial),
             name=f'AgentRelayImageMonitor-{serial}', daemon=True,
-        ).start()
+        ))
 
     def _control_command(self, message: dict[str, Any]) -> str | None:
         """Control authority belongs only to allowed humans in this group."""
@@ -1044,7 +1097,8 @@ class AgentRelay:
             typing_scope = (
                 TypingPulse(self.api, self.config.chat_id,
                             thread_id=message.get('message_thread_id'),
-                            permitted=lambda: self._run_permitted(run_generation))
+                            permitted=lambda: self._run_permitted(run_generation),
+                            start_thread=self._start_managed_thread)
                 if self.config.chat_typing else nullcontext())
             with typing_scope:
                 result = self._cwa_send(prompt, purpose='chat', **params)
@@ -1437,7 +1491,7 @@ class AgentRelay:
                 # create a duplicate status message after an ambiguous send.
                 LOG.warning('Не удалось сохранить статус задачи (%s)',
                             type(exc).__name__)
-            background_thread.start()
+            self._start_managed_thread(background_thread)
             return True
         self.api.call('sendMessage', {
             'chat_id': self.config.chat_id, 'text': reply,
@@ -1447,7 +1501,7 @@ class AgentRelay:
             },
         })
         if background_thread is not None:
-            background_thread.start()
+            self._start_managed_thread(background_thread)
         return True
 
     def _handle_natural_work(
@@ -1592,12 +1646,12 @@ class AgentRelay:
             if admitted:
                 # Telegram card editing can take tens of seconds. Do
                 # not block polling, especially /stop, on that API call.
-                threading.Thread(
+                self._start_managed_thread(threading.Thread(
                     target=self.progress.pending_amendments,
                     args=(work_id, len(self.work.pending_snapshot())),
                     kwargs={'admitted': True},
                     name=f'AgentRelayAmendmentCard-{work_id}', daemon=True,
-                ).start()
+                ))
                 say('Учла уточнение к задаче #' + str(work_id) +
                     '. Оно сохранено и будет передано разработчику, если '
                     'останется разрешённая итерация.')
@@ -1720,10 +1774,10 @@ class AgentRelay:
         if not starting:
             if self.progress is not None:
                 try:
-                    threading.Thread(
+                    self._start_managed_thread(threading.Thread(
                         target=self.progress.pending_amendments,
                         args=(work_id, len(self.work.pending_snapshot())),
-                        kwargs={'admitted': True}, daemon=True).start()
+                        kwargs={'admitted': True}, daemon=True))
                 except Exception:
                     LOG.warning('Native amendment card update unavailable')
             return f'Host: уточнение сохранено для задачи #{work_id}; исполнение зависит от оставшихся итераций.'
@@ -1754,8 +1808,8 @@ class AgentRelay:
                 self._native_worker_lock.release()
 
         try:
-            threading.Thread(target=run_reserved, daemon=True,
-                             name=f'AgentRelayNativeWork-{work_id}').start()
+            self._start_managed_thread(threading.Thread(target=run_reserved, daemon=True,
+                             name=f'AgentRelayNativeWork-{work_id}'))
         except Exception:
             try:
                 self.work.update(work_id, 'failed', note='Native worker launch failed; no replay')
@@ -2098,10 +2152,10 @@ class AgentRelay:
                 self._callback_slots.release()
 
         try:
-            threading.Thread(
+            self._start_managed_thread(threading.Thread(
                 target=perform, name=f'AgentRelayWorkUI-{work_id}',
                 daemon=True,
-            ).start()
+            ))
         except Exception:
             self._callback_slots.release()
             return False
@@ -2174,13 +2228,13 @@ class AgentRelay:
                             # This one-shot fallback is bounded by the single
                             # successful atomic stop, even when other UI slots
                             # are occupied by slow journal uploads.
-                            threading.Thread(
+                            self._start_managed_thread(threading.Thread(
                                 target=self.progress.update,
                                 args=(work_id, 'stopped'),
                                 kwargs={'note': 'Остановлена пользователем'},
                                 name=f'AgentRelayStopCard-{work_id}',
                                 daemon=True,
-                            ).start()
+                            ))
                         reply_text = ('Задача #' + str(work_id) + ' остановлена. '
                                       'Удалённый коммит нельзя откатить остановкой.')
                     else:
@@ -2234,8 +2288,11 @@ class AgentRelay:
         work_queue: queue.Queue[tuple[dict[str, Any], int]] = queue.Queue(maxsize=32)
 
         def worker() -> None:
-            while True:
-                update, generation = work_queue.get()
+            while not self._shutdown.is_set():
+                try:
+                    update, generation = work_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
                 try:
                     if self._run_permitted(generation):
                         if '_catchup_batch' in update:
@@ -2252,7 +2309,8 @@ class AgentRelay:
                 finally:
                     work_queue.task_done()
 
-        threading.Thread(target=worker, name='AgentRelayWorker', daemon=True).start()
+        self._start_managed_thread(threading.Thread(
+            target=worker, name='AgentRelayWorker', daemon=True))
         info = self.api.call('getWebhookInfo')
         if info.get('url'):
             raise RuntimeError('Telegram webhook is set; remove it before starting long polling')
@@ -2280,7 +2338,7 @@ class AgentRelay:
                         work_queue.put_nowait((update, self.control.generation()))
                     except queue.Full:
                         LOG.warning('Очередь заполнена: новое сообщение пропущено')
-        while True:
+        while not self._shutdown.is_set():
             try:
                 updates = self.api.call('getUpdates', {
                     'offset': self.cursor.offset,
@@ -2368,9 +2426,7 @@ def main() -> None:
                          image_client=image_client)
         app.serve()
     except KeyboardInterrupt:
-        if app is not None:
-            app.shutdown()
-        else:
+        if app is None:
             LOG.info('Остановлен.')
     except Exception as exc:
         LOG.error('Не удалось запустить: %s (%s)',
@@ -2378,6 +2434,12 @@ def main() -> None:
                   else 'проверь конфигурацию и соединение',
                   type(exc).__name__)
         raise SystemExit(1) from None
+    finally:
+        try:
+            if app is not None:
+                app.shutdown()
+        finally:
+            close_logging()
 
 
 if __name__ == '__main__':

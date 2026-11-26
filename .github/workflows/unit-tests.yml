@@ -6,14 +6,23 @@ on:
   workflow_dispatch:
 jobs:
   unit:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.14']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python }}
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Unit tests (no user credentials required)
-        run: python -m unittest discover -s tests -v
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+      - name: Unit tests with selected profile environment
+        env:
+          AGENTRELAY_ENV_FILE: .env.ragna
+        run: python -m unittest discover -s tests -q

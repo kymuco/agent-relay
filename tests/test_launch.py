@@ -10,28 +10,30 @@ from unittest.mock import Mock, patch
 import agent_relay
 import bootstrap
 from agent_relay import AgentRelay, Config
-from relay_logging import LOG, configure_logging
+from relay_logging import LOG, configure_logging, close_logging
 
 
 class LaunchTests(unittest.TestCase):
     def tearDown(self):
-        for h in list(LOG.handlers):
-            LOG.removeHandler(h)
-            h.close()
-        LOG.addHandler(logging.NullHandler())
+        close_logging()
 
     def test_console_quiet_with_debug_on_disk(self):
         with tempfile.TemporaryDirectory() as folder:
             log_path = Path(folder) / "app.log"
             with patch("relay_logging.sys.stdout", new_callable=io.StringIO) as out:
                 configure_logging("normal", str(log_path))
-                LOG.info("started")
-                LOG.debug("update=123")
-                LOG.warning("connection issue")
-                self.assertIn("started", out.getvalue())
-                self.assertIn("connection issue", out.getvalue())
-                self.assertNotIn("update=123", out.getvalue())
-                self.assertIn("update=123", log_path.read_text(encoding="utf-8"))
+                try:
+                    LOG.info("started")
+                    LOG.debug("update=123")
+                    LOG.warning("connection issue")
+                    self.assertIn("started", out.getvalue())
+                    self.assertIn("connection issue", out.getvalue())
+                    self.assertNotIn("update=123", out.getvalue())
+                    self.assertIn("update=123", log_path.read_text(encoding="utf-8"))
+                finally:
+                    close_logging()
+            log_path.unlink()
+            self.assertFalse(log_path.exists())
 
     def test_quiet_and_no_file(self):
         with patch("relay_logging.sys.stdout", new_callable=io.StringIO) as out:

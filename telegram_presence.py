@@ -23,10 +23,12 @@ class TypingPulse:
 
     def __init__(self, api: Any, chat_id: int, *, thread_id: int | None = None,
                  permitted: Callable[[], bool] = lambda: True,
-                 interval: float = 4.0, max_seconds: float = 180):
+                 interval: float = 4.0, max_seconds: float = 180,
+                 start_thread: Callable[[threading.Thread], None] | None = None):
         self.api, self.chat_id, self.thread_id = api, chat_id, thread_id
         self.permitted = permitted
         self.interval, self.max_seconds = interval, max_seconds
+        self._start_thread = start_thread
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -49,7 +51,10 @@ class TypingPulse:
     def start(self) -> "TypingPulse":
         self._thread = threading.Thread(
             target=self._loop, name="AgentRelayTyping", daemon=True)
-        self._thread.start()
+        if self._start_thread is None:
+            self._thread.start()
+        else:
+            self._start_thread(self._thread)
         return self
 
     def stop(self) -> None:

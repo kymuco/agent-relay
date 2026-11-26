@@ -9,15 +9,21 @@ LOG = logging.getLogger("agentrelay")
 LOG.addHandler(logging.NullHandler())
 
 
+def close_logging() -> None:
+    """Release owned file handles before profile or temporary directory cleanup."""
+    for handler in list(LOG.handlers):
+        LOG.removeHandler(handler)
+        handler.close()
+    LOG.addHandler(logging.NullHandler())
+
+
 def configure_logging(level: str = "normal", filename: str = "logs/agentrelay.log",
                       *, root: Path | None = None) -> None:
     console_levels = {"normal": logging.INFO, "quiet": logging.WARNING, "debug": logging.DEBUG}
     level = level.strip().lower()
     if level not in console_levels:
         raise ValueError("LOG_LEVEL must be normal, quiet, or debug")
-    for handler in list(LOG.handlers):
-        LOG.removeHandler(handler)
-        handler.close()
+    close_logging()
     LOG.setLevel(logging.DEBUG)
     LOG.propagate = False
     fmt = logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s", "%H:%M:%S")

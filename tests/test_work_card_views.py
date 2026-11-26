@@ -1,6 +1,7 @@
 """Display-only Telegram task cards, callbacks and durable journal tests."""
 from __future__ import annotations
 
+from contextlib import ExitStack
 import tempfile
 import threading
 import time
@@ -166,8 +167,9 @@ class TelegramCallbackTests(unittest.TestCase):
                         "chat": {"id": chat, "type": "supergroup"}}}}
 
     def test_expand_collapse_only_edits_exact_card_and_acknowledges(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(folder)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             baseline = api.call.call_count
             self.assertTrue(app._handle_progress_callback(self.callback("wp:d:4")))
             limit = time.monotonic() + 2
@@ -187,8 +189,9 @@ class TelegramCallbackTests(unittest.TestCase):
             dev.send.assert_not_called()
 
     def test_untrusted_or_replayed_callbacks_cannot_expose_or_modify(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(folder)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             for bad in (
                 self.callback("wp:d:4", user=11),
                 self.callback("wp:d:4", is_bot=True),
@@ -210,8 +213,9 @@ class TelegramCallbackTests(unittest.TestCase):
             main.send.assert_not_called()
 
     def test_journal_sends_one_file_with_cooldown_and_no_model_turn(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(folder)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             with patch("agent_relay.send_file", return_value={"message_id":500}) as send:
                 self.assertTrue(app._handle_progress_callback(self.callback("wp:j:4")))
                 self.assertTrue(app._handle_progress_callback(self.callback("wp:j:4")))
@@ -234,8 +238,9 @@ class TelegramCallbackTests(unittest.TestCase):
             main.send.assert_not_called()
 
     def test_slow_journal_upload_does_not_delay_emergency_stop(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(folder)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             entered, release = threading.Event(), threading.Event()
             def slow_send(*args, **kwargs):
                 entered.set()
@@ -254,8 +259,9 @@ class TelegramCallbackTests(unittest.TestCase):
                 send.assert_called_once()
 
     def test_callback_response_does_not_trigger_work_execution(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory() as folder, ExitStack() as cleanup:
             app, api, main, coord, dev = self.app(folder)
+            cleanup.callback(lambda: self.assertTrue(app.wait_for_background(5)))
             self.assertTrue(app._handle_progress_callback(self.callback("wp:d:4")))
             limit = time.monotonic() + 2
             while app.progress.history["4"]["view"] != "detail" and time.monotonic() < limit:
