@@ -1106,8 +1106,8 @@ class AgentRelay:
                 projects=projects, auto_projects=self.config.action_auto_projects,
                 executor=self.config.work_executor, mode=self.config.action_mode,
                 runtime_ready=self.work is not None and self._background is not None,
-                work_active=(work_facts.get('status') in ('queued', 'running')
-                             or self._native_worker_lock.locked()))
+                work_active=work_facts.get('status') in ('queued', 'running'),
+                worker_busy=self._native_worker_lock.locked())
             prompt += action_prompt(action_token, projects, execute=self.action_claims is not None,
                                     catalog=catalog)
         params: dict[str, Any] = {'conversation': self.config.conversation_id}

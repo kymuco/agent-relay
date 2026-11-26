@@ -82,6 +82,9 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(items["start_work"]["availability"], "busy")
         self.assertEqual(items["amend_work"]["availability"], "configured")
         self.assertEqual(items["get_work_result"]["availability"], "configured")
+        draining = {c["action"]: c for c in snapshot(worker_busy=True)["capabilities"]}
+        self.assertEqual(draining["start_work"]["availability"], "busy")
+        self.assertEqual(draining["amend_work"]["availability"], "no_active_task")
         items["start_work"]["input_schema"]["required"].clear()
         self.assertEqual(BY_ID["github.develop"].input_schema()["required"], ["project", "task"])
         self.assertEqual(policy.decide(work=policy.ACTIVE).reason, "executor_busy")
