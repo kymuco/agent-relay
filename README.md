@@ -879,3 +879,16 @@ claim, stop fence, remote SHA verification, bounded amendments, work history and
 card. Host finalizes directly from observed evidence and the worker report;
 no Coordinator planning or review request is sent. No new permissions and no
 retry/fallback after an ambiguous write. GitHub remains the source of code.
+
+### NA-06.1 — Capability Registry
+
+The immutable Host registry in `capability_registry.py` describes the four
+existing native capabilities, their stable IDs, legacy action names, input
+schemas, scope, executor, effects and constraints. The same argument definitions
+validate the model trailer and Host policy. Per eligible human turn the Host
+advertises a fresh catalog with configured projects, auto-write policy, mode and
+worker availability. This is a configuration snapshot, not live GitHub connector
+permission proof, a reservation, or an execution grant. Admission, claim and
+stop-generation checks remain authoritative. Existing v1 action names, direct
+and coordinated routes, settings and task history are unchanged. No new executor,
+local code writing, CI dispatch, plugin loading or remote delegation is enabled.

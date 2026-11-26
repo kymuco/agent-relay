@@ -11,11 +11,10 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from action_bridge import DELEGATIONS, Observation
+from action_bridge import Observation
+from capability_registry import BY_ACTION, READ_ACTIONS, WRITE_ACTIONS
 
 POLICY_VERSION = 1
-READ_ACTIONS = frozenset({"get_work_status", "get_work_result"})
-WRITE_ACTIONS = frozenset({"start_work", "amend_work"})
 
 
 @dataclass(frozen=True)
@@ -107,25 +106,21 @@ def evaluate(
         return result("deny", "unauthorized_source")
     if not generation_current:
         return result("deny", "stale_generation")
-    if observation.status != "proposed" or action not in READ_ACTIONS | WRITE_ACTIONS:
+    capability = BY_ACTION.get(action) if isinstance(action, str) else None
+    if observation.status != "proposed" or capability is None:
         return result("deny", "invalid_or_unknown_action")
-    if executor != "github" or work is None:
+    if not capability.supported(executor, runtime_ready=work is not None):
         return result("deny", "executor_unavailable")
+    if not capability.valid_arguments(args):
+        return result("deny", "invalid_arguments")
     current_id = work.get("id")
     active = work.get("status") in {"queued", "running"}
     if action == "start_work":
-        if (set(args) not in ({"project", "task"}, {"project", "task", "delegation"})
-                or not isinstance(args.get("project"), str)
-                or args.get("delegation", "coordinated") not in DELEGATIONS):
-            return result("deny", "invalid_arguments")
         delegation = args.get("delegation", "coordinated")
         project = args["project"]
         if bound_card is not None:
             return result("deny", "start_from_task_reply")
     else:
-        expected = {"work_id", "task"} if action == "amend_work" else {"work_id"}
-        if set(args) != expected or type(args.get("work_id")) is not int or args["work_id"] <= 0:
-            return result("deny", "invalid_arguments")
         work_id = args["work_id"]
         if bound_card is not None:
             if bound_card.get("work_id") != work_id:
@@ -145,10 +140,6 @@ def evaluate(
                          "revision", "verify", "local_test", "review", "idle"}:
                 return result("deny", "result_not_ready")
         return result("allow", "bounded_read")
-    task = args.get("task")
-    limit = 2500 if action == "start_work" else 1600
-    if not isinstance(task, str) or not task.strip() or len(task) > limit:
-        return result("deny", "invalid_task")
     if action == "start_work" and active:
         return result("deny", "executor_busy")
     if action == "amend_work":

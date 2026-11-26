@@ -28,6 +28,7 @@ from natural_work import route_natural_work
 from action_bridge import (ObservationJournal, action_prompt, new_turn_token,
                            parse_action_response)
 from action_policy import Source, evaluate, request_digest, READ_ACTIONS
+from capability_registry import catalog_snapshot
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from action_dispatch import DispatchClaims
 from agent_profile import (namespace_config, profile_directory, profile_log_path,
@@ -1100,7 +1101,15 @@ class AgentRelay:
                            if self.progress is not None else None)
             projects = {name: repo for name, repo in self.work_repos.items()
                         if name in self.work_projects}
-            prompt += action_prompt(action_token, projects, execute=self.action_claims is not None)
+            work_facts = self.work.admission_snapshot() if self.work is not None else {}
+            catalog = catalog_snapshot(
+                projects=projects, auto_projects=self.config.action_auto_projects,
+                executor=self.config.work_executor, mode=self.config.action_mode,
+                runtime_ready=self.work is not None and self._background is not None,
+                work_active=(work_facts.get('status') in ('queued', 'running')
+                             or self._native_worker_lock.locked()))
+            prompt += action_prompt(action_token, projects, execute=self.action_claims is not None,
+                                    catalog=catalog)
         params: dict[str, Any] = {'conversation': self.config.conversation_id}
         if inbound and inbound.media:
             params['media'] = inbound.media
@@ -1694,8 +1703,9 @@ class AgentRelay:
 
     def _evaluate_native(self, observation, *, source, authorized, generation_current,
                          projects, auto_projects, executor, bound_card):
-        work = self.work.admission_snapshot() if self.work is not None else None
-        if observation.action in READ_ACTIONS and self.work is not None:
+        runtime_ready = self.work is not None and self._background is not None
+        work = self.work.admission_snapshot() if runtime_ready else None
+        if observation.action in READ_ACTIONS and runtime_ready:
             item = self.work.feedback_snapshot((observation.arguments or {}).get('work_id'))
             if item is not None:
                 work = item

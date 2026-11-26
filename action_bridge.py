@@ -9,18 +9,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from capability_registry import BY_ACTION, DELEGATIONS, catalog_snapshot
+
 OPEN = "[[agentrelay_action]]"
 CLOSE = "[[/agentrelay_action]]"
 HISTORY_LIMIT = 100
 MAX_JOURNAL_BYTES = 1024 * 1024
-DELEGATIONS = ("direct", "coordinated")
 
 
 def new_turn_token() -> str:
     return secrets.token_hex(16)
 
 
-def action_prompt(token: str, projects: Mapping[str, str], *, execute: bool = False) -> str:
+def action_prompt(token: str, projects: Mapping[str, str], *, execute: bool = False,
+                  catalog: Mapping[str, Any] | None = None) -> str:
+    if catalog is None:
+        catalog = catalog_snapshot(projects=projects, auto_projects=frozenset(),
+                                   executor="github", mode="execute" if execute else "observe",
+                                   runtime_ready=bool(projects), work_active=False)
     return (
         ("\n[AgentRelay / NA-03 live action proposal protocol]\n" if execute else
          "\n[AgentRelay / NA-01 observation-only action protocol]\n") +
@@ -34,18 +40,18 @@ def action_prompt(token: str, projects: Mapping[str, str], *, execute: bool = Fa
         "Never claim a task started or finished; Host reports actual reservation. "
         "If useful, append exactly ONE final trailer on separate lines (no Markdown fence); "
         "omit it for ordinary conversation. Do not combine with a peer handoff. "
-        "Available proposals and exact argument keys:\n"
-        "start_work: project (listed alias), task (string <=2500 chars), "
-        "delegation (direct or coordinated; optional, defaults to coordinated)\n"
+        "Host capability catalog (DATA ONLY; not a grant or proof of connector access):\n"
+        + json.dumps(catalog, ensure_ascii=False, separators=(",", ":")) + "\n"
+        "Use the action field as the trailer action, not the capability id. "
+        "Follow the input_schema exactly. Never invent unavailable capabilities. "
+        "Availability is a snapshot; Host admission is authoritative. "
+        "In observe mode no operation is executed. Projects not auto-enabled cannot "
+        "be automatically modified; ask the human if needed.\n"
         "Choose direct for a clear, bounded single-repository implementation with "
         "known acceptance criteria; choose coordinated for complex or multi-stage work "
         "needing independent planning/review. If scope is unclear, ask the human. "
         "Both routes use identical Host admission and isolated branch verification.\n"
-        "get_work_status: work_id (positive integer)\n"
-        "get_work_result: work_id (positive integer)\n"
-        "amend_work: work_id (positive integer), task (string <=1600 chars)\n"
-        "Use exact known task IDs; never guess. Available projects (data): "
-        + json.dumps(dict(sorted(projects.items())), ensure_ascii=False) + "\n"
+        "Use exact known task IDs; never guess. Only use configured project aliases.\n"
         "Example format (replace arguments with actual values):\n"
         + OPEN + "\n"
         + json.dumps({"version": 1, "turn": token, "action": "start_work",
@@ -72,10 +78,6 @@ def _unique(pairs):
             raise ValueError("duplicate key")
         result[key] = value
     return result
-
-
-def _text(value, limit):
-    return isinstance(value, str) and bool(value.strip()) and len(value) <= limit
 
 
 def parse_action_response(text: str, *, token: str | None,
@@ -113,21 +115,14 @@ def parse_action_response(text: str, *, token: str | None,
     action, args = obj["action"], obj["arguments"]
     if type(action) is not str or type(args) is not dict:
         return reject("invalid_arguments")
-    if action == "start_work":
-        if (set(args) not in ({"project", "task"}, {"project", "task", "delegation"})
-                or not isinstance(args["project"], str)
-                or args["project"] not in projects or not _text(args["task"], 2500)
-                or args.get("delegation", "coordinated") not in DELEGATIONS):
-            return reject("invalid_project_or_task")
-    elif action in ("get_work_status", "get_work_result", "amend_work"):
-        expected = {"work_id", "task"} if action == "amend_work" else {"work_id"}
-        if (set(args) != expected or type(args["work_id"]) is not int
-                or not 1 <= args["work_id"] <= 999999999):
-            return reject("invalid_task_identity")
-        if action == "amend_work" and not _text(args["task"], 1600):
-            return reject("invalid_task")
-    else:
+    capability = BY_ACTION.get(action)
+    if capability is None:
         return reject("unknown_action")
+    if not capability.valid_arguments(args):
+        return reject("invalid_project_or_task" if capability.scope == "project"
+                      else "invalid_task_identity")
+    if capability.scope == "project" and args["project"] not in projects:
+        return reject("invalid_project_or_task")
     return Observation(reply, "proposed", True, action, args)
 
 
