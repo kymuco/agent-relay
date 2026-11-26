@@ -868,3 +868,14 @@ without raw exceptions, response bodies or credentials. After pulling, run
 start.cmd --setup-only to refresh dependencies; if an older same-version CWA
 is retained, reinstall the pinned Git dependency explicitly. Live verification
 is still required.
+
+### NA-03.1 — Direct Delegation
+
+Native `start_work` accepts optional `delegation: "direct" | "coordinated"`.
+Ragna chooses the direct route for clear bounded tasks; complex work may keep
+Coordinator. Omitted route defaults to coordinated (legacy compatibility).
+Direct uses the same Developer lane and original human scope, isolated branch,
+claim, stop fence, remote SHA verification, bounded amendments, work history and
+card. Host finalizes directly from observed evidence and the worker report;
+no Coordinator planning or review request is sent. No new permissions and no
+retry/fallback after an ambiguous write. GitHub remains the source of code.

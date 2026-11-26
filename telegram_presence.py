@@ -249,7 +249,7 @@ class WorkProgress:
     def result(self, work_id: int, *, developer_summary: str,
                coordinator_summary: str, repository: str, branch: str,
                commit_sha: str, remote_verified: bool, local_check: str = "",
-               pending_amendments: int = 0) -> bool:
+               pending_amendments: int = 0, delegation: str = "") -> bool:
         """Save trusted worker report and Host verification as separate fields."""
         with self._lock:
             rec = self.record
@@ -258,6 +258,7 @@ class WorkProgress:
             rec["result"] = {
                 "developer_summary": str(developer_summary)[:2300],
                 "coordinator_summary": str(coordinator_summary)[:1000],
+                "delegation": delegation if delegation in ("direct", "coordinated") else "",
                 "repository": str(repository)[:130],
                 "branch": str(branch)[:150],
                 "commit_sha": str(commit_sha)[:40],

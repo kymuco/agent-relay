@@ -250,17 +250,25 @@ class BackgroundDeveloper:
             permitted: Callable[[], bool],
             previous_sha: str = "", branch: str | None = None,
             human_request: str = "",
+            delegation: str = "coordinated",
             on_phase: Callable[[str], None] | None = None) -> DeveloperReport | None:
         if not permitted():
             return None
-        planned = self._turn("coordinator", self.coordinator,
-                             coordinator_prompt(task, repo=repo, project=project,
-                                                first=True, agent_name=self.agent_name), work_id=work_id)
-        if not permitted():
-            return None
-        action, instruction = parse_coordinator(planned, first=True)
-        if action != "delegate":
-            raise ValueError("coordinator did not delegate")
+        if delegation == "direct":
+            if not branch or not human_request.strip():
+                raise ValueError("direct delegation requires admitted native scope")
+            instruction = task
+        elif delegation == "coordinated":
+            planned = self._turn("coordinator", self.coordinator,
+                                 coordinator_prompt(task, repo=repo, project=project,
+                                                    first=True, agent_name=self.agent_name), work_id=work_id)
+            if not permitted():
+                return None
+            action, instruction = parse_coordinator(planned, first=True)
+            if action != "delegate":
+                raise ValueError("coordinator did not delegate")
+        else:
+            raise ValueError("unknown delegation route")
         if on_phase is not None and permitted():
             on_phase("developer")
         if not permitted():

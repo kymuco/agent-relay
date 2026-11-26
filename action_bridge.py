@@ -13,6 +13,7 @@ OPEN = "[[agentrelay_action]]"
 CLOSE = "[[/agentrelay_action]]"
 HISTORY_LIMIT = 100
 MAX_JOURNAL_BYTES = 1024 * 1024
+DELEGATIONS = ("direct", "coordinated")
 
 
 def new_turn_token() -> str:
@@ -34,7 +35,12 @@ def action_prompt(token: str, projects: Mapping[str, str], *, execute: bool = Fa
         "If useful, append exactly ONE final trailer on separate lines (no Markdown fence); "
         "omit it for ordinary conversation. Do not combine with a peer handoff. "
         "Available proposals and exact argument keys:\n"
-        "start_work: project (listed alias), task (string <=2500 chars)\n"
+        "start_work: project (listed alias), task (string <=2500 chars), "
+        "delegation (direct or coordinated; optional, defaults to coordinated)\n"
+        "Choose direct for a clear, bounded single-repository implementation with "
+        "known acceptance criteria; choose coordinated for complex or multi-stage work "
+        "needing independent planning/review. If scope is unclear, ask the human. "
+        "Both routes use identical Host admission and isolated branch verification.\n"
         "get_work_status: work_id (positive integer)\n"
         "get_work_result: work_id (positive integer)\n"
         "amend_work: work_id (positive integer), task (string <=1600 chars)\n"
@@ -43,7 +49,8 @@ def action_prompt(token: str, projects: Mapping[str, str], *, execute: bool = Fa
         "Example format (replace arguments with actual values):\n"
         + OPEN + "\n"
         + json.dumps({"version": 1, "turn": token, "action": "start_work",
-                      "arguments": {"project": "<alias>", "task": "<task>"}}, ensure_ascii=False)
+                      "arguments": {"project": "<alias>", "task": "<task>",
+                                    "delegation": "direct"}}, ensure_ascii=False)
         + "\n" + CLOSE + "\n[/AgentRelay observation protocol]"
     )
 
@@ -107,8 +114,10 @@ def parse_action_response(text: str, *, token: str | None,
     if type(action) is not str or type(args) is not dict:
         return reject("invalid_arguments")
     if action == "start_work":
-        if (set(args) != {"project", "task"} or not isinstance(args["project"], str)
-                or args["project"] not in projects or not _text(args["task"], 2500)):
+        if (set(args) not in ({"project", "task"}, {"project", "task", "delegation"})
+                or not isinstance(args["project"], str)
+                or args["project"] not in projects or not _text(args["task"], 2500)
+                or args.get("delegation", "coordinated") not in DELEGATIONS):
             return reject("invalid_project_or_task")
     elif action in ("get_work_status", "get_work_result", "amend_work"):
         expected = {"work_id", "task"} if action == "amend_work" else {"work_id"}

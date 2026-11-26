@@ -1774,7 +1774,8 @@ class AgentRelay:
             if starting:
                 work_id = self.work.start(fresh.project, branch=branch,
                                           proposal_id=fresh.proposal_id,
-                                          repository=fresh.repository, task=task)
+                                          repository=fresh.repository, task=task,
+                                          delegation=fresh.delegation or 'coordinated')
                 return work_id
             if self.work.add_amendment(task, expected_id=fresh.work_id):
                 return fresh.work_id
@@ -1820,7 +1821,8 @@ class AgentRelay:
                     return
                 self._run_github_work((work_id, decision.project, task),
                                       source.generation, branch=branch,
-                                      human_request=message['text'])
+                                      human_request=message['text'],
+                                      delegation=decision.delegation or 'coordinated')
             finally:
                 self._native_worker_lock.release()
 
@@ -1836,7 +1838,8 @@ class AgentRelay:
         return f'Host: задача #{work_id} принята в фоновую работу ({decision.project}).'
 
     def _run_github_work(self, payload: tuple[int, str, str], generation: int,
-                         *, branch: str | None = None, human_request: str = '') -> None:
+                         *, branch: str | None = None, human_request: str = '',
+                         delegation: str = 'coordinated') -> None:
         """Background GitHub work, bounded amendments, and verified remote SHA."""
         if self.work is None or self._background is None:
             return
@@ -1845,8 +1848,13 @@ class AgentRelay:
         if not permitted():
             return
         repo = self.work_repos[project]
-        stage = 'coordinator'
+        stage = 'delegation'
         try:
+            if delegation not in ('direct', 'coordinated'):
+                raise ValueError('Unknown delegation route')
+            if delegation == 'direct' and (not branch or not human_request.strip()):
+                raise ValueError('Direct delegation requires admitted native scope')
+            LOG.info('GitHub-задача #%s · delegation=%s', work_id, delegation)
             task = original_task
             verified = False
             previous_sha = ''
@@ -1864,12 +1872,14 @@ class AgentRelay:
                     return
                 if self.progress is not None:
                     self.progress.update(
-                        work_id, 'coordinator' if round_no == 1 else 'revision')
+                        work_id, ('developer' if delegation == 'direct' else 'coordinator')
+                        if round_no == 1 else 'revision')
                 stage = 'developer'
                 report = self._background.run(
                     work_id=work_id, project=project, repo=repo, task=task,
                     previous_sha=previous_sha, permitted=permitted,
-                    **({'branch': branch, 'human_request': human_request} if branch else {}),
+                    **({'branch': branch, 'human_request': human_request,
+                        'delegation': delegation} if branch else {}),
                     on_phase=(lambda phase: self.progress.update(work_id, phase))
                              if self.progress is not None else None)
                 if report is None or not permitted():
@@ -1952,11 +1962,9 @@ class AgentRelay:
                     return
                 if not test.success:
                     raise RuntimeError('local Codex verification did not complete')
-            stage = 'coordinator work review'
-            self.work.update(work_id, 'running', rounds, note='Coordinator проверяет отчёт')
-            if self.progress is not None:
-                self.progress.update(work_id, 'review')
+            stage = 'final evidence'
             review_data = json.dumps({
+                'delegation': delegation,
                 'developer_status': report.status,
                 'repository': report.repository,
                 'branch': report.branch,
@@ -1966,9 +1974,18 @@ class AgentRelay:
                 'local_check': verification_note,
                 'pending_amendments': len(self.work.pending_snapshot()),
             }, ensure_ascii=False)
-            message = self._background.review(
-                work_id=work_id, project=project, repo=repo, task=original_task,
-                report=review_data, permitted=permitted)
+            if delegation == 'coordinated':
+                stage = 'coordinator work review'
+                if not self.work.update(work_id, 'running', rounds, note='Coordinator проверяет отчёт'):
+                    return
+                if self.progress is not None:
+                    self.progress.update(work_id, 'review')
+                message = self._background.review(
+                    work_id=work_id, project=project, repo=repo, task=original_task,
+                    report=review_data, permitted=permitted)
+            else:
+                # No additional model turn; never invent an independent review.
+                message = ''
             if message is None or not permitted():
                 return
             target_status = 'completed' if verified and report.status == 'ready' else 'failed'
@@ -1991,7 +2008,7 @@ class AgentRelay:
                     branch=report.branch, commit_sha=report.commit_sha,
                     remote_verified=verified and report.status == 'ready',
                     local_check=verification_note,
-                    pending_amendments=pending_count)
+                    pending_amendments=pending_count, delegation=delegation)
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
@@ -2001,7 +2018,7 @@ class AgentRelay:
                 self.api.call('sendMessage', {
                     'chat_id': self.config.chat_id,
                     'text': (f'Задача #{work_id}: {status_name}. ' +
-                             (title[:220] if verified else message[:380])),
+                             (title[:220] if verified else (message or report.summary)[:380])),
                 })
             LOG.info('GitHub-задача #%s: %s · итераций %s',
                      work_id, status, rounds)

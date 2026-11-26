@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from action_bridge import Observation
+from action_bridge import DELEGATIONS, Observation
 
 POLICY_VERSION = 1
 READ_ACTIONS = frozenset({"get_work_status", "get_work_result"})
@@ -38,6 +38,7 @@ class Decision:
     repository: str | None = None
     work_id: int | None = None
     executor: str | None = None
+    delegation: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -49,6 +50,7 @@ class Decision:
             "repository": self.repository,
             "work_id": self.work_id,
             "executor": self.executor,
+            "delegation": self.delegation,
             "execution_enabled": False,
         }
 
@@ -81,6 +83,7 @@ def evaluate(
     project = None
     work_id = None
     repository = None
+    delegation = None
 
     def result(decision: str, reason: str) -> Decision:
         identity = {
@@ -92,12 +95,13 @@ def evaluate(
             "repository": repository,
             "work_id": work_id,
             "executor": executor,
+            "delegation": delegation,
         }
         digest = hashlib.sha256(
             json.dumps(identity, sort_keys=True, ensure_ascii=False,
                        separators=(",", ":")).encode("utf-8")
         ).hexdigest()
-        return Decision(decision, reason, digest, project, repository, work_id, executor)
+        return Decision(decision, reason, digest, project, repository, work_id, executor, delegation)
 
     if not authorized:
         return result("deny", "unauthorized_source")
@@ -110,8 +114,11 @@ def evaluate(
     current_id = work.get("id")
     active = work.get("status") in {"queued", "running"}
     if action == "start_work":
-        if set(args) != {"project", "task"} or not isinstance(args.get("project"), str):
+        if (set(args) not in ({"project", "task"}, {"project", "task", "delegation"})
+                or not isinstance(args.get("project"), str)
+                or args.get("delegation", "coordinated") not in DELEGATIONS):
             return result("deny", "invalid_arguments")
+        delegation = args.get("delegation", "coordinated")
         project = args["project"]
         if bound_card is not None:
             return result("deny", "start_from_task_reply")

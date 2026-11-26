@@ -97,6 +97,53 @@ class ExecuteTests(unittest.TestCase):
             self.assertTrue(dev.send.call_args.kwargs["verify_final_text"])
             self.assertFalse(app._native_worker_lock.locked())
 
+    def test_direct_route_skips_both_coordinator_turns_and_verifies(self):
+        import json
+        for outcome in ("ready", "blocked", "wrong_sha", "stopped"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as d:
+                app, api, main, coord, dev = self.make_app(d)
+                main.send.return_value.text = fixtures.trailer(args={
+                    "project": "demo", "task": "Add tests", "delegation": "direct"})
+                event = self.update()
+                with patch("agent_relay.new_turn_token", return_value=fixtures.TOKEN), \
+                     patch("agent_relay.threading.Thread") as thread:
+                    app.process_update(event)
+                    app.process_update(event)
+                    thread.return_value.start.assert_called_once()
+                    run = thread.call_args.kwargs["target"]
+                branch = app.work.record["branch"]
+                self.assertEqual(app.work.record["delegation"], "direct")
+                self.assertEqual(app.work.record["status"], "queued")
+                def answer(*args, **kwargs):
+                    if outcome == "stopped":
+                        app.control.stop()
+                        app.work.stop(expected_id=1)
+                    return response(json.dumps({
+                        "status": "blocked" if outcome == "blocked" else "ready",
+                        "repository": "example/sandbox",
+                        "branch": "" if outcome == "blocked" else branch,
+                        "commit_sha": "" if outcome == "blocked" else "a"*40,
+                        "summary": "Worker report"}), "dev")
+                dev.send.side_effect = answer
+                with patch("agent_relay.verify_remote_branch",
+                           return_value=outcome != "wrong_sha") as verify:
+                    run()
+                coord.send.assert_not_called()
+                dev.send.assert_called_once()
+                self.assertIn("Add tests", dev.send.call_args.args[0])
+                self.assertIn(event["message"]["text"], dev.send.call_args.args[0])
+                self.assertTrue(dev.send.call_args.kwargs["verify_final_text"])
+                self.assertEqual(verify.call_count, int(outcome in ("ready", "wrong_sha")))
+                expected = {"ready": "completed", "blocked": "failed",
+                            "wrong_sha": "failed", "stopped": "stopped"}[outcome]
+                self.assertEqual(app.work.record["status"], expected)
+                self.assertFalse(app._native_worker_lock.locked())
+                if outcome == "ready":
+                    evidence = app.work.feedback_snapshot(1)["result"]
+                    self.assertTrue(evidence["remote_verified"])
+                    self.assertEqual(evidence["delegation"], "direct")
+                    self.assertEqual(evidence["coordinator_summary"], "")
+
     def test_stop_after_reservation_prevents_worker_calls(self):
         with tempfile.TemporaryDirectory() as d:
             app, api, main, coord, dev = self.make_app(d)

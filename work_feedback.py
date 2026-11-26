@@ -29,6 +29,7 @@ def result_record(data: Mapping[str, Any], pending: int) -> dict[str, Any]:
                 and bool(branch) and bool(repo))
     return {
         "developer_status": _text(data.get("developer_status"), 24),
+        "delegation": data.get("delegation") if data.get("delegation") in ("direct", "coordinated") else "",
         "repository": repo, "branch": branch, "commit_sha": sha,
         "remote_verified": verified,
         "developer_summary": _text(data.get("developer_summary"), 2300),
@@ -45,6 +46,7 @@ def snapshot(record: Mapping[str, Any]) -> dict[str, Any]:
     out = {
         "id": record["id"], "project": record["project"], "status": record["status"],
         "stage": record["stage"],
+        "delegation": record.get("delegation") if record.get("delegation") in ("direct", "coordinated") else "",
         "note": _text(record.get("note"), 350),
         "task": _text(record.get("task"), 500),
         "branch": _text(record.get("branch"), 180),
@@ -109,6 +111,10 @@ def render_read(record: Mapping[str, Any], *, include_result: bool) -> str:
         f"Host: задача #{record['id']} · {record['project']} · {record['status']}",
         f"Этап: {record['stage']}. Ожидающих уточнений: {record['pending_count']}.",
     ]
+    if record.get("delegation") == "direct":
+        lines.append("Маршрут: напрямую Developer; Coordinator не использовался.")
+    elif record.get("delegation") == "coordinated":
+        lines.append("Маршрут: через Coordinator.")
     if record.get("task"):
         lines.append("Поручение: " + record["task"])
     if record.get("note"):

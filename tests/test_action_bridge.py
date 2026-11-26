@@ -31,6 +31,8 @@ class ProtocolTests(unittest.TestCase):
     def test_valid_actions(self):
         for action, args in (
             ("start_work", {"project": "demo", "task": "Add tests"}),
+            ("start_work", {"project": "demo", "task": "Add tests", "delegation": "direct"}),
+            ("start_work", {"project": "demo", "task": "Add tests", "delegation": "coordinated"}),
             ("get_work_status", {"work_id": 1}),
             ("get_work_result", {"work_id": 1}),
             ("amend_work", {"work_id": 1, "task": "Add edge case"}),
@@ -47,6 +49,9 @@ class ProtocolTests(unittest.TestCase):
             trailer(token="old"), trailer("shell", {"command": "test"}),
             trailer(args={"project": "unknown", "task": "test"}),
             trailer(args={"project": "demo", "task": "test", "extra": True}),
+            trailer(args={"project": "demo", "task": "test", "delegation": "auto"}),
+            trailer(args={"project": "demo", "task": "test", "delegation": []}),
+            trailer("amend_work", {"work_id": 1, "task": "test", "delegation": "direct"}),
             trailer("amend_work", {"work_id": True, "task": "test"}),
             trailer("get_work_status", {"work_id": 0}),
             trailer().replace('"version": 1', '"version": 1, "version": 1'),

@@ -348,7 +348,7 @@ class WorkState:
 
     def start(self, project: str, *, branch: str | None = None,
               proposal_id: str | None = None, repository: str = "",
-              task: str = "") -> int | None:
+              task: str = "", delegation: str = "coordinated") -> int | None:
         with self._lock:
             if self.record["status"] in self.ACTIVE:
                 return None
@@ -362,7 +362,7 @@ class WorkState:
                            "repository": repository, "task": task[:500],
                            "history": history[-HISTORY_LIMIT:]}
             if branch is not None:
-                self.record.update(branch=branch, proposal_id=proposal_id)
+                self.record.update(branch=branch, proposal_id=proposal_id, delegation=delegation)
             self._write()
             return self.record["id"]
 

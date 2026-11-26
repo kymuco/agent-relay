@@ -62,6 +62,17 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(p=p):
                 self.assertEqual(decide(p).decision, "deny")
 
+    def test_route_is_validated_and_bound_to_proposal(self):
+        direct = decide(proposal(project="demo", task="Add tests", delegation="direct"))
+        self.assertEqual(direct.decision, "allow")
+        self.assertEqual(direct.delegation, "direct")
+        self.assertEqual(direct.to_record()["delegation"], "direct")
+        self.assertEqual(decide().delegation, "coordinated")
+        self.assertNotEqual(direct.proposal_id, decide().proposal_id)
+        self.assertEqual(decide(proposal(project="demo", task="Add tests", delegation="bad")).decision, "deny")
+        self.assertEqual(decide(proposal(project="demo", task="Add tests", delegation="direct"),
+                                auto_projects=frozenset()).decision, "ask")
+
     def test_read_exact_task_only(self):
         p = proposal("get_work_status", work_id=7)
         self.assertEqual(decide(p, work=ACTIVE).decision, "allow")

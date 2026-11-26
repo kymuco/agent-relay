@@ -228,6 +228,8 @@ def render_work_journal(record: dict[str, Any]) -> bytes:
                 "подтверждён" if result.get("remote_verified") else "не подтверждён"),
             "Локальная проверка: " + _plain(result.get("local_check"), 500),
             "", "Вывод Coordinator:",
-            _plain(result.get("coordinator_summary"), 800) or "(нет отчёта)",
+            ("Не использовался (прямое делегирование)."
+             if result.get("delegation") == "direct" else
+             _plain(result.get("coordinator_summary"), 800) or "(нет отчёта)"),
         ])
     return ("\n".join(parts) + "\n").encode("utf-8")
