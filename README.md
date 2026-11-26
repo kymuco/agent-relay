@@ -727,3 +727,41 @@ and generation are diagnostic only, never reusable grants. A digest binds the
 proposal to the current source, not proof of semantic intent or prior consent.
 Recheck permissions, scope, task identity, expiry and generation at any future
 dispatch. Native connector restrictions are still an operator prerequisite.
+
+## NA-03: native background execution (opt-in)
+
+The default remains ACTION_MODE=off. First use observe with a dedicated test
+chat, verify actual canonical delivery and review proposed actions/decisions.
+Only after accepting those smoke tests, set ACTION_MODE=execute,
+ACTION_EXECUTE_ACK=on, ACTION_OBSERVE_READ_ONLY_ACK=on, WORK_ENABLED=on,
+WORK_EXECUTOR=github, WORK_LOCAL_VERIFY=off and an explicit ACTION_AUTO_PROJECTS
+allowlist. Use a disposable repository first. Native main/coordinator writes
+must be disabled; optionally set WORK_DEVELOPER_AUTH_FILE to separate worker
+credentials. Never commit auth files. These are operator prerequisites, not
+proof of provider permissions. GitHub native connector writes cannot be
+technically sandboxed by AgentRelay prompt instructions; use appropriately
+restricted GitHub credentials/repository protections. No local checkout/tests
+of untrusted worker code in execute mode.
+
+The main assistant proposes start_work/amend_work from an addressed human text
+turn; attachments, forwarded text and explicit quotes cannot grant writes.
+Host re-evaluates exact scope, current task, source and generation before
+reservation. A persistent SQLite one-shot claim keyed by bot/chat/message and
+update prevents replay even if the observation journal has rotated. A claim
+is not a queue; after a crash there is no replay. Journal allow remains only
+a policy decision; the WorkState reservation and Host acknowledgement record
+actual acceptance. Keep separate state per host, never delete/reset claim
+files casually, and ignore custom database/auth paths in Git. Claim storage
+is intentionally not rotated. The emergency stop fences future dispatch and
+output; it cannot revoke an already submitted native connector operation.
+One native background worker remains reserved until it returns, even after
+stop/resume. Each accepted new task gets a host-assigned unique branch
+agentrelay/bot-<id>/<uuid>; legacy work branches remain compatible. Existing
+Coordinator, Developer, status cards, bounded amendments and remote SHA
+verification are reused. The worker receives the original request and task;
+prompt scope is not a technical guarantee of correct intent or isolation.
+Ask/deny never dispatch. No confirmation UI yet. No /work start bypass in
+native modes; /work status, /work stop and emergency /stop remain available.
+Native read actions and feedback into the main chat are deferred to NA-04.
+Return to ACTION_MODE=observe (or off) after stopping existing tasks. No
+merge, release or live execution is implied by offline tests.

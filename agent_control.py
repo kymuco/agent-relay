@@ -43,6 +43,13 @@ class ControlState:
         with self._lock:
             return not self._paused and self._generation == generation
 
+    def admit(self, generation: int, reserve):
+        """Serialize only short durable reservations with /stop; no network I/O."""
+        with self._lock:
+            if self._paused or self._generation != generation:
+                return None
+            return reserve()
+
     def _write(self, paused: bool) -> None:
         generation = self._generation + 1
         self.path.parent.mkdir(parents=True, exist_ok=True)

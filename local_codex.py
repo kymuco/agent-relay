@@ -335,7 +335,8 @@ class WorkState:
             os.fsync(stream.fileno())
         os.replace(tmp, self.path)
 
-    def start(self, project: str) -> int | None:
+    def start(self, project: str, *, branch: str | None = None,
+              proposal_id: str | None = None) -> int | None:
         with self._lock:
             if self.record["status"] in self.ACTIVE:
                 return None
@@ -343,6 +344,8 @@ class WorkState:
             self.runner = CodexRunner()
             self.record = {"id": self.record["id"] + 1, "status": "queued",
                            "project": project, "stage": 0}
+            if branch is not None:
+                self.record.update(branch=branch, proposal_id=proposal_id)
             self._write()
             return self.record["id"]
 

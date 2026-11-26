@@ -13,6 +13,7 @@ import threading
 import sys
 import tempfile
 import time
+import uuid
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from natural_work import route_natural_work
 from action_bridge import (ObservationJournal, action_prompt, new_turn_token,
                            parse_action_response)
 from action_policy import Source, evaluate, request_digest
+from action_dispatch import DispatchClaims
 from telegram_presence import TypingPulse, WorkProgress
 from task_conversation import (classify_task_reply, normalize_task_reply,
                                trusted_task_context)
@@ -145,6 +147,9 @@ class Config:
     action_observe_read_only_ack: bool = False
     action_observation_file: str = '.agent-relay-action-observations.json'
     action_auto_projects: frozenset[str] = frozenset()
+    action_execute_ack: bool = False
+    action_claim_file: str = '.agent-relay-action-claims.sqlite3'
+    work_developer_auth_file: str = ''
     verify_final_text: bool = True
 
     @classmethod
@@ -210,10 +215,14 @@ class Config:
         natural_work_enabled = os.getenv('NATURAL_WORK_ENABLED', 'off').strip().lower() in ('on', '1', 'true')
         action_mode = os.getenv('ACTION_MODE', 'off').strip().lower()
         action_ack = os.getenv('ACTION_OBSERVE_READ_ONLY_ACK', 'off').strip().lower() == 'on'
-        if action_mode not in ('off', 'observe'):
-            raise ValueError('ACTION_MODE must be off or observe (NA-01 cannot execute)')
-        if action_mode == 'observe' and not action_ack:
-            raise ValueError('Observe requires a read-only test conversation and ACTION_OBSERVE_READ_ONLY_ACK=on')
+        execute_ack = os.getenv('ACTION_EXECUTE_ACK', 'off').strip().lower() == 'on'
+        if action_mode not in ('off', 'observe', 'execute'):
+            raise ValueError('ACTION_MODE must be off, observe or execute')
+        if action_mode != 'off' and not action_ack:
+            raise ValueError('Native actions require read-only main conversation acknowledgement')
+        if action_mode == 'execute' and (not execute_ack or not work_enabled
+                                        or work_executor != 'github' or work_local_verify):
+            raise ValueError('Execute requires smoke-test acknowledgement, GitHub work and WORK_LOCAL_VERIFY=off')
         telegram_rich_mode = os.getenv('TELEGRAM_RICH_MODE', 'off').strip().lower()
         if telegram_rich_mode not in ('off', 'auto'):
             raise ValueError('TELEGRAM_RICH_MODE must be off or auto')
@@ -282,6 +291,9 @@ class Config:
             work_live_progress=work_live_progress,
             action_mode=action_mode,
             action_observe_read_only_ack=action_ack,
+            action_execute_ack=execute_ack,
+            action_claim_file=os.getenv('ACTION_CLAIM_FILE', '.agent-relay-action-claims.sqlite3'),
+            work_developer_auth_file=os.getenv('WORK_DEVELOPER_AUTH_FILE', '').strip(),
             action_auto_projects=frozenset(x.strip() for x in os.getenv('ACTION_AUTO_PROJECTS', '').split(',') if x.strip()),
             action_observation_file=os.getenv('ACTION_OBSERVATION_FILE', '.agent-relay-action-observations.json'),
             verify_final_text=os.getenv('CWA_VERIFY_FINAL_TEXT', 'on').strip().lower() not in ('off', '0', 'false'),
@@ -474,12 +486,20 @@ class AgentRelay:
                  coordinator_client: Any = None, developer_client: Any = None,
                  image_client: Any = None):
         self.config = config
-        if config.action_mode not in ('off', 'observe'):
+        if config.action_mode not in ('off', 'observe', 'execute'):
             raise ValueError('Unsupported action mode')
-        if config.action_mode == 'observe' and not config.action_observe_read_only_ack:
-            raise ValueError('Observe requires operator acknowledgement of read-only test conversation')
+        if config.action_mode != 'off' and not config.action_observe_read_only_ack:
+            raise ValueError('Native actions require operator acknowledgement of read-only main conversation')
+        if config.action_mode == 'execute' and (
+                not config.action_execute_ack or not config.work_enabled
+                or config.work_executor != 'github' or not config.action_auto_projects
+                or config.work_local_verify):
+            raise ValueError('Execute requires smoke-test acknowledgement, GitHub work, explicit auto projects and WORK_LOCAL_VERIFY=off')
         self.action_journal = (ObservationJournal(config.action_observation_file)
-                               if config.action_mode == 'observe' else None)
+                               if config.action_mode != 'off' else None)
+        self.action_claims = (DispatchClaims(config.action_claim_file)
+                              if config.action_mode == 'execute' else None)
+        self._native_worker_lock = threading.Lock()
         self.api = api
         self.client = client
         # Dedicated read-only CWA instance so eventual image discovery does
@@ -496,7 +516,7 @@ class AgentRelay:
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
-        if config.action_mode == 'observe' and not config.action_auto_projects.issubset(
+        if config.action_mode != 'off' and not config.action_auto_projects.issubset(
                 set(self.work_projects) & set(self.work_repos)):
             raise ValueError('ACTION_AUTO_PROJECTS must contain only configured GitHub project aliases')
         self.progress = (WorkProgress(api, config.chat_id, config.work_progress_file)
@@ -555,7 +575,9 @@ class AgentRelay:
         if purpose in ('chat', 'catchup'):
             # Observe must use verified final text even with the diagnostic escape hatch.
             params['verify_final_text'] = (self.config.verify_final_text or
-                                           self.config.action_mode == 'observe')
+                                           self.config.action_mode != 'off')
+        elif purpose.startswith('work#') and self.config.action_mode == 'execute':
+            params['verify_final_text'] = True
         with self._cwa_request_lock:
             self._cwa_request_counter += 1
             request_id = self._cwa_request_counter
@@ -927,7 +949,7 @@ class AgentRelay:
             except Exception as exc:
                 LOG.warning('Не удалось получить исходный список изображений (%s)',
                             type(exc).__name__)
-        # NA-01: the main assistant proposes actions; no executor is wired.
+        # Native actions are proposals bound to a current human turn.
         action_token = None
         action_source = None
         action_card = None
@@ -944,7 +966,7 @@ class AgentRelay:
                            if self.progress is not None else None)
             projects = {name: repo for name, repo in self.work_repos.items()
                         if name in self.work_projects}
-            prompt += action_prompt(action_token, projects)
+            prompt += action_prompt(action_token, projects, execute=self.action_claims is not None)
         params: dict[str, Any] = {'conversation': self.config.conversation_id}
         if inbound and inbound.media:
             params['media'] = inbound.media
@@ -1002,7 +1024,10 @@ class AgentRelay:
                             return
                         LOG.info('NA-02 · update=%s · %s', update_id,
                                  decision.decision if decision is not None else observation.status)
-                        if action_seen:
+                        if action_seen and self.action_claims is not None:
+                            text += '\n\n' + self._dispatch_native_action(
+                                observation, decision, action_source, message, projects)
+                        elif action_seen:
                             label = {'allow': 'допустимо по политике',
                                      'ask': 'нужно уточнение или разрешение',
                                      'deny': 'отклонено'}[decision.decision]
@@ -1018,6 +1043,10 @@ class AgentRelay:
             text = text.replace('[[stop_dialogue]]', '').strip()
             text = explicit_handoff(text, self.config.peers,
                                     from_bot=sender_is_bot or action_seen)
+            if action_seen:
+                # Never route a literal peer command alongside an action trailer.
+                text = re.sub(r'(?im)^\s*/relay@[A-Za-z][A-Za-z0-9_]{4,31}\b\s*', '', text)
+                text = neutralize_peer_mentions(text, self.config.peers)
             # Only a verified, active peer session may create a routing command.
             # Keep /relay@... visible as real Telegram text: a native Reply alone
             # does not always reach the other bot in a group.
@@ -1289,7 +1318,8 @@ class AgentRelay:
                      else 'Сейчас нет выполняемой локальной задачи.')
         elif verb == 'start':
             if self.action_journal is not None:
-                reply = 'NA-01: режим наблюдения, запуск задач отключён. Действие не выполнено.'
+                reply = ('Native Agency: ручной /work start отключён в этом режиме. '
+                         'Дай поручение обычным сообщением. Действие не выполнено.')
             elif self.control.paused:
                 reply = 'Ragna приостановлена. Сначала отправь /resume@' + self.bot_username
             elif project not in self.work_projects:
@@ -1432,7 +1462,7 @@ class AgentRelay:
             prepared = dict(update)
             prepared['_task_reply_context'] = trusted_task_context(card).replace(
                 'Do not start, amend or stop development from this question.',
-                'You may propose a bounded action about this exact card in observation mode only.')
+                'You may propose a bounded action about this exact card; Host policy decides.')
             try:
                 work_queue.put_nowait((prepared, self.control.generation()))
             except queue.Full:
@@ -1521,7 +1551,118 @@ class AgentRelay:
             say('Очередь Ragna заполнена. Вопрос не передан, повтори позже.')
         return True
 
-    def _run_github_work(self, payload: tuple[int, str, str], generation: int) -> None:
+    def _dispatch_native_action(self, observation, decision, source, message, projects) -> str:
+        """Live in-memory proposal only; reserve under the stop-generation lock."""
+        if decision is None or decision.decision != 'allow':
+            reason = decision.reason if decision is not None else 'invalid_proposal'
+            return 'Host: действие не запущено (' + reason + ').'
+        if observation.action not in ('start_work', 'amend_work'):
+            return 'Host: чтение результата через Action Bridge ещё не подключено (NA-04).'
+        if self.action_claims is None or self.work is None or self._background is None:
+            return 'Host: исполнитель недоступен.'
+        # Attachments, forwarded messages and quotes cannot themselves grant writes.
+        sender = message.get('from') or {}
+        if (not isinstance(message.get('text'), str) or message.get('forward_origin')
+                or message.get('external_reply') or message.get('quote')
+                or message.get('forward_date') or message.get('via_bot')
+                or message.get('sender_chat') or sender.get('is_bot')
+                or sender.get('id') != source.user_id
+                or message.get('message_id') != source.message_id
+                or (message.get('chat') or {}).get('id') != source.chat_id
+                or source.bot_id != self.bot_id
+                or request_digest(message['text']) != source.request_sha256
+                or source.user_id not in self.config.allowed_user_ids
+                or source.user_id not in self.config.work_allowed_user_ids
+                or not is_addressed(message, self.bot_username, self.bot_id,
+                                    self.config.peers, self.config.allowed_user_ids,
+                                    self.config.peer_bot_ids, self.config.bot_aliases)):
+            return 'Host: источник поручения не допущен.'
+        starting = observation.action == 'start_work'
+        task = observation.arguments['task']
+        branch = 'agentrelay/bot-' + str(self.bot_id) + '/' + uuid.uuid4().hex
+        # Card lookup can wait for Telegram UI; never do it under the stop lock.
+        card = (self.progress.card_for_reply(message, bot_id=self.bot_id)
+                if self.progress is not None else None)
+        if starting and not self._native_worker_lock.acquire(blocking=False):
+            return 'Host: предыдущий исполнитель ещё не освободился.'
+        def reserve():
+            if self._shutdown.is_set():
+                return None
+            current_projects = {name: repo for name, repo in self.work_repos.items()
+                                if name in self.work_projects}
+            fresh = evaluate(observation, source=source, authorized=True,
+                             generation_current=True, projects=current_projects,
+                             auto_projects=self.config.action_auto_projects,
+                             executor=self.config.work_executor,
+                             work=self.work.admission_snapshot(), bound_card=card)
+            if (fresh.decision != 'allow' or fresh.proposal_id != decision.proposal_id
+                    or not self.action_claims.claim(source, fresh.proposal_id)):
+                return None
+            if starting:
+                work_id = self.work.start(fresh.project, branch=branch,
+                                          proposal_id=fresh.proposal_id)
+                return work_id
+            if self.work.add_amendment(task, expected_id=fresh.work_id):
+                return fresh.work_id
+            return None
+        try:
+            work_id = self.control.admit(source.generation, reserve)
+        except Exception as exc:
+            LOG.error('Native action reservation failed (%s); no replay', type(exc).__name__)
+            work_id = None
+        if work_id is None:
+            if starting:
+                self._native_worker_lock.release()
+            return 'Host: допуск изменился, задача занята или запрос уже обработан. Повтора нет.'
+        if not starting:
+            if self.progress is not None:
+                try:
+                    threading.Thread(
+                        target=self.progress.pending_amendments,
+                        args=(work_id, len(self.work.pending_snapshot())),
+                        kwargs={'admitted': True}, daemon=True).start()
+                except Exception:
+                    LOG.warning('Native amendment card update unavailable')
+            return f'Host: уточнение сохранено для задачи #{work_id}; исполнение зависит от оставшихся итераций.'
+
+        def run_reserved():
+            try:
+                if not self._run_permitted(source.generation) or not self.work.active(work_id):
+                    self.work.stop(expected_id=work_id)
+                    return
+                if self.progress is not None:
+                    try:
+                        self.progress.begin(
+                            work_id, decision.project, task,
+                            reply_message_id=message['message_id'],
+                            thread_id=message.get('message_thread_id'),
+                            repo=decision.repository)
+                    except Exception as exc:
+                        LOG.warning('Native work card unavailable (%s)', type(exc).__name__)
+                if not self._run_permitted(source.generation) or not self.work.active(work_id):
+                    self.work.stop(expected_id=work_id)
+                    if self.progress is not None:
+                        self.progress.update(work_id, 'stopped')
+                    return
+                self._run_github_work((work_id, decision.project, task),
+                                      source.generation, branch=branch,
+                                      human_request=message['text'])
+            finally:
+                self._native_worker_lock.release()
+
+        try:
+            threading.Thread(target=run_reserved, daemon=True,
+                             name=f'AgentRelayNativeWork-{work_id}').start()
+        except Exception:
+            try:
+                self.work.update(work_id, 'failed', note='Native worker launch failed; no replay')
+            finally:
+                self._native_worker_lock.release()
+            return f'Host: задача #{work_id} зарезервирована, но запуск потока не удался.'
+        return f'Host: задача #{work_id} принята в фоновую работу ({decision.project}).'
+
+    def _run_github_work(self, payload: tuple[int, str, str], generation: int,
+                         *, branch: str | None = None, human_request: str = '') -> None:
         """Background GitHub work, bounded amendments, and verified remote SHA."""
         if self.work is None or self._background is None:
             return
@@ -1554,6 +1695,7 @@ class AgentRelay:
                 report = self._background.run(
                     work_id=work_id, project=project, repo=repo, task=task,
                     previous_sha=previous_sha, permitted=permitted,
+                    **({'branch': branch, 'human_request': human_request} if branch else {}),
                     on_phase=(lambda phase: self.progress.update(work_id, phase))
                              if self.progress is not None else None)
                 if report is None or not permitted():
@@ -2090,7 +2232,7 @@ def main() -> None:
         coordinator_client = developer_client = None
         if config.work_enabled and config.work_executor == 'github':
             coordinator_client = BrowserlessHTTPClient(auth_file=config.auth_file)
-            developer_client = BrowserlessHTTPClient(auth_file=config.auth_file)
+            developer_client = BrowserlessHTTPClient(auth_file=config.work_developer_auth_file or config.auth_file)
         app = AgentRelay(config, api, client,
                          coordinator_client=coordinator_client,
                          developer_client=developer_client,
