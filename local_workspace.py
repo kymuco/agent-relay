@@ -69,12 +69,86 @@ def workspace_label(data: Any, sha: str) -> str:
     if record is None:
         return ""
     if record["status"] == "prepared":
-        return "Local Workspace: подготовлен точный SHA (код не запускался) · " + record["workspace_id"]
+        return "Local Workspace: подготовлен точный SHA (при подготовке код не запускался) · " + record["workspace_id"]
     return "Local Workspace: не подтверждён (" + record["reason"] + ")"
 
 
 class _Stopped(Exception):
     pass
+
+
+def _workspace_git(hooks: Path, permitted: Callable[[], bool]):
+    from local_codex import _child_environment
+    options = ["-c", "core.hooksPath=" + str(hooks), "-c", "core.fsmonitor=false",
+               "-c", "core.symlinks=false", "-c", "submodule.recurse=false",
+               "-c", "fetch.recurseSubmodules=false", "-c", "gc.auto=0",
+               "-c", "maintenance.auto=false"]
+    env = {**_child_environment(), "GIT_TERMINAL_PROMPT": "0"}
+
+    def git(directory: Path, *args: str, allow_missing: bool = False) -> str:
+        if not permitted():
+            raise _Stopped()
+        proc = subprocess.run(["git", "-C", str(directory), *options, *args],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="strict", timeout=90, env=env, check=False)
+        if not permitted():
+            raise _Stopped()
+        if allow_missing and proc.returncode == 1 and not proc.stderr:
+            return ""
+        if proc.returncode != 0:
+            raise RuntimeError("workspace Git command failed")
+        return proc.stdout.strip()
+
+    return git, options
+
+
+def _disable_filters(git, options: list[str], source: Path) -> None:
+    keys = git(source, "config", "--name-only", "--get-regexp",
+               r"^filter\..*\.(smudge|clean|process|required)$", allow_missing=True)
+    drivers = set()
+    for key in keys.splitlines():
+        match = _FILTER_KEY.fullmatch(key)
+        if not match:
+            raise ValueError("unsafe filter configuration")
+        drivers.add(match.group(1))
+    if len(drivers) > 64:
+        raise ValueError("unsafe filter configuration")
+    for driver in sorted(drivers):
+        for key, value in (("smudge", ""), ("clean", ""), ("process", ""), ("required", "false")):
+            options.extend(("-c", f"filter.{driver}.{key}={value}"))
+
+
+
+def verify_prepared_workspace(source: Path, root: Path, repo: str, sha: str,
+                              identity: str, *, permitted: Callable[[], bool]) -> Path | None:
+    """Revalidate a fresh worktree before execution; no checkout, no scripts."""
+    from github_work import _github_origin_matches
+    if not _ID.fullmatch(identity) or not _SHA.fullmatch(sha):
+        return None
+    try:
+        root = validate_root(str(root), (source,))
+        source = source.resolve(strict=True)
+        dest = root / identity
+        hooks = root / (identity + ".disabled-hooks")
+        if not dest.is_dir() or dest.resolve(strict=True) != dest or hooks.exists() or hooks.is_symlink():
+            return None
+        git, options = _workspace_git(hooks, permitted)
+        if (Path(git(source, "rev-parse", "--show-toplevel")).resolve(strict=True) != source
+                or not _github_origin_matches(git(source, "remote", "get-url", "origin"), repo)):
+            return None
+        _disable_filters(git, options, source)
+        def common(directory):
+            return Path(git(directory, "rev-parse", "--path-format=absolute",
+                            "--git-common-dir")).resolve(strict=True)
+        if (Path(git(dest, "rev-parse", "--show-toplevel")).resolve(strict=True) != dest
+                or common(source) != common(dest)
+                or git(dest, "rev-parse", "--verify", "HEAD") != sha
+                or git(dest, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"
+                or git(dest, "status", "--porcelain", "--untracked-files=all", "--ignored")):
+            return None
+        return dest if permitted() else None
+    except (_Stopped, OSError, ValueError, RuntimeError, UnicodeError, subprocess.SubprocessError):
+        return None
 
 
 def prepare_workspace(source: Path, root: Path, repo: str, sha: str, *,
@@ -86,7 +160,6 @@ def prepare_workspace(source: Path, root: Path, repo: str, sha: str, *,
     partial directories and worktree metadata are retained for manual review.
     """
     from github_work import _github_origin_matches
-    from local_codex import _child_environment
 
     identity = f"bot-{bot_id}-work-{work_id}-{uuid.uuid4().hex}"
     if not _ID.fullmatch(identity) or not _SHA.fullmatch(sha):
@@ -97,25 +170,7 @@ def prepare_workspace(source: Path, root: Path, repo: str, sha: str, *,
         source = source.resolve(strict=True)
         dest = root / identity
         hooks = root / (identity + ".disabled-hooks")
-        options = ["-c", "core.hooksPath=" + str(hooks), "-c", "core.fsmonitor=false",
-                   "-c", "core.symlinks=false", "-c", "submodule.recurse=false",
-                   "-c", "fetch.recurseSubmodules=false", "-c", "gc.auto=0",
-                   "-c", "maintenance.auto=false"]
-        env = {**_child_environment(), "GIT_TERMINAL_PROMPT": "0"}
-
-        def git(directory: Path, *args: str, allow_missing: bool = False) -> str:
-            if not permitted():
-                raise _Stopped()
-            proc = subprocess.run(["git", "-C", str(directory), *options, *args],
-                                  capture_output=True, text=True, encoding="utf-8",
-                                  errors="strict", timeout=90, env=env, check=False)
-            if not permitted():
-                raise _Stopped()
-            if allow_missing and proc.returncode == 1 and not proc.stderr:
-                return ""
-            if proc.returncode != 0:
-                raise RuntimeError("workspace Git command failed")
-            return proc.stdout.strip()
+        git, options = _workspace_git(hooks, permitted)
 
         reason = "source_not_root"
         if Path(git(source, "rev-parse", "--show-toplevel")).resolve(strict=True) != source:
@@ -127,19 +182,7 @@ def prepare_workspace(source: Path, root: Path, repo: str, sha: str, *,
         # Disable configured checkout filters without altering Git config.
         # LFS files remain pointers. Refuse unusual driver names.
         reason = "unsafe_filter_config"
-        keys = git(source, "config", "--name-only", "--get-regexp",
-                   r"^filter\..*\.(smudge|clean|process|required)$", allow_missing=True)
-        drivers = set()
-        for key in keys.splitlines():
-            match = _FILTER_KEY.fullmatch(key)
-            if not match:
-                return _record("unavailable", sha, identity, reason)
-            drivers.add(match.group(1))
-        if len(drivers) > 64:
-            return _record("unavailable", sha, identity, reason)
-        for driver in sorted(drivers):
-            for key, value in (("smudge", ""), ("clean", ""), ("process", ""), ("required", "false")):
-                options.extend(("-c", f"filter.{driver}.{key}={value}"))
+        _disable_filters(git, options, source)
 
         reason = "fetch_failed"
         git(source, "fetch", "--no-tags", "--no-recurse-submodules",

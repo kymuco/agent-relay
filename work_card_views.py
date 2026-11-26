@@ -12,6 +12,7 @@ from typing import Any
 
 from github_ci import ci_label
 from local_workspace import workspace_label
+from local_execution import execution_label
 
 _PHASE_LABELS = {
     "queued": "📥 Поручение принято",
@@ -191,6 +192,9 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
     workspace = workspace_label(result.get("workspace"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
     if workspace:
         lines.append(_h(workspace, 300))
+    execution = execution_label(result.get("execution"), result.get("workspace"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
+    if execution:
+        lines.append(_h(execution, 250))
     # Each line is independently escaped/closed, so trimming by whole lines
     # cannot break a Telegram HTML tag or entity.
     kept: list[str] = []
@@ -251,4 +255,7 @@ def render_work_journal(record: dict[str, Any]) -> bytes:
     workspace = workspace_label(result.get("workspace"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
     if workspace:
         parts.extend(["", workspace])
+    execution = execution_label(result.get("execution"), result.get("workspace"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
+    if execution:
+        parts.extend(["", execution])
     return ("\n".join(parts) + "\n").encode("utf-8")

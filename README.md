@@ -929,3 +929,24 @@ fences subsequent Git commands but may leave partial materialization. No automat
 cleanup, deletion, reuse, replay, or refresh of historical tasks; the operator
 must manage retained worktrees and disk usage. Existing trusted Git configuration
 and credentials are required; Git credential helpers/transport can still run.
+
+### NA-06.4 — Local Execution
+
+Opt in with `WORK_LOCAL_TESTS=demo=unittest` (multiple entries separated by
+semicolons; supported presets: unittest, pytest). Requires a configured GitHub
+project and WORK_WORKSPACE_ROOT, with WORK_LOCAL_VERIFY=off. **Tests execute
+repository code with the Host user's OS permissions. A worktree and a fixed
+command are NOT a sandbox. Only enable trusted repositories and code.**
+Host rechecks worktree identity, shared Git directory, detached HEAD, exact SHA
+and clean status before executing the fixed Python preset; no shell, no model
+commands, no installation. Uses WORK_PYTHON or the active interpreter. Unittest
+requires a nonzero test count; pytest must be installed by the operator.
+Run when CI is disabled, not configured, not run or unavailable; do not duplicate
+passed CI or mask failed/incomplete/pending CI. A successful local fallback can
+complete a task with unavailable/not-run CI while preserving that CI evidence.
+Local failure, timeout, no tests, output limit or unverifiable execution requires
+review. Uses WORK_TIMEOUT_SECONDS, polls stop permission, attempts process-tree
+termination, bounds captured output, and persists only exit status/count/time,
+not raw logs. This is best-effort process management, not OS isolation; no
+protection against malicious child processes or network/file access. No automatic
+retry, source repair, dependency install, or Codex invocation yet.

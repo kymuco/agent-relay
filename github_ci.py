@@ -11,6 +11,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -48,8 +49,12 @@ def _get(repo: str, suffix: str, query: dict[str, Any], *, timeout: float) -> di
     if token:
         headers["Authorization"] = "Bearer " + token
     request = Request(url, headers=headers, method="GET")
-    with build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
-        raw = response.read(_MAX_BODY + 1)
+    try:
+        with build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+            raw = response.read(_MAX_BODY + 1)
+    except HTTPError as exc:
+        exc.close()
+        raise
     if len(raw) > _MAX_BODY:
         raise ValueError("oversized CI response")
     value = json.loads(raw)
@@ -120,6 +125,9 @@ def observe_ci(repo: str, branch: str, sha: str, *, wait_seconds: int,
                     state = "not_configured"
             if not permitted():
                 return None
+        except HTTPError as exc:
+            exc.close()
+            return _record("unavailable", sha, []) if permitted() else None
         except (OSError, ValueError, TypeError, RecursionError):
             return _record("unavailable", sha, []) if permitted() else None
         if state not in ("pending", "not_run") or time.monotonic() >= deadline:
