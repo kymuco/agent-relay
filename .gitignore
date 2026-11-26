@@ -23,3 +23,7 @@ logs/
 .agent-relay-action-observations.json.tmp
 
 .agent-relay-action-claims.sqlite3*
+
+.env.*
+!.env.example
+.agent-relay-profiles/

@@ -47,7 +47,7 @@ def route_natural_work(text: str, *, bot_username: str,
     if not isinstance(text, str) or len(text) > 2500 or "\n" in text:
         return None
     text = text.strip()
-    prefixes = (bot_username, "Рагна", "Ragna", *aliases)
+    prefixes = (bot_username, *aliases)
     addressed = None
     for name in prefixes:
         name = name.strip().lstrip("@")

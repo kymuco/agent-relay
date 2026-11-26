@@ -1,6 +1,6 @@
 """Separate persistent CWA work conversations and strict GitHub work evidence.
 
-Human-authorized work is delegated by Ragna's work-coordinator conversation
+Human-authorized work is delegated by the agent's work-coordinator conversation
 to a separate GitHub-worker conversation. Neither text nor tool claims grant
 local command authority. No retries of ambiguous CWA writes.
 """
@@ -42,8 +42,11 @@ class ChatRegistry:
     """Atomic, durable IDs of two independent long-lived ChatGPT conversations."""
     _LANES = frozenset(("coordinator", "developer"))
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, main_id: str = '', claim_lane=None,
+                 retained_lanes: dict[str, str] | None = None):
         self.path = Path(path)
+        self.main_id = main_id
+        self.claim_lane = claim_lane
         self._lock = threading.Lock()
         self.ids: dict[str, str] = {}
         if self.path.is_file():
@@ -56,6 +59,17 @@ class ChatRegistry:
                 self.ids = record
             except (UnicodeError, OSError, ValueError) as exc:
                 raise ValueError("Work conversation registry unreadable") from exc
+
+        for lane, cid in (retained_lanes or {}).items():
+            if lane in self.ids and self.ids[lane] != cid:
+                raise ValueError('Saved work conversation conflicts with profile ownership')
+            self.ids[lane] = cid
+        if (len(set(self.ids.values())) != len(self.ids)
+                or (self.main_id and self.main_id in self.ids.values())):
+            raise ValueError('Work conversations must be distinct from one another and the main chat')
+        if self.claim_lane:
+            for lane, cid in self.ids.items():
+                self.claim_lane(lane, cid)
 
     def get(self, lane: str) -> str | None:
         if lane not in self._LANES:
@@ -70,6 +84,11 @@ class ChatRegistry:
             previous = self.ids.get(lane)
             if previous is not None and previous != conversation_id:
                 raise ValueError("work conversation unexpectedly changed")
+            if conversation_id == self.main_id or any(
+                    value == conversation_id for key, value in self.ids.items() if key != lane):
+                raise ValueError('Work conversation conflicts with another lane')
+            if self.claim_lane:
+                self.claim_lane(lane, conversation_id)
             self.ids[lane] = conversation_id
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_name(self.path.name + ".tmp")
@@ -137,15 +156,15 @@ def parse_developer(text: str, *, expected_repo: str,
 
 
 def coordinator_prompt(task: str, *, repo: str, project: str,
-                       report: str = "", first: bool) -> str:
+                       report: str = "", first: bool, agent_name: str = "assistant") -> str:
     instruction = (
         'Respond ONLY {"action":"delegate","instruction":"specific task"}. '
         if first else
         'Delegation is over. Respond ONLY {"action":"finish","message":"honest concise report"}. '
     )
     return (
-        "[AgentRelay / Ragna background orchestration] This is an explicitly "
-        "authorized local-work task from a trusted human. You are Ragna's work "
+        "[AgentRelay / background orchestration] This is an explicitly "
+        "authorized local-work task from a trusted human. You are the agent's work "
         "coordinator in a separate ChatGPT conversation, not the Telegram chat. "
         + instruction +
         "A second ChatGPT worker may have GitHub connector capabilities. "
@@ -156,7 +175,7 @@ def coordinator_prompt(task: str, *, repo: str, project: str,
         "the report includes evidence; a claimed commit is not proof of existence. "
         "Do not request unlimited continuation. Task context JSON follows:\n"
         + json.dumps({"project": project, "repository": repo, "task": task,
-                      "worker_report": report[:4500]}, ensure_ascii=False)
+                      "agent_name": agent_name, "worker_report": report[:4500]}, ensure_ascii=False)
     )
 
 
@@ -203,12 +222,14 @@ class BackgroundDeveloper:
     """Two conversations, two distinct CWA clients; main Telegram lane is free."""
 
     def __init__(self, coordinator_client: Any, developer_client: Any,
-                 registry: ChatRegistry, send: Callable[..., Any]):
+                 registry: ChatRegistry, send: Callable[..., Any], *,
+                 agent_name: str = 'assistant'):
         if coordinator_client is developer_client:
             raise ValueError("work lanes must use separate CWA clients")
         self.coordinator = coordinator_client
         self.developer = developer_client
         self.registry = registry
+        self.agent_name = agent_name
         self.send = send
 
     def _turn(self, lane: str, client: Any, prompt: str, *, work_id: int) -> str:
@@ -234,7 +255,7 @@ class BackgroundDeveloper:
             return None
         planned = self._turn("coordinator", self.coordinator,
                              coordinator_prompt(task, repo=repo, project=project,
-                                                first=True), work_id=work_id)
+                                                first=True, agent_name=self.agent_name), work_id=work_id)
         if not permitted():
             return None
         action, instruction = parse_coordinator(planned, first=True)
@@ -261,7 +282,7 @@ class BackgroundDeveloper:
             return None
         final = self._turn("coordinator", self.coordinator,
                            coordinator_prompt(task, repo=repo, project=project,
-                                              report=report, first=False),
+                                              report=report, first=False, agent_name=self.agent_name),
                            work_id=work_id)
         if not permitted():
             return None

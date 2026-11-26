@@ -126,7 +126,9 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
     worker = _plain(result.get("developer_summary", ""), 2200)
     tests = _worker_test_count(worker)
     files = _files(worker)
-    lines = [f"<b>Задача #{work_id} · {project}</b>", _PHASE_LABELS[phase], "",
+    name = _h(record.get("agent_name"), 40)
+    owner = f" · {name}" if name else ""
+    lines = [f"<b>Задача #{work_id} · {project}{owner}</b>", _PHASE_LABELS[phase], "",
              f"<i>{task}</i>"]
     if not detail:
         queued_changes = record.get("pending_changes", 0)
@@ -147,7 +149,7 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
             if note:
                 lines.append("\n" + _h(note, 220))
         elif phase != "queued":
-            lines.append("\nМожно продолжать общение с Ragna.")
+            lines.append("\nМожно продолжать общение с ассистентом.")
     else:
         queued_changes = record.get("pending_changes", 0)
         if type(queued_changes) is int and queued_changes > 0:

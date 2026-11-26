@@ -170,16 +170,21 @@ def read_env_values(path: Path) -> dict[str, str]:
 
 
 def validate_local_config() -> None:
-    env_file = ROOT / ".env"
+    selected = os.environ.get('AGENTRELAY_ENV_FILE')
+    env_file = ROOT / (selected or '.env')
     if not env_file.is_file():
+        if selected:
+            raise RuntimeError('Selected AGENTRELAY_ENV_FILE does not exist')
         shutil.copyfile(ROOT / ".env.example", env_file)
         raise RuntimeError("Created .env from template; fill bot/group IDs and rerun start.cmd")
     config = read_env_values(env_file)
+    config.update(os.environ)
     required = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "ALLOWED_USER_IDS", "CWA_CONVERSATION_ID")
     missing = [key for key in required if not config.get(key) or "REPLACE" in config[key].upper()]
     if missing:
         raise RuntimeError("Configure these .env fields: " + ", ".join(missing))
-    name = os.environ.get("CWA_AUTH_FILE") or config.get("CWA_AUTH_FILE") or "auth_data.json"
+    from agent_profile import profile_auth_path
+    name = profile_auth_path(config.get("AGENT_PROFILE", "").strip(), config.get("CWA_AUTH_FILE", "auth_data.json"))
     auth = Path(name)
     if not auth.is_absolute():
         auth = ROOT / auth

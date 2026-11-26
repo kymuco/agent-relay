@@ -30,14 +30,13 @@ _STOP = re.compile(r"^(?:останови|отмени|прерви|стоп)\b"
 _GUARD = re.compile(
     r"^(?:не\s+(?:делай|надо|нужно|добавляй|исправляй)|"
     r"давай\s+(?:обсудим|подумаем)|а\s+(?:если|что если))\b", re.I)
-_PREFIX = re.compile(r"^(?:@?ragnacobot|@?ragna|рагна)(?!\w)[\s,:!—–-]*", re.I)
 _OTHER_BOT = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{2,31}\b")
 
 
 def normalize_task_reply(text: str, *, bot_username: str = "",
                          aliases: tuple[str, ...] = ()) -> str:
     text = (text or "").strip()
-    for name in (bot_username, *aliases, "Ragna", "Рагна"):
+    for name in (bot_username, *aliases):
         name = name.strip().lstrip("@")
         if not 3 <= len(name) <= 40:
             continue

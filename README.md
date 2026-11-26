@@ -793,3 +793,54 @@ must still match; old results without identity and expired history are unavailab
 Worker-reported tests are not independent verification. Native connector scope
 and natural-language intent remain dependent on provider permissions and
 operator smoke checks; live execution is still opt-in.
+
+## NA-05: symmetric named agents
+
+An optional AGENT_PROFILE (safe lowercase slug) gives each instance its own
+state namespace under .agent-relay-profiles/<profile>/. AGENT_NAME is the
+human-facing display name, and BOT_ALIASES lists the actual address names.
+The default, unnamed mode retains existing state paths. Ragna's historical
+aliases are retained only for the actual legacy Ragna bot usernames; new
+profiles have no implicit Ragna aliases. Both named agents use the same code.
+
+Named profiles isolate Telegram cursor, stop state, tasks and history,
+work conversations, cards, action observations, dispatch claims and logs.
+An OS process lock prevents two simultaneous instances of one named profile.
+A local SQLite ownership registry binds each profile to its Telegram bot ID,
+group and main CWA conversation; coordinator/developer lanes cannot overlap
+with each other or any named profile's chat. A mismatch is rejected, not silently
+rebound. Legacy unnamed instances and different checkouts/hosts are outside
+this local registry; do not run the same bot or chat from multiple hosts.
+All new named-profile GitHub tasks (including legacy explicit work commands)
+use unique bot-ID/UUID branches. Task IDs remain local to each agent.
+
+For two independent instances in one checkout, create .env.ragna and .env.yuki
+from .env.example, set AGENT_PROFILE=ragna or yuki and AGENT_NAME=Ragna or Yuki,
+provide different Telegram tokens and CWA_CONVERSATION_ID values, and configure
+BOT_ALIASES, peer identity and WORK_* allowlists separately. With a profile,
+CWA_AUTH_FILE=auth_data.json resolves to the profile's own auth_data.json;
+explicit alternate auth paths remain supported. For example, start from two
+separate PowerShell terminals after completing dependency setup:
+
+    $env:AGENTRELAY_ENV_FILE = ".env.ragna"
+    .\start.cmd
+
+and:
+
+    $env:AGENTRELAY_ENV_FILE = ".env.yuki"
+    .\start.cmd
+
+The shell environment takes precedence over the selected file; avoid stale
+variables and never commit credentials. Run initial setup once, not concurrently.
+Custom state/log paths outside the profile namespace are rejected (legacy
+defaults in copied .env files are remapped). Existing unnamed state is NOT
+migrated automatically. Stop the old instance before adopting a named profile;
+keep its files as backups and do not assume old task IDs, cursor, stop state or
+claims have migrated. New profile starts with fresh state and retains the usual
+first-launch backlog skip. Do not use this as a way to bypass a stopped task.
+Do not delete ownership or claim files to fix configuration mistakes.
+
+Separate state and conversation ownership are not remote connector permission
+isolation. Main/coordinator native write restrictions and operator smoke tests
+still apply. No shared task ledger, cross-host lease, agent-to-agent work
+delegation or live parallel Telegram experiment is implied by this milestone.

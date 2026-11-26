@@ -97,7 +97,7 @@ def format_work_progress(work_id: int, project: str, task: str,
     if note.strip():
         lines.extend(["", _safe_text(note, 1200)])
     if phase not in _TERMINAL:
-        lines.extend(["", "Можно продолжать общение с Ragna."])
+        lines.extend(["", "Можно продолжать общение с ассистентом."])
     return "\n".join(lines)
 
 
@@ -111,8 +111,9 @@ class WorkProgress:
 
     HISTORY_LIMIT = 30
 
-    def __init__(self, api: Any, chat_id: int, state_file: str):
+    def __init__(self, api: Any, chat_id: int, state_file: str, *, agent_name: str = ''):
         self.api, self.chat_id = api, chat_id
+        self.agent_name = agent_name
         self.path = Path(state_file)
         self._lock = threading.RLock()
         self.record: dict[str, Any] | None = None
@@ -176,6 +177,7 @@ class WorkProgress:
         with self._lock:
             rec: dict[str, Any] = {
                 "work_id": work_id, "project": project[:80],
+                "agent_name": self.agent_name,
                 "task": task[:250], "repository": repo[:130],
                 "chat_id": self.chat_id, "message_id": 0,
                 "thread_id": thread_id, "phase": "queued",

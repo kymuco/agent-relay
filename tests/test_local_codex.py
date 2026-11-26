@@ -135,7 +135,7 @@ class LocalWorkTests(unittest.TestCase):
                 with self.assertLogs("agentrelay", level="ERROR") as lines:
                     app._run_local_work(payload["_local_work"], generation)
                 codex.assert_not_called()
-            self.assertIn("Ragna decision parsing", lines.output[0])
+            self.assertIn("orchestrator decision parsing", lines.output[0])
             self.assertIn("JSON", lines.output[0])
             self.assertEqual(app.work.record["status"], "failed")
 

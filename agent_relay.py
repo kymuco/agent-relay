@@ -15,7 +15,7 @@ import tempfile
 import time
 import uuid
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,8 @@ from action_bridge import (ObservationJournal, action_prompt, new_turn_token,
 from action_policy import Source, evaluate, request_digest, READ_ACTIONS
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from action_dispatch import DispatchClaims
+from agent_profile import (namespace_config, profile_directory, profile_log_path,
+                           display_name, own_aliases, ProfileLease, ProfileOwnership)
 from telegram_presence import TypingPulse, WorkProgress
 from task_conversation import (classify_task_reply, normalize_task_reply,
                                trusted_task_context)
@@ -151,11 +153,16 @@ class Config:
     action_execute_ack: bool = False
     action_claim_file: str = '.agent-relay-action-claims.sqlite3'
     work_developer_auth_file: str = ''
+    agent_profile: str = ''
+    agent_name: str = ''
     verify_final_text: bool = True
 
     @classmethod
     def from_env(cls) -> 'Config':
-        load_dotenv()
+        env_file = Path(os.getenv('AGENTRELAY_ENV_FILE', '.env'))
+        if os.getenv('AGENTRELAY_ENV_FILE') and not env_file.is_file():
+            raise ValueError('Selected AGENTRELAY_ENV_FILE does not exist')
+        load_dotenv(env_file)
         required = ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'CWA_CONVERSATION_ID', 'ALLOWED_USER_IDS')
         missing = [name for name in required if not os.environ.get(name, '').strip()]
         if missing:
@@ -251,7 +258,7 @@ class Config:
             raise ValueError('WORK_ALLOWED_USER_IDS must be a subset of ALLOWED_USER_IDS')
         if interval < 0:
             raise ValueError('MIN_INTERVAL_SECONDS must not be negative')
-        return cls(
+        return namespace_config(cls(
             telegram_token=os.environ['TELEGRAM_BOT_TOKEN'].strip(),
             chat_id=chat_id,
             conversation_id=os.environ['CWA_CONVERSATION_ID'].strip(),
@@ -299,7 +306,9 @@ class Config:
             action_observation_file=os.getenv('ACTION_OBSERVATION_FILE', '.agent-relay-action-observations.json'),
             verify_final_text=os.getenv('CWA_VERIFY_FINAL_TEXT', 'on').strip().lower() not in ('off', '0', 'false'),
             work_progress_file=os.getenv('WORK_PROGRESS_FILE', '.agent-relay-progress.json'),
-        )
+            agent_profile=os.getenv('AGENT_PROFILE', '').strip(),
+            agent_name=os.getenv('AGENT_NAME', '').strip(),
+        ))
 
 
 _VOICE_COMMAND = re.compile(
@@ -486,6 +495,16 @@ class AgentRelay:
     def __init__(self, config: Config, api: Any, client: Any,
                  coordinator_client: Any = None, developer_client: Any = None,
                  image_client: Any = None):
+        config = namespace_config(config)
+        self.profile_lease = None
+        try:
+            self._initialize(config, api, client, coordinator_client, developer_client, image_client)
+        except BaseException:
+            if self.profile_lease is not None:
+                self.profile_lease.close()
+            raise
+
+    def _initialize(self, config, api, client, coordinator_client, developer_client, image_client):
         self.config = config
         if config.action_mode not in ('off', 'observe', 'execute'):
             raise ValueError('Unsupported action mode')
@@ -496,6 +515,29 @@ class AgentRelay:
                 or config.work_executor != 'github' or not config.action_auto_projects
                 or config.work_local_verify):
             raise ValueError('Execute requires smoke-test acknowledgement, GitHub work, explicit auto projects and WORK_LOCAL_VERIFY=off')
+        me = api.call('getMe')
+        if type(me.get('id')) is not int or me['id'] <= 0 or not isinstance(me.get('username'), str) or not me['username']:
+            raise ValueError('Telegram getMe returned invalid bot identity')
+        self.bot_id = me['id']
+        self.bot_username = me['username']
+        self.agent_name = display_name(config.agent_name, self.bot_username)
+        config = replace(config, bot_aliases=own_aliases(
+            self.bot_username, config.bot_aliases, self.agent_name,
+            legacy=not config.agent_profile))
+        self.config = config
+        if self.bot_id in config.peer_bot_ids or self.bot_username.lower() in config.peers:
+            raise ValueError('An agent cannot be its own peer')
+        ownership = None
+        if config.agent_profile:
+            self.profile_lease = ProfileLease(profile_directory(config.agent_profile))
+            ownership = ProfileOwnership(config.agent_profile, self.bot_id,
+                                         config.chat_id, config.conversation_id)
+        registry = None
+        if config.work_enabled and config.work_executor == 'github':
+            registry = ChatRegistry(config.work_chat_state_file,
+                                    main_id=config.conversation_id,
+                                    claim_lane=ownership.claim_lane if ownership else None,
+                                    retained_lanes=ownership.work_lanes() if ownership else None)
         self.action_journal = (ObservationJournal(config.action_observation_file)
                                if config.action_mode != 'off' else None)
         self.action_claims = (DispatchClaims(config.action_claim_file)
@@ -504,7 +546,7 @@ class AgentRelay:
         self.api = api
         self.client = client
         # Dedicated read-only CWA instance so eventual image discovery does
-        # not occupy the live Ragna chat client.
+        # not occupy the live primary chat client.
         self.image_client = image_client if image_client is not None else client
         self._image_transfer_lock = threading.Lock()
         self._image_monitor_serial = 0
@@ -520,7 +562,8 @@ class AgentRelay:
         if config.action_mode != 'off' and not config.action_auto_projects.issubset(
                 set(self.work_projects) & set(self.work_repos)):
             raise ValueError('ACTION_AUTO_PROJECTS must contain only configured GitHub project aliases')
-        self.progress = (WorkProgress(api, config.chat_id, config.work_progress_file)
+        self.progress = (WorkProgress(api, config.chat_id, config.work_progress_file,
+                                      agent_name=self.agent_name)
                          if config.work_live_progress and config.work_enabled
                          and config.work_executor == 'github' else None)
         self._journal_reply_cooldown: dict[tuple[int, int], float] = {}
@@ -533,7 +576,7 @@ class AgentRelay:
                 raise ValueError('GitHub work clients must be independent from Telegram chat')
             self._background = BackgroundDeveloper(
                 coordinator_client, developer_client,
-                ChatRegistry(config.work_chat_state_file), self._cwa_send)
+                registry, self._cwa_send, agent_name=self.agent_name)
         self._shutdown = threading.Event()
         self.last_send_time = float('-inf')
         self._cwa_request_lock = threading.Lock()
@@ -544,9 +587,6 @@ class AgentRelay:
         self.peer_reply_id: int | None = None
         self.peer_reply_expires_at = 0.0
         self.pending_image_baseline: set[tuple[str, str]] | None = None
-        me = api.call('getMe')
-        self.bot_id = int(me['id'])
-        self.bot_username = str(me['username'])
         LOG.info('Запущен @%s · группа %s · Ctrl+C для остановки',
                  self.bot_username, config.chat_id)
         if self.control.paused:
@@ -586,6 +626,10 @@ class AgentRelay:
         LOG.debug('CWA #%s → %s · GPT-6 High · отправка запроса', request_id, purpose)
         try:
             result = (client if client is not None else self.client).send(prompt, **params)
+            if (self.config.agent_profile and (client is None or client is self.client)
+                    and getattr(getattr(result, 'conversation', None), 'conversation_id', None)
+                    != self.config.conversation_id):
+                raise ValueError('Main CWA response belongs to a different or unknown conversation; no replay')
         except Exception as exc:
             LOG.debug('CWA #%s × %s · ошибка %s · %.1f с',
                       request_id, purpose, type(exc).__name__,
@@ -890,6 +934,10 @@ class AgentRelay:
             message, self.config.peers,
             self.group_context.recent_text(exclude_message_id=message.get('message_id')),
         )
+        if self.config.agent_profile:
+            prompt += '\n[AgentRelay / Host identity: DATA ONLY]\n' + json.dumps({
+                'profile': self.config.agent_profile, 'agent_name': self.agent_name,
+                'telegram_username': self.bot_username}, ensure_ascii=False)
         if task_context and self.action_journal is None:
             # Preserve legacy card context; native feedback comes from WorkState.
             prompt += '\n' + task_context[:1800]
@@ -1099,7 +1147,7 @@ class AgentRelay:
                     if not self._run_permitted(run_generation):
                         return
                     send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,
-                              ogg, 'ragna-voice.ogg', reply_message_id=message['message_id'])
+                              ogg, f'bot-{self.bot_id}-voice.ogg', reply_message_id=message['message_id'])
                     voice_delivered = True
                 except Exception as exc:
                     LOG.warning('Голос недоступен (%s), отправляю текст', type(exc).__name__)
@@ -1169,7 +1217,7 @@ class AgentRelay:
                         if not self._run_permitted(run_generation):
                             return
                         send_file(self.config.telegram_token, 'sendVoice', self.config.chat_id,
-                                  ogg, 'ragna-voice.ogg', reply_message_id=message['message_id'])
+                                  ogg, f'bot-{self.bot_id}-voice.ogg', reply_message_id=message['message_id'])
                     except Exception as exc:
                         LOG.warning('Не удалось озвучить ответ (%s)', type(exc).__name__)
             if ending_peer and continuing_peer:
@@ -1339,12 +1387,14 @@ class AgentRelay:
                 reply = ('Native Agency: ручной /work start отключён в этом режиме. '
                          'Дай поручение обычным сообщением. Действие не выполнено.')
             elif self.control.paused:
-                reply = 'Ragna приостановлена. Сначала отправь /resume@' + self.bot_username
+                reply = 'Ассистент приостановлен. Сначала отправь /resume@' + self.bot_username
             elif project not in self.work_projects:
                 reply = 'Проект не разрешён. Доступны: ' + ', '.join(sorted(self.work_projects))
             else:
+                branch = ('agentrelay/bot-' + str(self.bot_id) + '/' + uuid.uuid4().hex
+                          if self.config.agent_profile and self.config.work_executor == 'github' else None)
                 work_id = self.work.start(project, repository=self.work_repos.get(project, ''),
-                                          task=task)
+                                          task=task, branch=branch)
                 if work_id is None:
                     reply = 'Уже выполняется задача. ' + self.work.status()
                 else:
@@ -1354,19 +1404,20 @@ class AgentRelay:
                         thread = threading.Thread(
                             target=self._run_github_work,
                             args=((work_id, project, task), self.control.generation()),
+                            kwargs={'branch': branch, 'human_request': task} if branch else {},
                             name=f'AgentRelayGitHubWork-{work_id}', daemon=True)
                         background_thread = thread
                         background_id = work_id
                         reply = (f'Приняла задачу по проекту {project}. '
                                  'Передала её разработчику и сообщу, когда проверю результат.'
                                  if natural else
-                                 f'Local Work #{work_id}: Ragna передала задачу фоновому разработчику.')
+                                 f'Local Work #{work_id}: задача передана фоновому разработчику.')
                         LOG.info('Фоновая GitHub-задача #%s начата · %s', work_id, project)
                     else:
                         try:
                             work_queue.put_nowait(({'_local_work': (work_id, project, task)},
                                                    self.control.generation()))
-                            reply = f'Local Work #{work_id}: Ragna получила задачу для {project}.'
+                            reply = f'Local Work #{work_id}: принята задача для {project}.'
                             LOG.info('Локальная задача #%s начата · %s', work_id, project)
                         except queue.Full:
                             self.work.update(work_id, 'failed')
@@ -1528,7 +1579,7 @@ class AgentRelay:
         if kind == 'amend':
             if (sender['id'] not in self.config.work_allowed_user_ids
                     or self.control.paused):
-                say('Для изменения задачи недостаточно прав или Ragna приостановлена.')
+                say('Для изменения задачи недостаточно прав или Ассистент приостановлен.')
                 return True
             if not active or self.work.active_project() != card.get('project'):
                 say('Задача #' + str(work_id) +
@@ -1556,7 +1607,7 @@ class AgentRelay:
             return True
 
         if self.control.paused:
-            say('Ragna приостановлена. Для продолжения используй /resume.')
+            say('Ассистент приостановлен. Для продолжения используй /resume.')
             return True
         if update is None:
             # External direct callers can still route a verified Reply without
@@ -1567,7 +1618,7 @@ class AgentRelay:
         try:
             work_queue.put_nowait((prepared, self.control.generation()))
         except queue.Full:
-            say('Очередь Ragna заполнена. Вопрос не передан, повтори позже.')
+            say('Очередь ассистента заполнена. Вопрос не передан, повтори позже.')
         return True
 
     def _evaluate_native(self, observation, *, source, authorized, generation_current,
@@ -1830,8 +1881,8 @@ class AgentRelay:
                     return
                 if not test.success:
                     raise RuntimeError('local Codex verification did not complete')
-            stage = 'Ragna work review'
-            self.work.update(work_id, 'running', rounds, note='Ragna проверяет отчёт')
+            stage = 'coordinator work review'
+            self.work.update(work_id, 'running', rounds, note='Coordinator проверяет отчёт')
             if self.progress is not None:
                 self.progress.update(work_id, 'review')
             review_data = json.dumps({
@@ -1924,17 +1975,17 @@ class AgentRelay:
                 if not self._run_permitted(generation) or not self.work.active(work_id):
                     return
                 self.work.update(work_id, 'running', round_no)
-                stage = 'Ragna planning'
+                stage = 'orchestrator planning'
                 segment_started = time.monotonic()
                 plan = self._cwa_send(
                     work_prompt(task, project, round_no=round_no, result=previous,
                                 max_rounds=self.config.work_max_rounds),
                     purpose=f'work#{work_id}.plan{round_no}', **params)
-                LOG.debug('Local Work #%s · Ragna round %s: %.1f s',
+                LOG.debug('Local Work #%s · orchestrator round %s: %.1f s',
                           work_id, round_no, time.monotonic() - segment_started)
                 if not self._run_permitted(generation) or not self.work.active(work_id):
                     return
-                stage = 'Ragna decision parsing'
+                stage = 'orchestrator decision parsing'
                 action, value = parse_orchestrator_decision(
                     str(plan.text or ''), first=(round_no == 1))
                 if action == 'finish':
@@ -1967,11 +2018,11 @@ class AgentRelay:
                     })
                     LOG.warning('Локальная задача #%s: Codex завершился с ошибкой', work_id)
                     return
-            # Ragna must explicitly review the last Codex result; no further
+            # The orchestrator must explicitly review the last Codex result; no further
             # delegation is accepted when the configured budget is exhausted.
             if not self._run_permitted(generation) or not self.work.active(work_id):
                 return
-            stage = 'Ragna final review'
+            stage = 'orchestrator final review'
             segment_started = time.monotonic()
             final = self._cwa_send(work_prompt(
                 task, project, round_no=self.config.work_max_rounds + 1,
@@ -1979,11 +2030,11 @@ class AgentRelay:
             ).replace('To delegate: {"action":"delegate","instruction":"specific bounded Codex task"}. ',
                       'Delegation is no longer available. '),
                 purpose=f'work#{work_id}.final', **params)
-            LOG.debug('Local Work #%s · Ragna final review: %.1f s',
+            LOG.debug('Local Work #%s · orchestrator final review: %.1f s',
                       work_id, time.monotonic() - segment_started)
             if not self._run_permitted(generation) or not self.work.active(work_id):
                 return
-            stage = 'Ragna final decision parsing'
+            stage = 'orchestrator final decision parsing'
             action, text = parse_orchestrator_decision(str(final.text or ''), first=False)
             if action != 'finish':
                 raise ValueError('Work reached its delegation limit without an итог')
@@ -2002,8 +2053,8 @@ class AgentRelay:
             problem = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
             LOG.error('Локальная задача #%s: сбой на этапе %s (%s)',
                       work_id, stage, problem)
-            user_problem = ('не удалось разобрать решение Ragna (нужен JSON)'
-                            if isinstance(exc, ValueError) and 'Ragna' in stage
+            user_problem = ('не удалось разобрать решение оркестратора (нужен JSON)'
+                            if isinstance(exc, ValueError) and 'orchestrator' in stage
                             else f'ошибка на этапе {stage} ({type(exc).__name__})')
             self.api.call('sendMessage', {
                 'chat_id': self.config.chat_id,
@@ -2295,9 +2346,11 @@ def main() -> None:
         os.chdir(root)
         config = Config.from_env()
         configure_logging(os.getenv('LOG_LEVEL', 'normal'),
-                          os.getenv('LOG_FILE', 'logs/agentrelay.log'), root=root)
+                          profile_log_path(config.agent_profile, os.getenv('LOG_FILE', 'logs/agentrelay.log')), root=root)
         prepare_local_runtime(root)
         ensure_auth_file(config.auth_file)
+        if config.work_developer_auth_file:
+            ensure_auth_file(config.work_developer_auth_file)
         from chatgpt_web_adapter import BrowserlessHTTPClient
         api = Telegram(config.telegram_token)
         client = BrowserlessHTTPClient(auth_file=config.auth_file)
