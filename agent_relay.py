@@ -2135,7 +2135,7 @@ class AgentRelay:
                     'text': (f'Задача #{work_id}: {status_name}. ' +
                              (title[:220] if verified else (message or report.summary)[:380]) +
                              ('\n' + ci_label(ci, report.commit_sha) if ci is not None
-                              and target_status != 'needs_review' else '') +
+                              and (target_status != 'needs_review' or execution is not None) else '') +
                              ('\n' + workspace_label(workspace, report.commit_sha)
                               if workspace is not None and workspace['status'] == 'prepared' else '') +
                              ('\n' + execution_label(execution, workspace, report.commit_sha)

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from local_workspace import prepare_workspace, validate_root, workspace_record
+from local_workspace import prepare_workspace, validate_root, workspace_record, verify_prepared_workspace
 from work_feedback import result_record
 from work_card_views import work_keyboard
 import test_action_bridge as fixtures
@@ -78,6 +78,14 @@ class WorkspaceTests(unittest.TestCase):
             self.assertEqual((source/"untracked.txt").read_text(encoding="utf-8"), "keep")
             self.assertEqual(git(source, "config", "filter.guard.smudge"), "false")
             self.assertEqual(workspace_record(observed, sha), observed)
+            with patch("github_work._github_origin_matches", return_value=True):
+                self.assertEqual(verify_prepared_workspace(source, root, REPO, sha,
+                    observed["workspace_id"], permitted=lambda: True), workspace)
+                self.assertIsNone(verify_prepared_workspace(source, root, REPO, original_head,
+                    observed["workspace_id"], permitted=lambda: True))
+                (workspace/"value.txt").write_text("changed", encoding="utf-8")
+                self.assertIsNone(verify_prepared_workspace(source, root, REPO, sha,
+                    observed["workspace_id"], permitted=lambda: True))
 
     def test_stop_before_git_never_materializes(self):
         with tempfile.TemporaryDirectory() as d:
