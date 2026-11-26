@@ -710,3 +710,20 @@ fenced blocks; oversized or unclosed blocks use literal text. Rich Messages
 remain opt-in via TELEGRAM_RICH_MODE=auto. Use off if Telegram Rich rendering
 introduces artifacts. No automatic retry of a possibly delivered Telegram
 message. No live Telegram or authenticated CWA test is implied.
+
+## NA-02: action admission dry-run
+
+In ACTION_MODE=observe, each proposed action is evaluated by action_policy.py
+against Host-owned source identity, current stop generation, configured GitHub
+project and current task/card binding. ACTION_AUTO_PROJECTS is an explicit
+comma-separated subset of configured project aliases (empty by default).
+Bounded reads can be allowed; starts require an idle worker; amendments require
+the exact active task and Reply binding for auto eligibility. Writes to projects
+without auto eligibility are classified ask; unknown or out-of-scope actions are
+denied. No confirmation button is required for eligible proposals. Ask is a
+classification only; no approval endpoint exists yet. No execution path is
+connected. Journal decisions (allow/ask/deny), proposal digest, source digest
+and generation are diagnostic only, never reusable grants. A digest binds the
+proposal to the current source, not proof of semantic intent or prior consent.
+Recheck permissions, scope, task identity, expiry and generation at any future
+dispatch. Native connector restrictions are still an operator prerequisite.

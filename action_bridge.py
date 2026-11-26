@@ -123,7 +123,8 @@ class ObservationJournal:
         self._lock = threading.Lock()
 
     def record(self, *, bot_id, chat_id, update_id, message_id, user_id,
-               observation: Observation):
+               observation: Observation, admission=None, generation=None,
+               request_sha256=None):
         with self._lock:
             records = []
             if self.path.exists():
@@ -139,7 +140,9 @@ class ObservationJournal:
                             "update_id": update_id, "message_id": message_id,
                             "user_id": user_id, "status": observation.status,
                             "action": observation.action, "arguments": observation.arguments,
-                            "reason": observation.reason})
+                            "reason": observation.reason,
+                            "admission": admission, "generation": generation,
+                            "request_sha256": request_sha256})
             payload = json.dumps(records[-HISTORY_LIMIT:], ensure_ascii=False, indent=2)
             if len(payload.encode("utf-8")) > MAX_JOURNAL_BYTES:
                 raise ValueError("oversized observation journal")

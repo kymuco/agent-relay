@@ -26,6 +26,7 @@ from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
 from natural_work import route_natural_work
 from action_bridge import (ObservationJournal, action_prompt, new_turn_token,
                            parse_action_response)
+from action_policy import Source, evaluate, request_digest
 from telegram_presence import TypingPulse, WorkProgress
 from task_conversation import (classify_task_reply, normalize_task_reply,
                                trusted_task_context)
@@ -143,6 +144,7 @@ class Config:
     action_mode: str = 'off'
     action_observe_read_only_ack: bool = False
     action_observation_file: str = '.agent-relay-action-observations.json'
+    action_auto_projects: frozenset[str] = frozenset()
     verify_final_text: bool = True
 
     @classmethod
@@ -280,6 +282,7 @@ class Config:
             work_live_progress=work_live_progress,
             action_mode=action_mode,
             action_observe_read_only_ack=action_ack,
+            action_auto_projects=frozenset(x.strip() for x in os.getenv('ACTION_AUTO_PROJECTS', '').split(',') if x.strip()),
             action_observation_file=os.getenv('ACTION_OBSERVATION_FILE', '.agent-relay-action-observations.json'),
             verify_final_text=os.getenv('CWA_VERIFY_FINAL_TEXT', 'on').strip().lower() not in ('off', '0', 'false'),
             work_progress_file=os.getenv('WORK_PROGRESS_FILE', '.agent-relay-progress.json'),
@@ -493,6 +496,9 @@ class AgentRelay:
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
+        if config.action_mode == 'observe' and not config.action_auto_projects.issubset(
+                set(self.work_projects) & set(self.work_repos)):
+            raise ValueError('ACTION_AUTO_PROJECTS must contain only configured GitHub project aliases')
         self.progress = (WorkProgress(api, config.chat_id, config.work_progress_file)
                          if config.work_live_progress and config.work_enabled
                          and config.work_executor == 'github' else None)
@@ -923,10 +929,19 @@ class AgentRelay:
                             type(exc).__name__)
         # NA-01: the main assistant proposes actions; no executor is wired.
         action_token = None
+        action_source = None
+        action_card = None
         projects = {}
         if (self.action_journal is not None and addressed and not sender_is_bot
                 and sender.get('id') in self.config.work_allowed_user_ids):
             action_token = new_turn_token()
+            action_source = Source(
+                bot_id=self.bot_id, chat_id=self.config.chat_id,
+                update_id=update_id, message_id=message['message_id'],
+                user_id=sender['id'], generation=run_generation,
+                request_sha256=request_digest(text_in))
+            action_card = (self.progress.card_for_reply(message, bot_id=self.bot_id)
+                           if self.progress is not None else None)
             projects = {name: repo for name, repo in self.work_repos.items()
                         if name in self.work_projects}
             prompt += action_prompt(action_token, projects)
@@ -956,22 +971,43 @@ class AgentRelay:
             if self.action_journal is not None:
                 observation = parse_action_response(text, token=action_token, projects=projects)
                 text, action_seen = observation.reply, observation.seen
-                if action_token is not None:
+                if action_source is not None:
+                    decision = None
+                    if observation.seen:
+                        decision = evaluate(
+                            observation, source=action_source,
+                            authorized=(addressed and not sender_is_bot
+                                        and sender['id'] in self.config.work_allowed_user_ids),
+                            generation_current=self._run_permitted(run_generation),
+                            projects=projects, auto_projects=self.config.action_auto_projects,
+                            executor=self.config.work_executor,
+                            work=self.work.admission_snapshot() if self.work is not None else None,
+                            bound_card=action_card)
+                    if not self._run_permitted(run_generation):
+                        return
                     try:
-                        self.action_journal.record(
+                        saved = self.action_journal.record(
                             bot_id=self.bot_id, chat_id=self.config.chat_id,
                             update_id=update_id, message_id=message['message_id'],
-                            user_id=sender['id'], observation=observation)
+                            user_id=sender['id'], observation=observation,
+                            admission=decision.to_record() if decision is not None else None,
+                            generation=run_generation, request_sha256=action_source.request_sha256)
                     except (OSError, ValueError) as exc:
                         LOG.warning('NA-01 observation not saved (%s)', type(exc).__name__)
                         if action_seen:
                             text += '\n\nРежим наблюдения: действие не запущено, запись журнала не удалась.'
                     else:
-                        LOG.info('NA-01 · update=%s · %s', update_id, observation.status)
+                        if not saved:
+                            LOG.info('NA-02 · duplicate observation · update=%s', update_id)
+                            return
+                        LOG.info('NA-02 · update=%s · %s', update_id,
+                                 decision.decision if decision is not None else observation.status)
                         if action_seen:
-                            text += ('\n\nРежим наблюдения: предложение записано, действие не выполнено.'
-                                     if observation.status == 'proposed' else
-                                     '\n\nРежим наблюдения: некорректное предложение отклонено, действие не выполнено.')
+                            label = {'allow': 'допустимо по политике',
+                                     'ask': 'нужно уточнение или разрешение',
+                                     'deny': 'отклонено'}[decision.decision]
+                            text += ('\n\nРежим наблюдения: ' + label +
+                                     '; действие не выполнено.')
                 elif action_seen:
                     LOG.info('NA-01 · предложение вне разрешённого диалогового хода проигнорировано')
                     text += '\n\nДействие не выполнено.'

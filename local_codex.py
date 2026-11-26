@@ -397,6 +397,11 @@ class WorkState:
             self._write()
             return real_status
 
+    def admission_snapshot(self) -> dict[str, Any]:
+        """Atomic read-only facts for NA-02; not a reservation or grant."""
+        with self._lock:
+            return {key: self.record[key] for key in ('id', 'status', 'project')}
+
     def active_project(self) -> str | None:
         with self._lock:
             if (not self._cancel.is_set() and
