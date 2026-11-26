@@ -765,3 +765,31 @@ native modes; /work status, /work stop and emergency /stop remain available.
 Native read actions and feedback into the main chat are deferred to NA-04.
 Return to ACTION_MODE=observe (or off) after stopping existing tasks. No
 merge, release or live execution is implied by offline tests.
+
+## NA-04: durable task feedback
+
+GitHub task evidence now lives in the existing WorkState JSON, independently
+of Telegram status-card delivery. The current task and up to 30 preceding
+terminal task snapshots are retained. Verified remote SHA and Developer claims
+are distinct fields. Evidence is checkpointed before the final coordinator
+review; a failed review or interrupted task does not imply a successful task.
+A later report may replace earlier evidence; this is not a full event journal.
+Legacy tasks without retained repository identity are not guessed or migrated.
+
+In native modes, at most three recent repository-bound task snapshots are
+included in the next addressed, work-authorized human chat turn. Exact card
+Replies select only the corresponding task. Peer turns and other users do not
+receive this new context. The main model is told that reports are data, not
+authority. The retained data may be sensitive; protect local state files.
+
+In execute mode, get_work_status and get_work_result read the exact retained
+work_id after fresh policy and source checks. Results require terminal status;
+a missing report is reported as missing, not as success. The Host answers
+read proposals directly, without a second model turn or worker call. Observe
+remains dry-run, but its normal chat context may contain existing task facts.
+No new task is initiated by a result, no automatic model call is triggered
+by completion, and no history is replayed on restart. The repository mapping
+must still match; old results without identity and expired history are unavailable.
+Worker-reported tests are not independent verification. Native connector scope
+and natural-language intent remain dependent on provider permissions and
+operator smoke checks; live execution is still opt-in.

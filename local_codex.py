@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from work_feedback import HISTORY_LIMIT, TERMINAL, result_record, snapshot
+
 _ALIAS = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 _ALLOWED_ENV = {
     "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
@@ -319,6 +321,15 @@ class WorkState:
                         not isinstance(saved.get("project"), str) or
                         type(saved.get("stage")) is not int):
                     raise ValueError("invalid saved work state")
+                history = saved.get("history", [])
+                if (not isinstance(history, list) or len(history) > HISTORY_LIMIT
+                        or any(not isinstance(item, dict) or type(item.get("id")) is not int
+                               or not 0 < item["id"] < saved["id"]
+                               or item.get("status") not in TERMINAL
+                               or not isinstance(item.get("project"), str)
+                               or type(item.get("stage")) is not int for item in history)
+                        or len({item["id"] for item in history}) != len(history)):
+                    raise ValueError("invalid work history")
                 self.record = saved
             except (OSError, ValueError, UnicodeError) as exc:
                 raise ValueError("Work state unreadable; refusing local work") from exc
@@ -336,14 +347,20 @@ class WorkState:
         os.replace(tmp, self.path)
 
     def start(self, project: str, *, branch: str | None = None,
-              proposal_id: str | None = None) -> int | None:
+              proposal_id: str | None = None, repository: str = "",
+              task: str = "") -> int | None:
         with self._lock:
             if self.record["status"] in self.ACTIVE:
                 return None
             self._cancel.clear()
             self.runner = CodexRunner()
+            history = list(self.record.get("history", []))
+            if self.record["id"] and self.record["status"] in TERMINAL:
+                history.append(snapshot(self.record))
             self.record = {"id": self.record["id"] + 1, "status": "queued",
-                           "project": project, "stage": 0}
+                           "project": project, "stage": 0,
+                           "repository": repository, "task": task[:500],
+                           "history": history[-HISTORY_LIMIT:]}
             if branch is not None:
                 self.record.update(branch=branch, proposal_id=proposal_id)
             self._write()
@@ -386,7 +403,8 @@ class WorkState:
             self._write()
             return list(pending)
 
-    def finalize(self, id: int, status: str, stage: int, note: str) -> str | None:
+    def finalize(self, id: int, status: str, stage: int, note: str,
+                 *, result: dict[str, Any] | None = None) -> str | None:
         """Finish atomically; surface late amendments instead of losing them."""
         with self._lock:
             if (self.record["id"] != id or self._cancel.is_set()
@@ -397,8 +415,38 @@ class WorkState:
             if pending:
                 note += f"; {len(pending)} уточн. ожидают нового поручения"
             self.record.update(status=real_status, stage=stage, note=note[:350])
+            if result is not None:
+                self.record["result"] = result_record(result, len(pending))
             self._write()
             return real_status
+
+    def checkpoint_result(self, work_id: int, result: dict[str, Any]) -> bool:
+        """Persist observed evidence before review/Telegram, only for active task."""
+        with self._lock:
+            if (self.record["id"] != work_id or self._cancel.is_set()
+                    or self.record["status"] not in self.ACTIVE):
+                return False
+            self.record["result"] = result_record(
+                result, len(self.record.get("pending_amendments", [])))
+            self._write()
+            return True
+
+    def feedback_snapshot(self, work_id: int) -> dict[str, Any] | None:
+        """Read exact current or retained historical task, never guess latest."""
+        with self._lock:
+            if type(work_id) is not int or work_id <= 0:
+                return None
+            if self.record["id"] == work_id:
+                return snapshot(self.record)
+            for item in self.record.get("history", []):
+                if item["id"] == work_id:
+                    return snapshot(item)
+            return None
+
+    def recent_feedback(self) -> list[dict[str, Any]]:
+        with self._lock:
+            records = [self.record] + list(reversed(self.record.get("history", [])))
+            return [snapshot(item) for item in records if item["id"] > 0]
 
     def admission_snapshot(self) -> dict[str, Any]:
         """Atomic read-only facts for NA-02; not a reservation or grant."""

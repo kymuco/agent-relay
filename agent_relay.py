@@ -27,7 +27,8 @@ from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
 from natural_work import route_natural_work
 from action_bridge import (ObservationJournal, action_prompt, new_turn_token,
                            parse_action_response)
-from action_policy import Source, evaluate, request_digest
+from action_policy import Source, evaluate, request_digest, READ_ACTIONS
+from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from action_dispatch import DispatchClaims
 from telegram_presence import TypingPulse, WorkProgress
 from task_conversation import (classify_task_reply, normalize_task_reply,
@@ -889,10 +890,25 @@ class AgentRelay:
             message, self.config.peers,
             self.group_context.recent_text(exclude_message_id=message.get('message_id')),
         )
-        if task_context:
-            # Only the Host can attach this verified, bounded task binding.
+        if task_context and self.action_journal is None:
+            # Preserve legacy card context; native feedback comes from WorkState.
             prompt += '\n' + task_context[:1800]
-        if self.work is not None:
+        if (self.action_journal is not None and self.work is not None
+                and addressed and not sender_is_bot
+                and sender.get('id') in self.config.work_allowed_user_ids):
+            feedback_projects = {name: repo for name, repo in self.work_repos.items()
+                                 if name in self.work_projects}
+            records = self.work.recent_feedback()
+            card = (self.progress.card_for_reply(message, bot_id=self.bot_id)
+                    if self.progress is not None else None)
+            if card is not None:
+                # Exact Reply takes priority over newer tasks. Never substitute another task.
+                selected = self.work.feedback_snapshot(card['work_id'])
+                records = [selected] if selected is not None else []
+            prompt += context_prompt(records, feedback_projects)
+            if card is not None and not any(scoped(r, feedback_projects) for r in records):
+                prompt += '\nHost: exact replied-to task has no retained repository-bound feedback. Do not guess its result.'
+        elif self.work is not None and self.action_journal is None:
             status = self.work.status()
             if status != 'Локальных задач пока не было.':
                 prompt += ('\n[AgentRelay / background work status: trusted metadata, '
@@ -996,14 +1012,13 @@ class AgentRelay:
                 if action_source is not None:
                     decision = None
                     if observation.seen:
-                        decision = evaluate(
+                        decision = self._evaluate_native(
                             observation, source=action_source,
                             authorized=(addressed and not sender_is_bot
                                         and sender['id'] in self.config.work_allowed_user_ids),
                             generation_current=self._run_permitted(run_generation),
                             projects=projects, auto_projects=self.config.action_auto_projects,
                             executor=self.config.work_executor,
-                            work=self.work.admission_snapshot() if self.work is not None else None,
                             bound_card=action_card)
                     if not self._run_permitted(run_generation):
                         return
@@ -1025,8 +1040,11 @@ class AgentRelay:
                         LOG.info('NA-02 · update=%s · %s', update_id,
                                  decision.decision if decision is not None else observation.status)
                         if action_seen and self.action_claims is not None:
-                            text += '\n\n' + self._dispatch_native_action(
+                            host_reply = self._dispatch_native_action(
                                 observation, decision, action_source, message, projects)
+                            # A read is answered by Host facts, not a speculative model answer.
+                            text = (host_reply if observation.action in READ_ACTIONS else
+                                    text + '\n\n' + host_reply)
                         elif action_seen:
                             label = {'allow': 'допустимо по политике',
                                      'ask': 'нужно уточнение или разрешение',
@@ -1325,7 +1343,8 @@ class AgentRelay:
             elif project not in self.work_projects:
                 reply = 'Проект не разрешён. Доступны: ' + ', '.join(sorted(self.work_projects))
             else:
-                work_id = self.work.start(project)
+                work_id = self.work.start(project, repository=self.work_repos.get(project, ''),
+                                          task=task)
                 if work_id is None:
                     reply = 'Уже выполняется задача. ' + self.work.status()
                 else:
@@ -1551,13 +1570,25 @@ class AgentRelay:
             say('Очередь Ragna заполнена. Вопрос не передан, повтори позже.')
         return True
 
+    def _evaluate_native(self, observation, *, source, authorized, generation_current,
+                         projects, auto_projects, executor, bound_card):
+        work = self.work.admission_snapshot() if self.work is not None else None
+        if observation.action in READ_ACTIONS and self.work is not None:
+            item = self.work.feedback_snapshot((observation.arguments or {}).get('work_id'))
+            if item is not None:
+                work = item
+                if bound_card is not None and bound_card.get('work_id') == item['id']:
+                    bound_card = dict(bound_card, phase=item['status'], project=item['project'])
+        return evaluate(observation, source=source, authorized=authorized,
+                        generation_current=generation_current, projects=projects,
+                        auto_projects=auto_projects, executor=executor, work=work,
+                        bound_card=bound_card)
+
     def _dispatch_native_action(self, observation, decision, source, message, projects) -> str:
         """Live in-memory proposal only; reserve under the stop-generation lock."""
         if decision is None or decision.decision != 'allow':
             reason = decision.reason if decision is not None else 'invalid_proposal'
             return 'Host: действие не запущено (' + reason + ').'
-        if observation.action not in ('start_work', 'amend_work'):
-            return 'Host: чтение результата через Action Bridge ещё не подключено (NA-04).'
         if self.action_claims is None or self.work is None or self._background is None:
             return 'Host: исполнитель недоступен.'
         # Attachments, forwarded messages and quotes cannot themselves grant writes.
@@ -1577,6 +1608,26 @@ class AgentRelay:
                                     self.config.peers, self.config.allowed_user_ids,
                                     self.config.peer_bot_ids, self.config.bot_aliases)):
             return 'Host: источник поручения не допущен.'
+        if observation.action in READ_ACTIONS:
+            current_projects = {name: repo for name, repo in self.work_repos.items()
+                                if name in self.work_projects}
+            card = (self.progress.card_for_reply(message, bot_id=self.bot_id)
+                    if self.progress is not None else None)
+            fresh = self._evaluate_native(
+                observation, source=source, authorized=True,
+                generation_current=self._run_permitted(source.generation),
+                projects=current_projects, auto_projects=self.config.action_auto_projects,
+                executor=self.config.work_executor, bound_card=card)
+            item = self.work.feedback_snapshot(decision.work_id)
+            if (fresh.decision != 'allow' or fresh.proposal_id != decision.proposal_id
+                    or not scoped(item, current_projects)
+                    or (observation.action == 'get_work_result' and item['status'] not in TERMINAL)
+                    or not self._run_permitted(source.generation)):
+                return 'Host: точный результат недоступен или допуск изменился. Ничего не запускаю.'
+            # Read-only operation: no dispatch claim, no worker, no extra GPT turn.
+            return render_read(item, include_result=observation.action == 'get_work_result')
+        if observation.action not in ('start_work', 'amend_work'):
+            return 'Host: неизвестное действие.'
         starting = observation.action == 'start_work'
         task = observation.arguments['task']
         branch = 'agentrelay/bot-' + str(self.bot_id) + '/' + uuid.uuid4().hex
@@ -1600,7 +1651,8 @@ class AgentRelay:
                 return None
             if starting:
                 work_id = self.work.start(fresh.project, branch=branch,
-                                          proposal_id=fresh.proposal_id)
+                                          proposal_id=fresh.proposal_id,
+                                          repository=fresh.repository, task=task)
                 return work_id
             if self.work.add_amendment(task, expected_id=fresh.work_id):
                 return fresh.work_id
@@ -1700,6 +1752,7 @@ class AgentRelay:
                              if self.progress is not None else None)
                 if report is None or not permitted():
                     return
+                verified = False  # Never carry verification across a new report.
                 if report.status != 'ready':
                     verification_note = ('Worker was blocked; new changes were not '
                                          'independently verified.')
@@ -1716,6 +1769,12 @@ class AgentRelay:
                 previous_sha = report.commit_sha
                 verification_note = 'Remote Git branch and SHA independently verified.'
                 if not permitted():
+                    return
+                if not self.work.checkpoint_result(work_id, {
+                        'developer_status': report.status, 'repository': report.repository,
+                        'branch': report.branch, 'commit_sha': report.commit_sha,
+                        'developer_summary': report.summary, 'remote_verified': True,
+                        'local_check': verification_note}):
                     return
                 # Capture explicit human amendments only AFTER one worker step.
                 # The final permitted round leaves late changes pending, and
@@ -1737,6 +1796,13 @@ class AgentRelay:
                 break
             if report is None or not permitted():
                 return
+            if report.status != 'ready':
+                if not self.work.checkpoint_result(work_id, {
+                        'developer_status': report.status, 'repository': report.repository,
+                        'branch': report.branch, 'commit_sha': report.commit_sha,
+                        'developer_summary': report.summary, 'remote_verified': False,
+                        'local_check': verification_note}):
+                    return
             if verified and report.status == 'ready' and self.config.work_local_verify:
                 stage = 'checkout verified branch'
                 checkout_verified_commit(
@@ -1756,6 +1822,12 @@ class AgentRelay:
                 if not permitted():
                     return
                 verification_note += ' Codex check: ' + test.summary[:1000]
+                if not self.work.checkpoint_result(work_id, {
+                        'developer_status': report.status, 'repository': report.repository,
+                        'branch': report.branch, 'commit_sha': report.commit_sha,
+                        'developer_summary': report.summary, 'remote_verified': verified,
+                        'local_check': verification_note}):
+                    return
                 if not test.success:
                     raise RuntimeError('local Codex verification did not complete')
             stage = 'Ragna work review'
@@ -1781,10 +1853,14 @@ class AgentRelay:
             title = ('Проверен коммит ' + report.commit_sha[:12] +
                      ' в ' + report.repository + ' · ' + report.branch
                      if target_status == 'completed' else 'Исполнитель не подтвердил новые изменения')
-            status = self.work.finalize(work_id, target_status, rounds, title)
+            evidence = json.loads(review_data)
+            evidence['coordinator_summary'] = message
+            status = self.control.admit(generation, lambda: self.work.finalize(
+                work_id, target_status, rounds, title, result=evidence))
             if status is None:
                 return
-            pending = self.work.pending_snapshot()
+            final_snapshot = self.work.feedback_snapshot(work_id)
+            pending_count = final_snapshot['pending_count'] if final_snapshot else 0
             card_updated = False
             if self.progress is not None:
                 self.progress.result(
@@ -1793,11 +1869,11 @@ class AgentRelay:
                     branch=report.branch, commit_sha=report.commit_sha,
                     remote_verified=verified and report.status == 'ready',
                     local_check=verification_note,
-                    pending_amendments=len(pending))
+                    pending_amendments=pending_count)
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
-                status_name = ('Новые уточнения не применены' if pending else
+                status_name = ('Новые уточнения не применены' if pending_count else
                                'Коммит подтверждён' if verified else
                                'Работа не завершена')
                 self.api.call('sendMessage', {
