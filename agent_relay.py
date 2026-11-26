@@ -30,6 +30,7 @@ from action_bridge import (ObservationJournal, action_prompt, new_turn_token,
 from action_policy import Source, evaluate, request_digest, READ_ACTIONS
 from capability_registry import catalog_snapshot
 from github_ci import observe_ci, ci_label
+from local_workspace import prepare_workspace, validate_root, workspace_label
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from action_dispatch import DispatchClaims
 from agent_profile import (namespace_config, profile_directory, profile_log_path,
@@ -145,6 +146,7 @@ class Config:
     work_local_verify: bool = False
     work_ci_verify: bool = False
     work_ci_wait_seconds: int = 60
+    work_workspace_root: str = ''
     natural_work_enabled: bool = False
     telegram_rich_mode: str = 'off'
     chat_typing: bool = False
@@ -304,6 +306,7 @@ class Config:
             work_local_verify=work_local_verify,
             work_ci_verify=work_ci_verify,
             work_ci_wait_seconds=work_ci_wait,
+            work_workspace_root=os.getenv('WORK_WORKSPACE_ROOT', '').strip(),
             natural_work_enabled=natural_work_enabled,
             telegram_rich_mode=telegram_rich_mode,
             chat_typing=chat_typing,
@@ -571,6 +574,13 @@ class AgentRelay:
         self.cursor = Cursor(config.state_file)
         self.control = ControlState(config.control_file)
         self.work_projects = parse_projects(config.work_projects) if config.work_enabled else {}
+        self.workspace_root = None
+        if config.work_workspace_root:
+            if not config.work_enabled or config.work_executor != 'github' or config.work_local_verify:
+                raise ValueError('WORK_WORKSPACE_ROOT requires GitHub work and WORK_LOCAL_VERIFY=off')
+            self.workspace_root = validate_root(
+                config.work_workspace_root,
+                (*self.work_projects.values(), Path(__file__).resolve().parent))
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
@@ -1885,6 +1895,7 @@ class AgentRelay:
             report = None
             verification_note = ''
             ci = None
+            workspace = None
             rounds = 0
             for round_no in range(1, self.config.work_max_rounds + 1):
                 if not permitted():
@@ -2004,9 +2015,27 @@ class AgentRelay:
                         'developer_summary': report.summary, 'remote_verified': True,
                         'local_check': verification_note, 'ci': ci}):
                     return
+            if verified and report.status == 'ready' and self.workspace_root is not None:
+                stage = 'local workspace preparation'
+                if self.progress is not None:
+                    self.progress.update(work_id, 'workspace')
+                workspace = prepare_workspace(
+                    self.work_projects[project], self.workspace_root, repo, report.commit_sha,
+                    bot_id=self.bot_id, work_id=work_id, permitted=permitted)
+                if workspace is None or not permitted():
+                    return
+                LOG.info('GitHub-задача #%s · workspace=%s · id=%s',
+                         work_id, workspace['status'], workspace['workspace_id'])
+                if not self.work.checkpoint_result(work_id, {
+                        'delegation': delegation,
+                        'developer_status': report.status, 'repository': report.repository,
+                        'branch': report.branch, 'commit_sha': report.commit_sha,
+                        'developer_summary': report.summary, 'remote_verified': True,
+                        'local_check': verification_note, 'ci': ci, 'workspace': workspace}):
+                    return
             stage = 'final evidence'
             review_data = json.dumps({
-                'ci': ci,
+                'ci': ci, 'workspace': workspace,
                 'delegation': delegation,
                 'developer_status': report.status,
                 'repository': report.repository,
@@ -2038,6 +2067,9 @@ class AgentRelay:
             if ci is not None and ci['status'] not in ('passed', 'not_configured'):
                 target_status = 'needs_review'
                 title = 'Коммит подтверждён; ' + ci_label(ci, report.commit_sha)
+            if workspace is not None and workspace['status'] != 'prepared':
+                target_status = 'needs_review'
+                title = 'Коммит подтверждён; ' + workspace_label(workspace, report.commit_sha)
             evidence = json.loads(review_data)
             evidence['coordinator_summary'] = message
             status = self.control.admit(generation, lambda: self.work.finalize(
@@ -2054,7 +2086,8 @@ class AgentRelay:
                     branch=report.branch, commit_sha=report.commit_sha,
                     remote_verified=verified and report.status == 'ready',
                     local_check=verification_note,
-                    pending_amendments=pending_count, delegation=delegation, ci=ci)
+                    pending_amendments=pending_count, delegation=delegation, ci=ci,
+                    workspace=workspace)
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
@@ -2066,7 +2099,9 @@ class AgentRelay:
                     'text': (f'Задача #{work_id}: {status_name}. ' +
                              (title[:220] if verified else (message or report.summary)[:380]) +
                              ('\n' + ci_label(ci, report.commit_sha) if ci is not None
-                              and target_status != 'needs_review' else '')),
+                              and target_status != 'needs_review' else '') +
+                             ('\n' + workspace_label(workspace, report.commit_sha)
+                              if workspace is not None and workspace['status'] == 'prepared' else '')),
                 })
             LOG.info('GitHub-задача #%s: %s · итераций %s',
                      work_id, status, rounds)

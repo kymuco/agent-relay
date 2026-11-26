@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from relay_logging import LOG
 from github_ci import ci_record
+from local_workspace import workspace_record
 from work_card_views import (render_work_card, render_work_journal,
                              journal_event, work_keyboard)
 
@@ -76,6 +77,7 @@ _PHASES = {
     "verify": "🔎 Проверяю ветку и коммит",
     "local_test": "🧪 Проверяю код локально",
     "ci": "🧪 Проверяю GitHub Actions",
+    "workspace": "📂 Получаю точный коммит локально",
     "review": "📝 Проверяю итоговый отчёт",
     "completed": "✅ Коммит подтверждён",
     "needs_review": "⚠️ Требуется проверка",
@@ -251,7 +253,8 @@ class WorkProgress:
     def result(self, work_id: int, *, developer_summary: str,
                coordinator_summary: str, repository: str, branch: str,
                commit_sha: str, remote_verified: bool, local_check: str = "",
-               pending_amendments: int = 0, delegation: str = "", ci=None) -> bool:
+               pending_amendments: int = 0, delegation: str = "", ci=None,
+               workspace=None) -> bool:
         """Save trusted worker report and Host verification as separate fields."""
         with self._lock:
             rec = self.record
@@ -271,6 +274,9 @@ class WorkProgress:
             observed = ci_record(ci, commit_sha) if remote_verified is True else None
             if observed is not None:
                 rec["result"]["ci"] = observed
+            prepared = workspace_record(workspace, commit_sha) if remote_verified is True else None
+            if prepared is not None:
+                rec["result"]["workspace"] = prepared
             rec.setdefault("events", []).append(
                 journal_event("review", "Отчёты и результаты сохранены"))
             rec["events"] = rec["events"][-40:]

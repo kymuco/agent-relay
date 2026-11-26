@@ -910,3 +910,22 @@ Failed/incomplete/pending/unavailable/not_run finalize as needs_review while
 preserving the verified commit; not_configured and passed can complete normally.
 No automatic code repair, local fallback, or later refresh is enabled yet.
 Disabled by default for compatibility. Old task records are unchanged.
+
+### NA-06.3 — Local Workspace
+
+Set `WORK_WORKSPACE_ROOT` to an existing dedicated absolute directory outside
+AgentRelay and every configured project checkout; leave empty to disable.
+Requires GitHub work and `WORK_LOCAL_VERIFY=off`. For each verified final SHA,
+Host validates the local clone root and origin, fetches that SHA (not a moving
+branch), and creates a unique detached worktree. It checks HEAD and clean status
+with checkout hooks, external filters, symlink creation and submodule recursion
+disabled for those commands. LFS files remain pointers; submodules are not
+initialized. No project scripts, tests or Codex are launched. The primary
+checkout's branch/index/files are untouched; Git object and worktree metadata
+are shared. Workspace evidence is a snapshot with an ID relative to the root,
+not a guarantee of later directory state or an execution sandbox. A failed
+preparation preserves verified commit/CI and finalizes as needs_review. Stop
+fences subsequent Git commands but may leave partial materialization. No automatic
+cleanup, deletion, reuse, replay, or refresh of historical tasks; the operator
+must manage retained worktrees and disk usage. Existing trusted Git configuration
+and credentials are required; Git credential helpers/transport can still run.

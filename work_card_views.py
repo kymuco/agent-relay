@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from github_ci import ci_label
+from local_workspace import workspace_label
 
 _PHASE_LABELS = {
     "queued": "📥 Поручение принято",
@@ -20,6 +21,7 @@ _PHASE_LABELS = {
     "verify": "🔎 Проверяю ветку и коммит",
     "local_test": "🧪 Проверяю код",
     "ci": "🧪 Проверяю GitHub Actions",
+    "workspace": "📂 Получаю точный коммит локально",
     "review": "📝 Проверяю результат",
     "completed": "✅ Готово",
     "needs_review": "⚠️ Требуется проверка",
@@ -100,7 +102,7 @@ def work_keyboard(work_id: int, detail: bool, result: dict[str, Any],
         {"text": "Журнал", "callback_data": f"wp:j:{int(work_id)}"},
     ]]
     if phase in {"queued", "coordinator", "developer", "revision",
-                 "verify", "local_test", "ci", "review"}:
+                 "verify", "local_test", "ci", "workspace", "review"}:
         if stop_pending:
             rows.append([
                 {"text": "⏹ Да, остановить", "callback_data": f"wp:y:{int(work_id)}"},
@@ -186,6 +188,9 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
         lines.append(_h(ci, 300))
         if detail:
             lines.append("Наблюдение: " + _h(result["ci"]["observed_at"], 40))
+    workspace = workspace_label(result.get("workspace"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
+    if workspace:
+        lines.append(_h(workspace, 300))
     # Each line is independently escaped/closed, so trimming by whole lines
     # cannot break a Telegram HTML tag or entity.
     kept: list[str] = []
@@ -243,4 +248,7 @@ def render_work_journal(record: dict[str, Any]) -> bytes:
     ci = ci_label(result.get("ci"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
     if ci:
         parts.extend(["", ci, "Наблюдение: " + _plain(result["ci"]["observed_at"], 40)])
+    workspace = workspace_label(result.get("workspace"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
+    if workspace:
+        parts.extend(["", workspace])
     return ("\n".join(parts) + "\n").encode("utf-8")
