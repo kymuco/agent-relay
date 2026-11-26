@@ -255,8 +255,10 @@ class CodexRunner:
         python_binary = python_binary.resolve(strict=True)
         prompt = (
             "You are a bounded local coding worker for a human-authorized task. "
-            "Only modify files inside the current project. No git push, merge, "
-            "remote publishing, secret reading, or system configuration. "
+            + ("Read-only mode: do not modify any files or make commits. "
+               if sandbox == "read-only" else
+               "Only modify files inside the current project. ")
+            + "No git push, merge, remote publishing, secret reading, or system configuration. "
             "Do not bypass sandbox restrictions. Return a concise final summary "
             "with changed files, tests run, and uncertainties. "
             "The configured project WORKING DIRECTORY is the repository root. "

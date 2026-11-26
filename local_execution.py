@@ -113,7 +113,8 @@ def execution_label(data: Any, workspace: Any, sha: str) -> str:
 
 
 def run_local_tests(source: Path, root: Path, repo: str, sha: str, workspace: dict,
-                    preset: str, *, timeout: int, permitted: Callable[[], bool]) -> dict | None:
+                    preset: str, *, timeout: int, permitted: Callable[[], bool],
+                    failure_output: list[str] | None = None) -> dict | None:
     from local_codex import _child_environment, _kill_tree
     prepared = workspace_record(workspace, sha)
     if not prepared or prepared["status"] != "prepared" or preset not in _PRESETS:
@@ -164,6 +165,10 @@ def run_local_tests(source: Path, root: Path, repo: str, sha: str, workspace: di
                 if len(raw) > _OUTPUT_LIMIT:
                     return result("output_limit")
                 code = proc.returncode
+                # Transient bounded excerpt only for opted-in diagnostics.
+                # The caller never persists this raw data in task history.
+                if failure_output is not None and code != 0:
+                    failure_output.append(raw[-16000:].decode("utf-8", errors="replace")[-4000:])
                 count = None
                 if preset == "unittest":
                     markers = _MARKER.findall(raw)

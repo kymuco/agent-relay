@@ -950,3 +950,24 @@ termination, bounds captured output, and persists only exit status/count/time,
 not raw logs. This is best-effort process management, not OS isolation; no
 protection against malicious child processes or network/file access. No automatic
 retry, source repair, dependency install, or Codex invocation yet.
+
+### NA-06.5 — Codex Diagnostics
+
+Opt in with `WORK_CODEX_DIAGNOSTICS=demo` (comma-separated subset of aliases
+configured in WORK_LOCAL_TESTS). Requires installed/authenticated Codex CLI.
+The Host invokes Codex at most once after unsuccessful local execution; never
+on success or skipped local execution. `WORK_DIAGNOSTIC_TIMEOUT_SECONDS=180`
+(10–600) bounds the CLI call. Exact clean detached workspace revalidation is
+required before and after diagnostics. The existing CodexRunner uses read-only
+sandbox and never approval; the diagnostic prompt prohibits modifying source,
+rerunning code, installing dependencies, external connectors and network commands.
+These instructions are not independent OS/network isolation. Only opt in for
+trusted repositories and Codex configuration; Codex can process repository
+source and a bounded failure excerpt, which may contain sensitive data despite
+best-effort redaction of known environment secrets. No raw test output is saved
+in task history, cards or console. Structured category/summary/recommendation
+is a model report tied to the failed execution and exact SHA, not evidence of a
+fix. Missing CLI, failure, invalid report or changed workspace preserve the
+original local failure and needs_review. Stop prevents further stages and uses
+existing best-effort Codex process termination. No automated repair, replay,
+new native action, or additional permission is enabled. Disabled by default.

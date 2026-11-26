@@ -13,6 +13,7 @@ from typing import Any
 from github_ci import ci_label
 from local_workspace import workspace_label
 from local_execution import execution_label
+from local_diagnostics import diagnostic_label
 
 _PHASE_LABELS = {
     "queued": "📥 Поручение принято",
@@ -21,6 +22,7 @@ _PHASE_LABELS = {
     "revision": "🔁 Учитываю уточнения",
     "verify": "🔎 Проверяю ветку и коммит",
     "local_test": "🧪 Проверяю код",
+    "diagnostics": "🔎 Codex анализирует ошибку",
     "ci": "🧪 Проверяю GitHub Actions",
     "workspace": "📂 Получаю точный коммит локально",
     "review": "📝 Проверяю результат",
@@ -103,7 +105,7 @@ def work_keyboard(work_id: int, detail: bool, result: dict[str, Any],
         {"text": "Журнал", "callback_data": f"wp:j:{int(work_id)}"},
     ]]
     if phase in {"queued", "coordinator", "developer", "revision",
-                 "verify", "local_test", "ci", "workspace", "review"}:
+                 "verify", "local_test", "ci", "workspace", "diagnostics", "review"}:
         if stop_pending:
             rows.append([
                 {"text": "⏹ Да, остановить", "callback_data": f"wp:y:{int(work_id)}"},
@@ -195,6 +197,11 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
     execution = execution_label(result.get("execution"), result.get("workspace"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
     if execution:
         lines.append(_h(execution, 250))
+    diagnostic = diagnostic_label(result.get("diagnostic"), result.get("execution"),
+                                  result.get("workspace"), result.get("commit_sha", ""),
+                                  detail=detail) if result.get("remote_verified") is True else ""
+    if diagnostic:
+        lines.append(_h(diagnostic, 800 if detail else 150))
     # Each line is independently escaped/closed, so trimming by whole lines
     # cannot break a Telegram HTML tag or entity.
     kept: list[str] = []
@@ -258,4 +265,9 @@ def render_work_journal(record: dict[str, Any]) -> bytes:
     execution = execution_label(result.get("execution"), result.get("workspace"), result.get("commit_sha", "")) if result.get("remote_verified") is True else ""
     if execution:
         parts.extend(["", execution])
+    diagnostic = diagnostic_label(result.get("diagnostic"), result.get("execution"),
+                                  result.get("workspace"), result.get("commit_sha", ""),
+                                  detail=True) if result.get("remote_verified") is True else ""
+    if diagnostic:
+        parts.extend(["", diagnostic])
     return ("\n".join(parts) + "\n").encode("utf-8")

@@ -32,6 +32,8 @@ from capability_registry import catalog_snapshot
 from github_ci import observe_ci, ci_label
 from local_workspace import prepare_workspace, validate_root, workspace_label
 from local_execution import parse_local_tests, should_run_local, run_local_tests, execution_label, python_executable
+from local_diagnostics import (parse_diagnostic_projects, should_diagnose,
+                               diagnose_local_failure, diagnostic_label)
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from action_dispatch import DispatchClaims
 from agent_profile import (namespace_config, profile_directory, profile_log_path,
@@ -149,6 +151,8 @@ class Config:
     work_ci_wait_seconds: int = 60
     work_workspace_root: str = ''
     work_local_tests: str = ''
+    work_codex_diagnostics: str = ''
+    work_diagnostic_timeout_seconds: int = 180
     natural_work_enabled: bool = False
     telegram_rich_mode: str = 'off'
     chat_typing: bool = False
@@ -310,6 +314,8 @@ class Config:
             work_ci_wait_seconds=work_ci_wait,
             work_workspace_root=os.getenv('WORK_WORKSPACE_ROOT', '').strip(),
             work_local_tests=os.getenv('WORK_LOCAL_TESTS', '').strip(),
+            work_codex_diagnostics=os.getenv('WORK_CODEX_DIAGNOSTICS', '').strip(),
+            work_diagnostic_timeout_seconds=int(os.getenv('WORK_DIAGNOSTIC_TIMEOUT_SECONDS', '180')),
             natural_work_enabled=natural_work_enabled,
             telegram_rich_mode=telegram_rich_mode,
             chat_typing=chat_typing,
@@ -589,6 +595,9 @@ class AgentRelay:
             if self.workspace_root is None or config.work_executor != 'github':
                 raise ValueError('WORK_LOCAL_TESTS requires WORK_WORKSPACE_ROOT and GitHub work')
             python_executable()
+        self.diagnostic_projects = parse_diagnostic_projects(config.work_codex_diagnostics, self.local_tests)
+        if not 10 <= config.work_diagnostic_timeout_seconds <= 600:
+            raise ValueError('WORK_DIAGNOSTIC_TIMEOUT_SECONDS must be between 10 and 600')
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
@@ -1905,6 +1914,8 @@ class AgentRelay:
             ci = None
             workspace = None
             execution = None
+            diagnostic = None
+            failure_output = []
             rounds = 0
             for round_no in range(1, self.config.work_max_rounds + 1):
                 if not permitted():
@@ -2051,7 +2062,8 @@ class AgentRelay:
                     self.progress.update(work_id, 'local_test')
                 execution = run_local_tests(
                     self.work_projects[project], self.workspace_root, repo, report.commit_sha,
-                    workspace, preset, timeout=self.config.work_timeout_seconds, permitted=permitted)
+                    workspace, preset, timeout=self.config.work_timeout_seconds, permitted=permitted,
+                    **({'failure_output': failure_output} if project in self.diagnostic_projects else {}))
                 if execution is None or not permitted():
                     return
                 LOG.info('GitHub-задача #%s · local=%s · preset=%s · exit=%s · tests=%s',
@@ -2064,9 +2076,32 @@ class AgentRelay:
                         'local_check': verification_note, 'ci': ci, 'workspace': workspace,
                         'execution': execution}):
                     return
+            if project in self.diagnostic_projects and should_diagnose(execution):
+                stage = 'Codex diagnostics'
+                if self.progress is not None:
+                    self.progress.update(work_id, 'diagnostics')
+                diagnostic = diagnose_local_failure(
+                    self.work_projects[project], self.workspace_root, repo, report.commit_sha,
+                    workspace, execution, failure_output[-1] if failure_output else '',
+                    runner=self.work.runner, timeout=self.config.work_diagnostic_timeout_seconds,
+                    permitted=permitted)
+                failure_output.clear()
+                if diagnostic is None or not permitted():
+                    return
+                LOG.info('GitHub-задача #%s · diagnostics=%s · reason=%s',
+                         work_id, diagnostic['status'], diagnostic['reason'] or '-')
+                if not self.work.checkpoint_result(work_id, {
+                        'delegation': delegation,
+                        'developer_status': report.status, 'repository': report.repository,
+                        'branch': report.branch, 'commit_sha': report.commit_sha,
+                        'developer_summary': report.summary, 'remote_verified': True,
+                        'local_check': verification_note, 'ci': ci, 'workspace': workspace,
+                        'execution': execution, 'diagnostic': diagnostic}):
+                    return
             stage = 'final evidence'
             review_data = json.dumps({
                 'ci': ci, 'workspace': workspace, 'execution': execution,
+                'diagnostic': diagnostic,
                 'delegation': delegation,
                 'developer_status': report.status,
                 'repository': report.repository,
@@ -2123,7 +2158,7 @@ class AgentRelay:
                     remote_verified=verified and report.status == 'ready',
                     local_check=verification_note,
                     pending_amendments=pending_count, delegation=delegation, ci=ci,
-                    workspace=workspace, execution=execution)
+                    workspace=workspace, execution=execution, diagnostic=diagnostic)
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
@@ -2139,7 +2174,9 @@ class AgentRelay:
                              ('\n' + workspace_label(workspace, report.commit_sha)
                               if workspace is not None and workspace['status'] == 'prepared' else '') +
                              ('\n' + execution_label(execution, workspace, report.commit_sha)
-                              if execution is not None else '')),
+                              if execution is not None else '') +
+                             ('\n' + diagnostic_label(diagnostic, execution, workspace, report.commit_sha)
+                              if diagnostic is not None else '')),
                 })
             LOG.info('GitHub-задача #%s: %s · итераций %s',
                      work_id, status, rounds)
