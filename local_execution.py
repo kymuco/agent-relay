@@ -19,7 +19,6 @@ from typing import Any, Callable, Mapping
 from local_workspace import verify_prepared_workspace, workspace_record
 
 _PRESETS = frozenset({"unittest", "pytest"})
-_FALLBACK = frozenset({"not_configured", "not_run", "unavailable"})
 _STATUSES = frozenset({"passed", "failed", "no_tests", "timeout", "output_limit", "unavailable"})
 _OUTPUT_LIMIT = 1024 * 1024
 # Trusted launcher: ensure zero-test unittest discovery cannot return success.
@@ -45,9 +44,6 @@ def parse_local_tests(raw: str, projects: Mapping[str, Path]) -> dict[str, str]:
         result[alias] = preset
     return result
 
-
-def should_run_local(ci: dict | None) -> bool:
-    return ci is None or ci.get("status") in _FALLBACK
 
 
 def python_executable() -> Path:

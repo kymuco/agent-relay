@@ -136,7 +136,9 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
                 branch = app.work.record["branch"]
                 dev.send.return_value = dispatch.response(json.dumps({
                     "status": "ready", "repository": REPO, "branch": branch,
-                    "commit_sha": SHA, "summary": "Developer report"}), "dev")
+                    "commit_sha": SHA, "summary": "Developer report",
+                    "verification": {"route": "local", "reason": "Explicit local smoke test",
+                                     "preset": "unittest"}}), "dev")
                 ci = dict(status="not_configured", commit_sha=SHA, run_count=0, run_ids=[],
                           observed_at=STAMP)
                 def execute(*args, **kwargs):
@@ -157,7 +159,7 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
                 snap = app.work.feedback_snapshot(1)
                 self.assertEqual(snap["status"], "completed" if outcome == "passed" else "needs_review")
                 self.assertEqual(snap["result"]["execution"], observed(outcome))
-                self.assertEqual(snap["result"]["ci"], ci)
+                self.assertNotIn("ci", snap["result"])
                 if expected:
                     self.assertIn("AssertionError: test fixture", codex.call_args.args[1])
                     self.assertEqual(snap["result"]["diagnostic"]["status"], "reported")

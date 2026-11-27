@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from local_codex import normalize_decision_envelope, _unique_json_object, _child_environment
 from relay_logging import LOG
+from verification_routing import parse_plan
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _BRANCH = re.compile(r"^(?!-)(?!.*(?:\.\.|@\{|\\|//|[\x00-\x20~^:?*\[\]]))"
@@ -130,13 +131,14 @@ class DeveloperReport:
     branch: str
     commit_sha: str
     summary: str
+    verification: dict[str, Any] | None = None
 
 
 def parse_developer(text: str, *, expected_repo: str,
                     expected_branch: str | None = None) -> DeveloperReport:
     data = strict_object(text)
     expected = {"status", "repository", "branch", "commit_sha", "summary"}
-    if set(data) != expected or data.get("status") not in ("ready", "blocked"):
+    if set(data) not in (expected, expected | {"verification"}) or data.get("status") not in ("ready", "blocked"):
         raise ValueError("developer report has unexpected fields")
     if data["repository"] != expected_repo:
         raise ValueError("developer report names a different repository")
@@ -150,8 +152,10 @@ def parse_developer(text: str, *, expected_repo: str,
             raise ValueError("developer report has invalid Git identity")
         if expected_branch is not None and data["branch"] != expected_branch:
             raise ValueError("developer returned a different branch than authorized")
-    elif data["branch"] or data["commit_sha"]:
-        raise ValueError("blocked developer may not claim a branch or commit")
+    elif data["branch"] or data["commit_sha"] or "verification" in data:
+        raise ValueError("blocked developer may not claim a branch, commit or verification plan")
+    if "verification" in data:
+        data["verification"] = parse_plan(data["verification"])
     return DeveloperReport(**data)
 
 
@@ -181,7 +185,8 @@ def coordinator_prompt(task: str, *, repo: str, project: str,
 
 def developer_prompt(instruction: str, *, repo: str, work_id: int,
                      previous_sha: str = "", branch: str | None = None,
-                     authorized_task: str = "", human_request: str = "") -> str:
+                     authorized_task: str = "", human_request: str = "",
+                     verification_capabilities: dict | None = None) -> str:
     return (
         "[AgentRelay / GitHub developer worker] The human authorized bounded "
         "development within exactly this GitHub repository: " + repo + ". "
@@ -202,10 +207,27 @@ def developer_prompt(instruction: str, *, repo: str, work_id: int,
         "Return EXACTLY one JSON object with fields status, repository, branch, "
         "commit_sha, summary. Status must be ready (a real commit was verified "
         "from tool feedback) or blocked; blocked requires empty branch and SHA. "
-        "Do not put secrets, raw source text, or full tool output in summary.\n"
+        "For ready, also include verification: one object with route and a concise "
+        "reason (1–600 characters, single line); local/hybrid additionally require "
+        "preset equal to a configured local preset identifier. No other fields. "
+        "Choose cloud if GitHub Actions can satisfy the requested checks; avoid "
+        "local computation and worktrees whenever cloud is sufficient. Choose local "
+        "only for a concrete check that cannot reasonably be satisfied in cloud or "
+        "is explicitly required by the human; choose hybrid only if distinct cloud "
+        "and local checks are both needed. Host defers hybrid local work until CI passes. "
+        "Absence of workflow, temporary CI outage or a slow CI alone is not a reason "
+        "to consume local resources. If no verification is necessary, choose none "
+        "and explain why; never use none to bypass requested or necessary checks. "
+        "If necessary verification is unavailable, choose unavailable and explain. "
+        "Use only the Host-configured capabilities in the JSON below; do not invent "
+        "presets, paths or commands. A plan is a proposal, not permission or evidence. "
+        "For blocked omit verification. Do not change CI workflows unless the human "
+        "authorized that scope. Do not put secrets, raw source text, or full tool output in summary or reason.\n"
         + json.dumps({"work_id": work_id, "repository": repo,
                       "instruction": instruction, "previous_verified_sha": previous_sha,
-                      "authorized_task": authorized_task, "human_request": human_request},
+                      "authorized_task": authorized_task, "human_request": human_request,
+                      "verification_capabilities": verification_capabilities or
+                      {"cloud_ci": False, "local_presets": [], "codex_diagnostics": False}},
                      ensure_ascii=False)
     )
 
@@ -251,6 +273,7 @@ class BackgroundDeveloper:
             previous_sha: str = "", branch: str | None = None,
             human_request: str = "",
             delegation: str = "coordinated",
+            verification_capabilities: dict | None = None,
             on_phase: Callable[[str], None] | None = None) -> DeveloperReport | None:
         if not permitted():
             return None
@@ -276,7 +299,8 @@ class BackgroundDeveloper:
         raw = self._turn("developer", self.developer,
                          developer_prompt(instruction, repo=repo, work_id=work_id,
                                           previous_sha=previous_sha, branch=branch,
-                                          authorized_task=task, human_request=human_request),
+                                          authorized_task=task, human_request=human_request,
+                                          verification_capabilities=verification_capabilities),
                          work_id=work_id)
         if not permitted():
             return None

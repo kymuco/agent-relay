@@ -109,7 +109,8 @@ WRITE_ACTIONS = frozenset(c.action for c in _CAPABILITIES if c.effect == "write"
 
 def catalog_snapshot(*, projects: Mapping[str, str], auto_projects: frozenset[str],
                      executor: str, mode: str, runtime_ready: bool,
-                     work_active: bool, worker_busy: bool = False) -> dict[str, Any]:
+                     work_active: bool, worker_busy: bool = False,
+                     verification_by_project: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Copy safe configuration facts for the current eligible human turn."""
     if mode not in ("off", "observe", "execute"):
         raise ValueError("invalid native action mode")
@@ -133,7 +134,9 @@ def catalog_snapshot(*, projects: Mapping[str, str], auto_projects: frozenset[st
         "mode": mode,
         "execution_enabled": mode == "execute" and runtime_ready and executor == "github" and bool(projects),
         "projects": {alias: {"repository": repo, "write_policy":
-                             "automatic" if alias in auto_projects else "not_auto_enabled"}
+                             "automatic" if alias in auto_projects else "not_auto_enabled",
+                             **({"verification": verification_by_project[alias]}
+                                if verification_by_project and alias in verification_by_project else {})}
                      for alias, repo in sorted(projects.items())} if mode != "off" else {},
         "capabilities": items,
     }

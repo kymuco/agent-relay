@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from local_execution import parse_local_tests, should_run_local, run_local_tests, execution_record
+from local_execution import parse_local_tests, run_local_tests, execution_record
 from work_feedback import result_record
 from work_card_views import render_work_card
 import test_action_bridge as fixtures
@@ -35,11 +35,7 @@ class LocalRunnerTests(unittest.TestCase):
                     "demo=unittest;"):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 parse_local_tests(raw, projects)
-        for state in ("not_configured", "not_run", "unavailable"):
-            self.assertTrue(should_run_local({"status": state}))
-        for state in ("passed", "failed", "pending", "incomplete", "unknown"):
-            self.assertFalse(should_run_local({"status": state}))
-        self.assertTrue(should_run_local(None))
+
 
     def run_fixture(self, source_text=None, *, timeout=10, failure_output=None):
         with tempfile.TemporaryDirectory() as d:
@@ -125,17 +121,24 @@ class LocalRunnerTests(unittest.TestCase):
 
 
 class LocalIntegrationTests(unittest.TestCase):
-    def test_ci_fallback_and_separate_evidence(self):
+    def test_developer_routes_and_separate_evidence(self):
         scenarios = [
-            ("not_configured", "passed", True, "completed"),
-            ("unavailable", "passed", True, "completed"),
-            ("not_configured", "failed", True, "needs_review"),
-            ("passed", "passed", False, "completed"),
-            ("failed", "passed", False, "needs_review"),
-            ("pending", "passed", False, "needs_review"),
+            ("cloud", "not_configured", "passed", False, "needs_review"),
+            ("cloud", "unavailable", "passed", False, "needs_review"),
+            ("cloud", "passed", "passed", False, "completed"),
+            ("cloud", "failed", "passed", False, "needs_review"),
+            ("local", "not_configured", "passed", True, "completed"),
+            ("local", "not_configured", "failed", True, "needs_review"),
+            ("hybrid", "passed", "passed", True, "completed"),
+            ("hybrid", "passed", "failed", True, "needs_review"),
+            ("hybrid", "failed", "passed", False, "needs_review"),
+            ("hybrid", "pending", "passed", False, "needs_review"),
+            ("none", "not_configured", "passed", False, "completed"),
+            ("unavailable", "unavailable", "passed", False, "needs_review"),
+            (None, "not_configured", "passed", False, "needs_review"),
         ]
-        for state, outcome, runs, expected in scenarios:
-            with self.subTest(state=state, outcome=outcome), tempfile.TemporaryDirectory() as d:
+        for route, state, outcome, runs, expected in scenarios:
+            with self.subTest(route=route, state=state, outcome=outcome), tempfile.TemporaryDirectory() as d:
                 base = Path(d).resolve()
                 source, root = base/"source", base/"root"
                 source.mkdir()
@@ -151,24 +154,36 @@ class LocalIntegrationTests(unittest.TestCase):
                     app.process_update(fixture.update())
                     worker = thread.call_args.kwargs["target"]
                 branch = app.work.record["branch"]
-                dev.send.return_value = dispatch.response(json.dumps({
-                    "status": "ready", "repository": REPO, "branch": branch,
-                    "commit_sha": SHA, "summary": "3 tests passed"}), "dev")
+                report = {"status": "ready", "repository": REPO, "branch": branch,
+                          "commit_sha": SHA, "summary": "Developer report"}
+                if route is not None:
+                    plan = {"route": route, "reason": "Test selected verification route"}
+                    if route in ("local", "hybrid"):
+                        plan["preset"] = "unittest"
+                    report["verification"] = plan
+                dev.send.return_value = dispatch.response(json.dumps(report), "dev")
                 ids = [1] if state in ("passed", "failed", "pending") else []
                 ci = dict(status=state, commit_sha=SHA, run_count=len(ids), run_ids=ids,
                           observed_at=STAMP)
                 with patch("agent_relay.verify_remote_branch", return_value=True), \
-                     patch("agent_relay.observe_ci", return_value=ci), \
-                     patch("agent_relay.prepare_workspace", return_value=WORKSPACE), \
+                     patch("agent_relay.observe_ci", return_value=ci) as observe, \
+                     patch("agent_relay.prepare_workspace", return_value=WORKSPACE) as prepare, \
                      patch("agent_relay.run_local_tests", return_value=observed(outcome)) as execute, \
                      patch("local_codex.CodexRunner.run") as codex:
                     worker()
                 self.assertEqual(execute.call_count, int(runs))
+                self.assertEqual(prepare.call_count, int(runs))
+                cloud = route in ("cloud", "hybrid", None)
+                self.assertEqual(observe.call_count, int(cloud))
                 codex.assert_not_called()
                 coord.send.assert_not_called()
                 snap = app.work.feedback_snapshot(1)
                 self.assertEqual(snap["status"], expected)
-                self.assertEqual(snap["result"]["ci"], ci)
+                if cloud:
+                    self.assertEqual(snap["result"]["ci"], ci)
+                else:
+                    self.assertNotIn("ci", snap["result"])
+                self.assertEqual(snap["result"]["verification"]["route"], route or "unspecified")
                 self.assertTrue(snap["result"]["remote_verified"])
                 if runs:
                     self.assertEqual(snap["result"]["execution"], observed(outcome))

@@ -124,7 +124,7 @@ class WorkspaceIntegrationTests(unittest.TestCase):
                 root.mkdir()
                 fixture = dispatch.ExecuteTests()
                 app, api, main, coord, dev = fixture.make_app(
-                    str(source), work_workspace_root=str(root),
+                    str(source), work_workspace_root=str(root), work_local_tests="demo=unittest",
                     work_ci_verify=True, work_ci_wait_seconds=0)
                 main.send.return_value.text = fixtures.trailer(args={
                     "project": "demo", "task": "Add tests", "delegation": "direct"})
@@ -135,14 +135,18 @@ class WorkspaceIntegrationTests(unittest.TestCase):
                 branch = app.work.record["branch"]
                 dev.send.return_value = dispatch.response(json.dumps({
                     "status": "ready", "repository": REPO, "branch": branch,
-                    "commit_sha": SHA, "summary": "3 tests passed"}), "dev")
+                    "commit_sha": SHA, "summary": "3 tests passed",
+                    "verification": {"route": "local", "reason": "Authorized local smoke test",
+                                     "preset": "unittest"}}), "dev")
                 observed = dict(status=outcome, commit_sha=SHA, workspace_id=IDENTITY,
                                 reason="" if outcome == "prepared" else "fetch_failed",
                                 observed_at="2026-11-26T12:00:00+00:00")
                 ci = dict(status="not_configured", commit_sha=SHA, run_count=0, run_ids=[],
                           observed_at="2026-11-26T12:00:00+00:00")
+                from test_local_execution import observed as tested
                 with patch("agent_relay.verify_remote_branch", return_value=True), \
-                     patch("agent_relay.observe_ci", return_value=ci), \
+                     patch("agent_relay.observe_ci", return_value=ci) as observe, \
+                     patch("agent_relay.run_local_tests", return_value=tested()) as execute, \
                      patch("agent_relay.prepare_workspace", return_value=observed) as prepare, \
                      patch("local_codex.CodexRunner.run") as codex, \
                      patch("agent_relay.checkout_verified_commit") as legacy:
@@ -155,7 +159,9 @@ class WorkspaceIntegrationTests(unittest.TestCase):
                 snap = app.work.feedback_snapshot(1)
                 self.assertEqual(snap["status"], "completed" if outcome == "prepared" else "needs_review")
                 self.assertTrue(snap["result"]["remote_verified"])
-                self.assertEqual(snap["result"]["ci"], ci)
+                observe.assert_not_called()
+                self.assertEqual(execute.call_count, int(outcome == "prepared"))
+                self.assertNotIn("ci", snap["result"])
                 self.assertEqual(snap["result"]["workspace"], observed)
                 self.assertEqual(app.progress.record["result"]["workspace"], observed)
 

@@ -14,6 +14,7 @@ from github_ci import ci_label
 from local_workspace import workspace_label
 from local_execution import execution_label
 from local_diagnostics import diagnostic_label
+from verification_routing import verification_label
 
 _PHASE_LABELS = {
     "queued": "📥 Поручение принято",
@@ -202,6 +203,10 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
                                   detail=detail) if result.get("remote_verified") is True else ""
     if diagnostic:
         lines.append(_h(diagnostic, 800 if detail else 150))
+    plan = verification_label(result.get("verification"), result.get("commit_sha", ""),
+                              detail=detail) if result.get("remote_verified") is True else ""
+    if plan:
+        lines.append(_h(plan, 750 if detail else 200))
     # Each line is independently escaped/closed, so trimming by whole lines
     # cannot break a Telegram HTML tag or entity.
     kept: list[str] = []
@@ -270,4 +275,8 @@ def render_work_journal(record: dict[str, Any]) -> bytes:
                                   detail=True) if result.get("remote_verified") is True else ""
     if diagnostic:
         parts.extend(["", diagnostic])
+    plan = verification_label(result.get("verification"), result.get("commit_sha", ""),
+                              detail=True) if result.get("remote_verified") is True else ""
+    if plan:
+        parts.extend(["", plan])
     return ("\n".join(parts) + "\n").encode("utf-8")

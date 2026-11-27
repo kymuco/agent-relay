@@ -31,7 +31,9 @@ from action_policy import Source, evaluate, request_digest, READ_ACTIONS
 from capability_registry import catalog_snapshot
 from github_ci import observe_ci, ci_label
 from local_workspace import prepare_workspace, validate_root, workspace_label
-from local_execution import parse_local_tests, should_run_local, run_local_tests, execution_label, python_executable
+from local_execution import parse_local_tests, run_local_tests, execution_label, python_executable
+from verification_routing import (capabilities as verification_capabilities, admit_plan,
+                                  wants_cloud, wants_local, review_reason, verification_label)
 from local_diagnostics import (parse_diagnostic_projects, should_diagnose,
                                diagnose_local_failure, diagnostic_label)
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
@@ -232,6 +234,8 @@ class Config:
         work_executor = os.getenv('WORK_EXECUTOR', 'codex').strip().lower()
         work_repos = os.getenv('WORK_REPOS', '').strip()
         work_local_verify = os.getenv('WORK_LOCAL_VERIFY', 'off').strip().lower() in ('on', '1', 'true')
+        if work_local_verify:
+            raise ValueError('WORK_LOCAL_VERIFY=on is retired; use WORK_LOCAL_TESTS and Developer verification plans')
         work_ci_mode = os.getenv('WORK_CI_VERIFY', 'off').strip().lower()
         if work_ci_mode not in ('on', 'off'):
             raise ValueError('WORK_CI_VERIFY must be on or off')
@@ -529,6 +533,8 @@ class AgentRelay:
 
     def _initialize(self, config, api, client, coordinator_client, developer_client, image_client):
         self.config = config
+        if config.work_local_verify:
+            raise ValueError('WORK_LOCAL_VERIFY=on is retired; use WORK_LOCAL_TESTS and Developer verification plans')
         if not 0 <= config.work_ci_wait_seconds <= 300:
             raise ValueError('WORK_CI_WAIT_SECONDS must be between 0 and 300')
         if config.work_ci_verify and (not config.work_enabled or config.work_executor != 'github'):
@@ -1148,7 +1154,8 @@ class AgentRelay:
                 executor=self.config.work_executor, mode=self.config.action_mode,
                 runtime_ready=self.work is not None and self._background is not None,
                 work_active=work_facts.get('status') in ('queued', 'running'),
-                worker_busy=self._native_worker_lock.locked())
+                worker_busy=self._native_worker_lock.locked(),
+                verification_by_project={name: self._verification_capabilities(name) for name in projects})
             prompt += action_prompt(action_token, projects, execute=self.action_claims is not None,
                                     catalog=catalog)
         params: dict[str, Any] = {'conversation': self.config.conversation_id}
@@ -1888,6 +1895,13 @@ class AgentRelay:
             return f'Host: задача #{work_id} зарезервирована, но запуск потока не удался.'
         return f'Host: задача #{work_id} принята в фоновую работу ({decision.project}).'
 
+    def _verification_capabilities(self, project: str) -> dict:
+        return verification_capabilities(
+            cloud_enabled=self.config.work_ci_verify,
+            local_preset=self.local_tests.get(project),
+            workspace_enabled=self.workspace_root is not None,
+            diagnostics_enabled=project in self.diagnostic_projects)
+
     def _run_github_work(self, payload: tuple[int, str, str], generation: int,
                          *, branch: str | None = None, human_request: str = '',
                          delegation: str = 'coordinated') -> None:
@@ -1915,6 +1929,7 @@ class AgentRelay:
             workspace = None
             execution = None
             diagnostic = None
+            verification = None
             failure_output = []
             rounds = 0
             for round_no in range(1, self.config.work_max_rounds + 1):
@@ -1934,6 +1949,7 @@ class AgentRelay:
                 report = self._background.run(
                     work_id=work_id, project=project, repo=repo, task=task,
                     previous_sha=previous_sha, permitted=permitted,
+                    verification_capabilities=self._verification_capabilities(project),
                     **({'branch': branch, 'human_request': human_request,
                         'delegation': delegation} if branch else {}),
                     on_phase=(lambda phase: self.progress.update(work_id, phase))
@@ -1941,6 +1957,7 @@ class AgentRelay:
                 if report is None or not permitted():
                     return
                 verified = False  # Never carry verification across a new report.
+                verification = None
                 if report.status != 'ready':
                     verification_note = ('Worker was blocked; new changes were not '
                                          'independently verified.')
@@ -1955,6 +1972,8 @@ class AgentRelay:
                 if previous_sha and report.commit_sha == previous_sha:
                     raise ValueError('Developer claimed a revision without a new commit')
                 previous_sha = report.commit_sha
+                verification = admit_plan(report.verification, report.commit_sha,
+                                          self._verification_capabilities(project))
                 verification_note = 'Remote Git branch and SHA independently verified.'
                 if not permitted():
                     return
@@ -1962,7 +1981,7 @@ class AgentRelay:
                         'developer_status': report.status, 'repository': report.repository,
                         'branch': report.branch, 'commit_sha': report.commit_sha,
                         'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note}):
+                        'local_check': verification_note, 'verification': verification}):
                     return
                 # Capture explicit human amendments only AFTER one worker step.
                 # The final permitted round leaves late changes pending, and
@@ -1991,34 +2010,11 @@ class AgentRelay:
                         'developer_summary': report.summary, 'remote_verified': False,
                         'local_check': verification_note}):
                     return
-            if verified and report.status == 'ready' and self.config.work_local_verify:
-                stage = 'checkout verified branch'
-                checkout_verified_commit(
-                    self.work_projects[project], report.commit_sha, report.branch)
-                if not permitted():
-                    return
-                stage = 'local Codex test verification'
-                if self.progress is not None:
-                    self.progress.update(work_id, 'local_test')
-                test = self.work.runner.run(
-                    self.work_projects[project],
-                    'READ-ONLY verification of the exact checked-out commit ' +
-                    report.commit_sha + '. Do not modify files. Run existing '
-                    'tests if possible; report exact commands and failures. '
-                    'Do not install dependencies, make commits or access the network.',
-                    timeout=self.config.work_timeout_seconds, sandbox='read-only')
-                if not permitted():
-                    return
-                verification_note += ' Codex check: ' + test.summary[:1000]
-                if not self.work.checkpoint_result(work_id, {
-                        'developer_status': report.status, 'repository': report.repository,
-                        'branch': report.branch, 'commit_sha': report.commit_sha,
-                        'developer_summary': report.summary, 'remote_verified': verified,
-                        'local_check': verification_note}):
-                    return
-                if not test.success:
-                    raise RuntimeError('local Codex verification did not complete')
-            if verified and report.status == 'ready' and self.config.work_ci_verify:
+            if verification is not None:
+                LOG.info('GitHub-задача #%s · verification=%s · admission=%s · reason=%s',
+                         work_id, verification['route'], verification['admission'],
+                         verification['admission_reason'] or '-')
+            if verified and report.status == 'ready' and wants_cloud(verification, enabled=self.config.work_ci_verify):
                 stage = 'GitHub CI observation'
                 if self.progress is not None:
                     self.progress.update(work_id, 'ci')
@@ -2033,9 +2029,10 @@ class AgentRelay:
                         'developer_status': report.status, 'repository': report.repository,
                         'branch': report.branch, 'commit_sha': report.commit_sha,
                         'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note, 'ci': ci}):
+                        'local_check': verification_note, 'verification': verification, 'ci': ci}):
                     return
-            if verified and report.status == 'ready' and self.workspace_root is not None:
+            if (verified and report.status == 'ready' and self.workspace_root is not None
+                    and wants_local(verification, ci)):
                 stage = 'local workspace preparation'
                 if self.progress is not None:
                     self.progress.update(work_id, 'workspace')
@@ -2051,12 +2048,13 @@ class AgentRelay:
                         'developer_status': report.status, 'repository': report.repository,
                         'branch': report.branch, 'commit_sha': report.commit_sha,
                         'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note, 'ci': ci, 'workspace': workspace}):
+                        'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace}):
                     return
             preset = self.local_tests.get(project)
             if (verified and report.status == 'ready' and preset
                     and workspace is not None and workspace['status'] == 'prepared'
-                    and should_run_local(ci)):
+                    and wants_local(verification, ci)
+                    and verification['preset'] == preset):
                 stage = 'local test execution'
                 if self.progress is not None:
                     self.progress.update(work_id, 'local_test')
@@ -2073,7 +2071,7 @@ class AgentRelay:
                         'developer_status': report.status, 'repository': report.repository,
                         'branch': report.branch, 'commit_sha': report.commit_sha,
                         'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note, 'ci': ci, 'workspace': workspace,
+                        'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace,
                         'execution': execution}):
                     return
             if project in self.diagnostic_projects and should_diagnose(execution):
@@ -2095,13 +2093,13 @@ class AgentRelay:
                         'developer_status': report.status, 'repository': report.repository,
                         'branch': report.branch, 'commit_sha': report.commit_sha,
                         'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note, 'ci': ci, 'workspace': workspace,
+                        'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace,
                         'execution': execution, 'diagnostic': diagnostic}):
                     return
             stage = 'final evidence'
             review_data = json.dumps({
                 'ci': ci, 'workspace': workspace, 'execution': execution,
-                'diagnostic': diagnostic,
+                'diagnostic': diagnostic, 'verification': verification,
                 'delegation': delegation,
                 'developer_status': report.status,
                 'repository': report.repository,
@@ -2130,11 +2128,10 @@ class AgentRelay:
             title = ('Проверен коммит ' + report.commit_sha[:12] +
                      ' в ' + report.repository + ' · ' + report.branch
                      if target_status == 'completed' else 'Исполнитель не подтвердил новые изменения')
-            if (ci is not None and ci['status'] not in ('passed', 'not_configured')
-                    and not (should_run_local(ci) and execution is not None
-                             and execution['status'] == 'passed')):
+            issue = review_reason(verification, ci, execution)
+            if verified and issue:
                 target_status = 'needs_review'
-                title = 'Коммит подтверждён; ' + ci_label(ci, report.commit_sha)
+                title = 'Коммит подтверждён; проверка требует внимания (' + issue + ')'
             if workspace is not None and workspace['status'] != 'prepared':
                 target_status = 'needs_review'
                 title = 'Коммит подтверждён; ' + workspace_label(workspace, report.commit_sha)
@@ -2158,7 +2155,8 @@ class AgentRelay:
                     remote_verified=verified and report.status == 'ready',
                     local_check=verification_note,
                     pending_amendments=pending_count, delegation=delegation, ci=ci,
-                    workspace=workspace, execution=execution, diagnostic=diagnostic)
+                    workspace=workspace, execution=execution, diagnostic=diagnostic,
+                    verification=verification)
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
@@ -2169,8 +2167,9 @@ class AgentRelay:
                     'chat_id': self.config.chat_id,
                     'text': (f'Задача #{work_id}: {status_name}. ' +
                              (title[:220] if verified else (message or report.summary)[:380]) +
-                             ('\n' + ci_label(ci, report.commit_sha) if ci is not None
-                              and (target_status != 'needs_review' or execution is not None) else '') +
+                             ('\n' + verification_label(verification, report.commit_sha)
+                              if verification is not None else '') +
+                             ('\n' + ci_label(ci, report.commit_sha) if ci is not None else '') +
                              ('\n' + workspace_label(workspace, report.commit_sha)
                               if workspace is not None and workspace['status'] == 'prepared' else '') +
                              ('\n' + execution_label(execution, workspace, report.commit_sha)

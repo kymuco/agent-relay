@@ -114,7 +114,8 @@ class CIIntegrationTests(unittest.TestCase):
                 branch = app.work.record["branch"]
                 dev.send.return_value = dispatch.response(json.dumps({
                     "status": "ready", "repository": REPO, "branch": branch,
-                    "commit_sha": SHA, "summary": "3 tests passed"}), "dev")
+                    "commit_sha": SHA, "summary": "3 tests passed",
+                    "verification": {"route": "cloud", "reason": "CI covers tests"}}), "dev")
                 with patch("agent_relay.verify_remote_branch", return_value=True) as verify, \
                      patch("github_ci._get", return_value=payload(run(branch=branch, conclusion=conclusion))) as get:
                     worker()

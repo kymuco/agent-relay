@@ -971,3 +971,21 @@ fix. Missing CLI, failure, invalid report or changed workspace preserve the
 original local failure and needs_review. Stop prevents further stages and uses
 existing best-effort Codex process termination. No automated repair, replay,
 new native action, or additional permission is enabled. Disabled by default.
+
+### NA-06.5.1 — Intelligent Execution Routing (supersedes automatic local fallback)
+
+Developer receives a per-project configuration catalog and returns a bounded
+verification object with route and reason; local/hybrid also require an exact
+operator-configured preset. Host checks the final verified SHA and independently
+admits the plan. Cloud is preferred; missing workflow, unavailable CI or slow
+CI alone never triggers local preparation or execution. Cloud requires observed
+successful CI; local requires successful local tests, with no cloud claim; hybrid
+requires both, with local deferred until cloud passes. None means Developer
+reports execution unnecessary, not a passed check. Unavailable or denied plans
+require review. For older reports without a plan, only read-only CI observation
+is allowed; if CI is disabled, the legacy completed status means commit-only,
+not verified tests. If enabled and not passed, review is required. No additional
+model call or workflow creation. WORK_LOCAL_VERIFY=on is retired and rejected;
+WORK_WORKSPACE_ROOT and WORK_LOCAL_TESTS now permit but do not trigger local
+execution. All new records separate plan, admission and observed evidence. Local
+presets still execute trusted repository code with the Host user's OS permissions.

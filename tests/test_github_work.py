@@ -252,29 +252,10 @@ class GitHubWorkTests(unittest.TestCase):
                 verify.assert_not_called()
                 self.assertEqual(app.work.record["status"], "stopped")
 
-    def test_optional_local_verification_is_codex_read_only(self):
+    def test_legacy_automatic_local_verification_is_retired(self):
         with tempfile.TemporaryDirectory() as folder:
-            app, api, main, coordinator, developer = self.app(folder, verify=True)
-            coordinator.send.side_effect = [
-                response('{"action":"delegate","instruction":"code"}', "c"),
-                response('{"action":"finish","message":"Reviewed."}', "c"),
-            ]
-            developer.send.return_value = response(
-                '{"status":"ready","repository":"owner/demo",'
-                '"branch":"agentrelay/work-1","commit_sha":"' + "a"*40 +
-                '","summary":"One commit"}', "d")
-            q = Queue()
-            with patch("agent_relay.verify_remote_branch", return_value=True), \
-                 patch("agent_relay.checkout_verified_commit") as checkout, \
-                 patch("local_codex.CodexRunner.run", return_value=CodexResult(
-                     True, "3 tests passed", 0)) as codex:
-                app._handle_work_command(self.message("/work@MyBot start demo Test"), q)
-                deadline = time.monotonic() + 3
-                while time.monotonic() < deadline and app.work.active(1):
-                    time.sleep(0.02)
-                self.assertEqual(app.work.record["status"], "completed")
-                checkout.assert_called_once()
-                self.assertEqual(codex.call_args.kwargs["sandbox"], "read-only")
+            with self.assertRaisesRegex(ValueError, "retired"):
+                self.app(folder, verify=True)
 
 
 if __name__ == "__main__":
