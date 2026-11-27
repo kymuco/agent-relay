@@ -1114,7 +1114,7 @@ its path to the child via AGENTRELAY_ARTIFACT_DIR only for declared outputs.
 Tests should use that variable only if present, and must not write generated
 files into the checkout. After successful execution, Host revalidates the clean
 detached worktree, reads only declared regular single-link files, checks
-size (1–10 MiB per file), computes SHA-256. No directory scan, arbitrary local
+size (1 byte to 10 MiB per file), computes SHA-256. No directory scan, arbitrary local
 path, symlink/reparse point/hardlink retrieval, automatic cleanup or execution
 of artifacts. Final records bind SHA and workspace to successful execution;
 required unavailable outputs need review. Failed and superseded run directories

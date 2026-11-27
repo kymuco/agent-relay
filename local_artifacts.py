@@ -22,7 +22,6 @@ _RESERVED = re.compile(r"(?i)^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)")
 _EXTENSIONS = frozenset((".txt",".md",".csv",".json",".xml",".html",".pdf",".docx",
                          ".xlsx",".pptx",".png",".jpg",".jpeg",".webp",".zip",
                          ".apk",".wav",".ogg",".mp3",".log"))
-_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 def local_filename(value: Any) -> bool:

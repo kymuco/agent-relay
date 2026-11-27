@@ -113,7 +113,7 @@ def merge_required(previous: list[dict], current: list[dict]) -> list[dict]:
             raise ValueError("too many required artifacts across revisions")
         merged = {_request_key(r): r for r in (required + [r for r in merged.values()
                                                      if not r["required"]])[:_MAX]}
-    return list(merged.values())
+    return parse_artifact_requests(list(merged.values()))
 
 
 def _artifact_id(repo: str, sha: str, path: str, source: str = _SOURCE) -> str:
@@ -145,10 +145,11 @@ def _actions_record(request: dict, repo: str, sha: str, *, reason: str = "",
 
 def _local_record(request, repo, sha, *, reason="", metadata=None, workspace=None):
     meta=metadata or {}
-    return {**request, "artifact_id": _artifact_id(repo,sha,request["name"],_LOCAL),
+    wid = workspace["workspace_id"] if workspace and not reason else None
+    return {**request, "artifact_id": _artifact_id(repo,sha,request["name"] + ":" + (wid or ""),_LOCAL),
             "repository":repo,"commit_sha":sha,"filename":request["name"],
             "status":"unavailable" if reason else "available","reason":reason,
-            "workspace_id":workspace["workspace_id"] if workspace and not reason else None,
+            "workspace_id":wid,
             "size":meta.get("size") if not reason else None,
             "sha256":meta.get("sha256") if not reason else None,
             "observed_at":datetime.now(timezone.utc).isoformat(timespec="seconds")}
@@ -299,8 +300,16 @@ def artifact_records(data: Any, repo: str, sha: str) -> list[dict]:
         except (KeyError, ValueError, TypeError):
             return []
         key = _request_key(request)
-        identifier = _artifact_id(repo, sha, key[1], key[0])
-        filename = key[1] + ".zip" if key[0] == _ACTIONS else key[1].rsplit("/", 1)[-1]
+        if key[0] == _LOCAL:
+            wid = item.get("workspace_id")
+            if wid is not None and not isinstance(wid, str):
+                return []
+            identifier = _artifact_id(repo, sha, key[1] + ":" + (wid or ""), _LOCAL)
+            key = (key[0], key[1].casefold())
+        else:
+            identifier = _artifact_id(repo, sha, key[1], key[0])
+        filename = (request["name"] if key[0] == _LOCAL else
+                    key[1] + ".zip" if key[0] == _ACTIONS else key[1].rsplit("/", 1)[-1])
         if (key in seen or item.get("artifact_id") != identifier
                 or item.get("filename") != filename):
             return []
@@ -388,7 +397,8 @@ def withhold_artifacts(records: list[dict]) -> list[dict]:
             if item["source"] == _ACTIONS:
                 result.update(github_artifact_id=None, run_id=None, expires_at=None, created_at=None, digest="")
             elif item["source"] == _LOCAL:
-                result.update(workspace_id=None, sha256=None)
+                result.update(workspace_id=None, sha256=None,
+                              artifact_id=_artifact_id(item["repository"], item["commit_sha"], item["name"] + ":", _LOCAL))
             else:
                 result["git_blob_sha"] = ""
         outputs.append(result)
