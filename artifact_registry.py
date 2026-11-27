@@ -224,6 +224,12 @@ def artifact_records(data: Any, repo: str, sha: str) -> list[dict]:
     return result
 
 
+def withhold_artifacts(records: list[dict]) -> list[dict]:
+    return [dict(item, status='unavailable', reason='verification_incomplete',
+                 git_blob_sha='', size=None) if item['status'] == 'available' else dict(item)
+            for item in records]
+
+
 def artifact_url(record: dict) -> str | None:
     records = artifact_records([record], record.get("repository"), record.get("commit_sha"))
     if not records or records[0]["status"] != "available":

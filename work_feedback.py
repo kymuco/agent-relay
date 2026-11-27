@@ -15,7 +15,7 @@ from local_execution import execution_record, execution_label
 from local_diagnostics import diagnostic_record, diagnostic_label
 from verification_routing import verification_record, verification_label
 from feedback_loop import feedback_record, feedback_label
-from artifact_registry import artifact_records, artifact_label
+from artifact_registry import artifact_records, artifact_label, artifact_url
 
 HISTORY_LIMIT = 30
 TERMINAL = frozenset({"completed", "failed", "stopped", "interrupted", "needs_review"})
@@ -112,6 +112,8 @@ def context_prompt(records: list[dict[str, Any]], projects: Mapping[str, str]) -
             result["developer_summary"] = result["developer_summary"][:650]
             result["coordinator_summary"] = result["coordinator_summary"][:280]
             result["local_check"] = result["local_check"][:240]
+            if result.get("artifacts"):
+                result["artifacts"] = [dict(a, url=artifact_url(a)) for a in result["artifacts"]]
             item["result"] = result
         selected.append(item)
         if len(selected) == 3:

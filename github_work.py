@@ -251,7 +251,7 @@ def developer_prompt(instruction: str, *, repo: str, work_id: int,
            "Inspect the exact existing branch and CI run IDs or the local failure evidence; do not assume a diagnosis is correct. "
            "If the failure is intentional, unrelated, an environment limitation, or no meaningful progress is possible, "
            "make NO changes and return status unchanged, the exact previous SHA and branch, summary explaining why, "
-           "and omit verification. If a repair is necessary, create exactly ONE new commit whose sole parent is "
+           "and omit verification and artifacts. If a repair is necessary, create exactly ONE new commit whose sole parent is "
            "the previous verified SHA, preserving all earlier authorized changes. Never weaken, remove or skip "
            "required verification, alter expected results to hide a bug, or change CI to suppress failures. "
            "Do not fix intentionally failing tests. Compare recent verification observations; if the same failure "

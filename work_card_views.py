@@ -123,10 +123,11 @@ def work_keyboard(work_id: int, detail: bool, result: dict[str, Any],
     link = github_commit_url(result)
     if link:
         rows.append([{"text": "GitHub", "url": link}])
-    for artifact in result_artifacts(result):
-        url = artifact_url(artifact)
-        if url:
-            rows.append([{"text": "📎 " + artifact["filename"][:56], "url": url}])
+    if phase in ("completed", "needs_review"):
+        for artifact in result_artifacts(result):
+            url = artifact_url(artifact)
+            if url:
+                rows.append([{"text": "📎 " + artifact["filename"][:56], "url": url}])
     return {"inline_keyboard": rows}
 
 

@@ -2265,8 +2265,6 @@ class AgentRelay:
                     return
                 LOG.info('GitHub-задача #%s · artifacts=%s · available=%s', work_id,
                          len(artifacts), sum(a['status'] == 'available' for a in artifacts))
-                if not self.work.checkpoint_result(work_id, {**current_evidence(), 'artifacts': artifacts}):
-                    return
             stage = 'final evidence'
             review_data = json.dumps({
                 'ci': ci, 'workspace': workspace, 'execution': execution,
@@ -2324,6 +2322,8 @@ class AgentRelay:
                 return
             final_snapshot = self.work.feedback_snapshot(work_id)
             pending_count = final_snapshot['pending_count'] if final_snapshot else 0
+            if final_snapshot:
+                artifacts = final_snapshot.get('result', {}).get('artifacts', [])
             card_updated = False
             if self.progress is not None:
                 self.progress.result(

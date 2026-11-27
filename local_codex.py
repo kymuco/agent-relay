@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from work_feedback import HISTORY_LIMIT, TERMINAL, result_record, snapshot
+from artifact_registry import artifact_records, withhold_artifacts
 
 _ALIAS = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 _ALLOWED_ENV = {
@@ -418,6 +419,10 @@ class WorkState:
                 note += f"; {len(pending)} уточн. ожидают нового поручения"
             self.record.update(status=real_status, stage=stage, note=note[:350])
             if result is not None:
+                if pending:
+                    result = dict(result)
+                    result["artifacts"] = withhold_artifacts(artifact_records(
+                        result.get("artifacts"), result.get("repository"), result.get("commit_sha")))
                 self.record["result"] = result_record(result, len(pending))
             self._write()
             return real_status
