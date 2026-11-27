@@ -1016,3 +1016,27 @@ still contain sensitive data. Repeated trees are a deterministic no-progress gua
 not a guarantee of semantic progress for every different tree. Local execution
 remains separately opted in. No merge, force push, release, install, or permission
 expansion. No new CI workflows are automatically created.
+
+### NA-06.7.1/2 — Artifact Protocol & GitHub Repository Artifacts
+
+`WORK_ARTIFACT_PROJECTS=demo` opts a configured project into artifact metadata and
+immutable GitHub file links in the configured Telegram group. This is not an
+authorization to share arbitrary repository content or local files. Developer may
+return up to five distinct `artifacts` declarations with source github_repository,
+canonical repository-relative path, required boolean, delivery link. Host uses
+read-only Git commit and tree metadata for the final independently verified SHA;
+no clone, blob download, worktree, execution, redirect, arbitrary URL or write.
+Only regular Git blobs are registered; symlinks, directories and submodules are
+not deliverable. Git blob SHA and size describe the Git object, not a downloaded
+file or resolved Git LFS content. Artifact IDs are deterministic for source,
+repository, commit and path; task state/history associates them with work IDs.
+Required declarations survive repair rounds. Missing required artifacts result
+in needs_review; failed verification withholds locators. Optional unavailable
+items remain visible as limitations. Metadata observations are historical, not
+permanent availability promises. Private repositories may need WORK_CI_TOKEN
+with Contents: read; GitHub links retain normal GitHub access checks. Truncated,
+oversized or unavailable tree metadata fails closed. Registry is retained with
+existing profile-scoped task history (30 prior tasks), no new disk cache.
+Telegram cards, journals and Host result reads expose registered locators. Actual
+byte download, SHA-256 of payload, Actions archives, native CWA files, local
+outputs, and artifact transfer across hosts are later adapters, not implemented.

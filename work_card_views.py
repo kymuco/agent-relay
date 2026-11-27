@@ -16,6 +16,7 @@ from local_execution import execution_label
 from local_diagnostics import diagnostic_label
 from verification_routing import verification_label
 from feedback_loop import feedback_label
+from artifact_registry import result_artifacts, artifact_url, artifact_label
 
 _PHASE_LABELS = {
     "queued": "📥 Поручение принято",
@@ -23,6 +24,7 @@ _PHASE_LABELS = {
     "developer": "💻 Разработчик работает с GitHub",
     "revision": "🔁 Учитываю уточнения",
     "feedback": "🔁 Developer анализирует сбой",
+    "artifacts": "📦 Проверяю артефакты",
     "verify": "🔎 Проверяю ветку и коммит",
     "local_test": "🧪 Проверяю код",
     "diagnostics": "🔎 Codex анализирует ошибку",
@@ -108,7 +110,7 @@ def work_keyboard(work_id: int, detail: bool, result: dict[str, Any],
         {"text": "Журнал", "callback_data": f"wp:j:{int(work_id)}"},
     ]]
     if phase in {"queued", "coordinator", "developer", "revision",
-                 "verify", "local_test", "ci", "workspace", "diagnostics", "feedback", "review"}:
+                 "verify", "local_test", "ci", "workspace", "diagnostics", "feedback", "artifacts", "review"}:
         if stop_pending:
             rows.append([
                 {"text": "⏹ Да, остановить", "callback_data": f"wp:y:{int(work_id)}"},
@@ -121,6 +123,10 @@ def work_keyboard(work_id: int, detail: bool, result: dict[str, Any],
     link = github_commit_url(result)
     if link:
         rows.append([{"text": "GitHub", "url": link}])
+    for artifact in result_artifacts(result):
+        url = artifact_url(artifact)
+        if url:
+            rows.append([{"text": "📎 " + artifact["filename"][:56], "url": url}])
     return {"inline_keyboard": rows}
 
 
@@ -136,7 +142,8 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
         result = {}
     worker = _plain(result.get("developer_summary", ""), 2200)
     tests = _worker_test_count(worker)
-    files = _files(worker)
+    outputs = result_artifacts(result)
+    files = [] if outputs else _files(worker)
     name = _h(record.get("agent_name"), 40)
     owner = f" · {name}" if name else ""
     lines = [f"<b>Задача #{work_id} · {project}{owner}</b>", _PHASE_LABELS[phase], "",
@@ -213,6 +220,9 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
                               detail=detail) if result.get("remote_verified") is True else ""
     if feedback:
         lines.append(_h(feedback, 800 if detail else 200))
+    if outputs:
+        lines.extend(["", "<b>Артефакты (метаданные GitHub):</b>"])
+        lines.extend(_h(artifact_label(item), 250) for item in outputs)
     # Each line is independently escaped/closed, so trimming by whole lines
     # cannot break a Telegram HTML tag or entity.
     kept: list[str] = []
@@ -289,4 +299,8 @@ def render_work_journal(record: dict[str, Any]) -> bytes:
                               detail=True) if result.get("remote_verified") is True else ""
     if feedback:
         parts.extend(["", feedback])
+    outputs = result_artifacts(result)
+    if outputs:
+        parts.extend(["", "Артефакты (метаданные, не скачанные файлы):"])
+        parts.extend(artifact_label(item, include_url=True) for item in outputs)
     return ("\n".join(parts) + "\n").encode("utf-8")

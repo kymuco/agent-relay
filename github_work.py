@@ -18,6 +18,7 @@ from typing import Any, Callable
 from local_codex import normalize_decision_envelope, _unique_json_object, _child_environment
 from relay_logging import LOG
 from verification_routing import parse_plan
+from artifact_registry import parse_artifact_requests
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _BRANCH = re.compile(r"^(?!-)(?!.*(?:\.\.|@\{|\\|//|[\x00-\x20~^:?*\[\]]))"
@@ -132,6 +133,7 @@ class DeveloperReport:
     commit_sha: str
     summary: str
     verification: dict[str, Any] | None = None
+    artifacts: list[dict] | None = None
 
 
 def parse_developer(text: str, *, expected_repo: str,
@@ -140,7 +142,8 @@ def parse_developer(text: str, *, expected_repo: str,
     data = strict_object(text)
     expected = {"status", "repository", "branch", "commit_sha", "summary"}
     statuses = ("ready", "blocked", "unchanged") if feedback_sha else ("ready", "blocked")
-    if set(data) not in (expected, expected | {"verification"}) or data.get("status") not in statuses:
+    if (not expected <= set(data) or set(data) - expected - {"verification", "artifacts"}
+            or data.get("status") not in statuses):
         raise ValueError("developer report has unexpected fields")
     if data["repository"] != expected_repo:
         raise ValueError("developer report names a different repository")
@@ -162,6 +165,10 @@ def parse_developer(text: str, *, expected_repo: str,
         raise ValueError("blocked developer may not claim a branch, commit or verification plan")
     if "verification" in data:
         data["verification"] = parse_plan(data["verification"])
+    if "artifacts" in data:
+        if data["status"] != "ready":
+            raise ValueError("only ready reports may declare artifacts")
+        data["artifacts"] = parse_artifact_requests(data["artifacts"])
     return DeveloperReport(**data)
 
 
@@ -216,7 +223,16 @@ def developer_prompt(instruction: str, *, repo: str, work_id: int,
         "from tool feedback) or blocked; blocked requires empty branch and SHA. "
         "For ready, also include verification: one object with route and a concise "
         "reason (1–600 characters, single line); local/hybrid additionally require "
-        "preset equal to a configured local preset identifier. No other fields. "
+        "preset equal to a configured local preset identifier. "
+        "If the Host advertises github_repository in artifact_sources, optionally include artifacts: "
+        "an array of at most five distinct objects, each exactly {source: github_repository, "
+        "path: canonical repository-relative file path, required: boolean, delivery: link}. "
+        "Declare only actual output files relevant to the original human task, not credentials, "
+        "unrelated inputs, symlinks, directories, URLs, or speculative outputs. "
+        "Mark user-requested deliverables required; preserve required outputs in later repairs. "
+        "Host checks metadata at the final verified SHA and provides immutable links, not downloaded bytes. "
+        "If an artifact source is unavailable, explain the limitation in summary, never invent a file. "
+        "No other fields. "
         "Choose cloud if GitHub Actions can satisfy the requested checks; avoid "
         "local computation and worktrees whenever cloud is sufficient. Choose local "
         "only for a concrete check that cannot reasonably be satisfied in cloud or "

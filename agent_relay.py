@@ -37,6 +37,8 @@ from verification_routing import (capabilities as verification_capabilities, adm
 from local_diagnostics import (parse_diagnostic_projects, should_diagnose,
                                diagnose_local_failure, diagnostic_label)
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
+from artifact_registry import (parse_artifact_projects, merge_required, register_artifacts,
+                               artifact_label)
 from feedback_loop import (parse_feedback_projects, read_commit_identity, repairable,
                            preserves_checks, feedback_context, feedback_label)
 from action_dispatch import DispatchClaims
@@ -157,6 +159,7 @@ class Config:
     work_local_tests: str = ''
     work_codex_diagnostics: str = ''
     work_feedback_projects: str = ''
+    work_artifact_projects: str = ''
     work_diagnostic_timeout_seconds: int = 180
     natural_work_enabled: bool = False
     telegram_rich_mode: str = 'off'
@@ -323,6 +326,7 @@ class Config:
             work_local_tests=os.getenv('WORK_LOCAL_TESTS', '').strip(),
             work_codex_diagnostics=os.getenv('WORK_CODEX_DIAGNOSTICS', '').strip(),
             work_feedback_projects=os.getenv('WORK_FEEDBACK_PROJECTS', '').strip(),
+            work_artifact_projects=os.getenv('WORK_ARTIFACT_PROJECTS', '').strip(),
             work_diagnostic_timeout_seconds=int(os.getenv('WORK_DIAGNOSTIC_TIMEOUT_SECONDS', '180')),
             natural_work_enabled=natural_work_enabled,
             telegram_rich_mode=telegram_rich_mode,
@@ -612,6 +616,8 @@ class AgentRelay:
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
         self.feedback_projects = parse_feedback_projects(config.work_feedback_projects, {
+            alias: repo for alias, repo in self.work_repos.items() if alias in self.work_projects})
+        self.artifact_projects = parse_artifact_projects(config.work_artifact_projects, {
             alias: repo for alias, repo in self.work_repos.items() if alias in self.work_projects})
         if config.action_mode != 'off' and not config.action_auto_projects.issubset(
                 set(self.work_projects) & set(self.work_repos)):
@@ -1907,7 +1913,8 @@ class AgentRelay:
             local_preset=self.local_tests.get(project),
             workspace_enabled=self.workspace_root is not None,
             diagnostics_enabled=project in self.diagnostic_projects) | {
-                'autonomous_feedback': project in self.feedback_projects}
+                'autonomous_feedback': project in self.feedback_projects,
+                'artifact_sources': ['github_repository'] if project in self.artifact_projects else []}
 
     def _run_github_work(self, payload: tuple[int, str, str], generation: int,
                          *, branch: str | None = None, human_request: str = '',
@@ -1931,6 +1938,8 @@ class AgentRelay:
             task = original_task
             authorized_amendments = []
             feedback_enabled = project in self.feedback_projects
+            artifact_requests = []
+            artifacts = []
             feedback = None
             feedback_commits = []
             feedback_observations = []
@@ -1987,6 +1996,7 @@ class AgentRelay:
                 if previous_sha and report.commit_sha == previous_sha:
                     raise ValueError('Developer claimed a revision without a new commit')
                 previous_sha = report.commit_sha
+                artifact_requests = merge_required(artifact_requests, report.artifacts or [])
                 verification = admit_plan(report.verification, report.commit_sha,
                                           self._verification_capabilities(project))
                 verification_note = 'Remote Git branch and SHA independently verified.'
@@ -2163,6 +2173,7 @@ class AgentRelay:
                 if not save_feedback('evaluating'):
                     return
                 context = feedback_context(current_evidence(), excerpt)
+                context['artifact_requests'] = artifact_requests
                 rounds += 1
                 if not self.work.update(work_id, 'running', rounds, note='Developer анализирует результат проверки'):
                     return
@@ -2220,6 +2231,7 @@ class AgentRelay:
                 next_plan = admit_plan(candidate.verification, candidate.commit_sha,
                                        self._verification_capabilities(project))
                 old_plan = verification
+                artifact_requests = merge_required(artifact_requests, candidate.artifacts or [])
                 report, identity, verification = candidate, next_identity, next_plan
                 seen_trees.add(identity['tree'])
                 feedback_commits.append(report.commit_sha)
@@ -2240,10 +2252,26 @@ class AgentRelay:
                     break
                 # No numeric iteration ceiling. The next round verifies the new
                 # commit exactly once, and only confirmed failure may continue.
+            if verified and report.status == 'ready' and artifact_requests:
+                stage = 'artifact registration'
+                if self.progress is not None:
+                    self.progress.update(work_id, 'artifacts')
+                artifacts = register_artifacts(
+                    artifact_requests, repo, report.commit_sha,
+                    enabled=project in self.artifact_projects,
+                    verified_final=not (feedback_issue or review_reason(verification, ci, execution)
+                                        or self.work.pending_snapshot()), permitted=permitted)
+                if artifacts is None or not permitted():
+                    return
+                LOG.info('GitHub-задача #%s · artifacts=%s · available=%s', work_id,
+                         len(artifacts), sum(a['status'] == 'available' for a in artifacts))
+                if not self.work.checkpoint_result(work_id, {**current_evidence(), 'artifacts': artifacts}):
+                    return
             stage = 'final evidence'
             review_data = json.dumps({
                 'ci': ci, 'workspace': workspace, 'execution': execution,
                 'diagnostic': diagnostic, 'verification': verification, 'feedback': feedback,
+                'artifacts': artifacts,
                 'delegation': delegation,
                 'developer_status': report.status,
                 'repository': report.repository,
@@ -2285,6 +2313,9 @@ class AgentRelay:
             if feedback_issue:
                 target_status = 'needs_review'
                 title = 'Коммит подтверждён ранее; Feedback Loop: ' + feedback_issue
+            if verified and any(a['required'] and a['status'] != 'available' for a in artifacts):
+                target_status = 'needs_review'
+                title = 'Коммит подтверждён; обязательные артефакты недоступны'
             evidence = json.loads(review_data)
             evidence['coordinator_summary'] = message
             status = self.control.admit(generation, lambda: self.work.finalize(
@@ -2303,7 +2334,7 @@ class AgentRelay:
                     local_check=verification_note,
                     pending_amendments=pending_count, delegation=delegation, ci=ci,
                     workspace=workspace, execution=execution, diagnostic=diagnostic,
-                    verification=verification, feedback=feedback)
+                    verification=verification, feedback=feedback, artifacts=artifacts)
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
@@ -2324,7 +2355,8 @@ class AgentRelay:
                              ('\n' + diagnostic_label(diagnostic, execution, workspace, report.commit_sha)
                               if diagnostic is not None else '') +
                              ('\n' + feedback_label(feedback, report.commit_sha)
-                              if feedback is not None else '')),
+                              if feedback is not None else '') +
+                             ''.join('\n' + artifact_label(a, include_url=True) for a in artifacts))[:3900],
                 })
             LOG.info('GitHub-задача #%s: %s · итераций %s',
                      work_id, status, rounds)

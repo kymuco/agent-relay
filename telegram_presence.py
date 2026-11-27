@@ -20,6 +20,7 @@ from local_execution import execution_record
 from local_diagnostics import diagnostic_record
 from verification_routing import verification_record
 from feedback_loop import feedback_record
+from artifact_registry import artifact_records
 from work_card_views import (render_work_card, render_work_journal,
                              journal_event, work_keyboard)
 
@@ -79,6 +80,7 @@ _PHASES = {
     "developer": "💻 Разработчик работает с GitHub",
     "revision": "🔁 Передаю уточнения",
     "feedback": "🔁 Developer анализирует сбой",
+    "artifacts": "📦 Проверяю артефакты",
     "verify": "🔎 Проверяю ветку и коммит",
     "local_test": "🧪 Проверяю код локально",
     "diagnostics": "🔎 Codex анализирует ошибку",
@@ -260,7 +262,8 @@ class WorkProgress:
                coordinator_summary: str, repository: str, branch: str,
                commit_sha: str, remote_verified: bool, local_check: str = "",
                pending_amendments: int = 0, delegation: str = "", ci=None,
-               workspace=None, execution=None, diagnostic=None, verification=None, feedback=None) -> bool:
+               workspace=None, execution=None, diagnostic=None, verification=None, feedback=None,
+               artifacts=None) -> bool:
         """Save trusted worker report and Host verification as separate fields."""
         with self._lock:
             rec = self.record
@@ -295,6 +298,9 @@ class WorkProgress:
             loop = feedback_record(feedback, commit_sha) if remote_verified is True else None
             if loop is not None:
                 rec["result"]["feedback"] = loop
+            outputs = artifact_records(artifacts, repository, commit_sha) if remote_verified is True else []
+            if outputs:
+                rec["result"]["artifacts"] = outputs
             rec.setdefault("events", []).append(
                 journal_event("review", "Отчёты и результаты сохранены"))
             rec["events"] = rec["events"][-40:]

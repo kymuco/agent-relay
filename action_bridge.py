@@ -51,6 +51,8 @@ def action_prompt(token: str, projects: Mapping[str, str], *, execute: bool = Fa
         "known acceptance criteria; choose coordinated for complex or multi-stage work "
         "needing independent planning/review. If scope is unclear, ask the human. "
         "Both routes use identical Host admission and isolated branch verification. "
+        "For requested output files preserve the deliverable in the delegated task. "
+        "Only advertise artifact sources listed in the project catalog; do not promise downloaded files. "
         "Developer chooses verification (cloud/local/hybrid/none/unavailable); "
         "Host admits only configured capabilities. Local resources are not automatic "
         "fallback for missing CI. Do not promise local execution or bypass human scope.\n"
