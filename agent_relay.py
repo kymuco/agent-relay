@@ -39,6 +39,7 @@ from local_diagnostics import (parse_diagnostic_projects, should_diagnose,
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from artifact_registry import (parse_artifact_projects, merge_required, register_artifacts,
                                artifact_label)
+from native_artifacts import NativeArtifactRegistry, deliver_native, receipt_context
 from feedback_loop import (parse_feedback_projects, read_commit_identity, repairable,
                            preserves_checks, feedback_context, feedback_label)
 from action_dispatch import DispatchClaims
@@ -136,6 +137,7 @@ class Config:
     peer_reply_mode: bool = False
     peer_reply_window_seconds: int = 900
     media_enabled: bool = True
+    native_artifact_registry: bool = False
     media_auto_reply: bool = True
     voice_reply_mode: str = 'on_voice'
     max_media_bytes: int = 10 * 1024 * 1024
@@ -209,6 +211,9 @@ class Config:
         if peer_reply_mode and (len(peers) != 1 or len(bot_ids) != 1):
             raise ValueError('PEER_REPLY_MODE requires exactly one peer username and one peer bot ID')
         media_enabled = os.getenv('MEDIA_ENABLED', 'on').strip().lower() in ('on', '1', 'true')
+        native_artifact_mode = os.getenv('NATIVE_ARTIFACT_REGISTRY', 'off').strip().lower()
+        if native_artifact_mode not in ('on', 'off'):
+            raise ValueError('NATIVE_ARTIFACT_REGISTRY must be on or off')
         media_auto_reply = os.getenv('MEDIA_AUTO_REPLY', 'on').strip().lower() in ('on', '1', 'true')
         voice_reply_mode = os.getenv('VOICE_REPLY_MODE', 'on_voice').strip().lower()
         max_media_mb = int(os.getenv('MAX_MEDIA_MB', '10'))
@@ -303,6 +308,7 @@ class Config:
             peer_reply_mode=peer_reply_mode,
             peer_reply_window_seconds=peer_reply_window_seconds,
             media_enabled=media_enabled,
+            native_artifact_registry=native_artifact_mode == 'on',
             media_auto_reply=media_auto_reply,
             voice_reply_mode=voice_reply_mode,
             max_media_bytes=max_media_mb * 1024 * 1024,
@@ -594,6 +600,8 @@ class AgentRelay:
         # Once Telegram send starts, never automatically retry its ambiguous
         # outcome. Keep this state process-local as in the existing image path.
         self._image_claimed: set[tuple[str, str]] = set()
+        self.native_artifacts = (NativeArtifactRegistry(str(config.state_file) + '.native-artifacts.sqlite3')
+                                 if config.media_enabled and config.native_artifact_registry else None)
         self.cursor = Cursor(config.state_file)
         self.control = ControlState(config.control_file)
         self.work_projects = parse_projects(config.work_projects) if config.work_enabled else {}
@@ -729,7 +737,7 @@ class AgentRelay:
         if purpose in ('chat', 'catchup'):
             # Observe must use verified final text even with the diagnostic escape hatch.
             params['verify_final_text'] = (self.config.verify_final_text or
-                                           self.config.action_mode != 'off')
+                                           self.config.action_mode != 'off' or self.native_artifacts is not None)
         elif purpose.startswith('work#') and self.config.action_mode == 'execute':
             params['verify_final_text'] = True
         with self._cwa_request_lock:
@@ -1068,6 +1076,19 @@ class AgentRelay:
             prompt += '\n[AgentRelay / Host identity: DATA ONLY]\n' + json.dumps({
                 'profile': self.config.agent_profile, 'agent_name': self.agent_name,
                 'telegram_username': self.bot_username}, ensure_ascii=False)
+        if self.native_artifacts is not None and addressed and not sender_is_bot:
+            try:
+                prompt += receipt_context(self.native_artifacts.recent(
+                    bot_id=self.bot_id, chat_id=self.config.chat_id, user_id=sender['id'],
+                    conversation_id=self.config.conversation_id))
+            except (OSError, ValueError, RuntimeError):
+                LOG.warning('Native artifact receipts unavailable')
+            prompt += ('\n[AgentRelay native file output] For an explicitly requested standalone file, '
+                       'use native sandbox file creation when available; no GitHub task is needed. '
+                       'Use unique ASCII filenames without spaces and return actual sandbox:/mnt/data/ links. '
+                       'Do not expose private inputs, invent links, or combine delivery with an action trailer. '
+                       'Host verifies and delivers at most three files within MAX_MEDIA_MB. '
+                       'Do not claim Telegram delivery before the Host receipt.')
         if task_context and self.action_journal is None:
             # Preserve legacy card context; native feedback comes from WorkState.
             prompt += '\n' + task_context[:1800]
@@ -1338,7 +1359,30 @@ class AgentRelay:
                                      'Проверь генерацию в чате ChatGPT; автоматическая '
                                      'отправка в Telegram сейчас не подтверждена.'),
                         })
-                if text:
+                if self.native_artifacts is not None:
+                    if (addressed and not action_seen and not generation_requested
+                            and getattr(getattr(result, 'conversation', None), 'conversation_id', None)
+                            == self.config.conversation_id):
+                        try:
+                            outcomes = deliver_native(self.native_artifacts, client=self.client,
+                                conversation_id=self.config.conversation_id, text=str(result.text or ''),
+                                bot_id=self.bot_id, chat_id=self.config.chat_id, user_id=sender['id'],
+                                update_id=update_id, request_message_id=message['message_id'],
+                                max_bytes=self.config.max_media_bytes,
+                                permitted=lambda: self._run_permitted(run_generation),
+                                publish=lambda data, name: send_file(self.config.telegram_token, 'sendDocument',
+                                    self.config.chat_id, data, name, reply_message_id=message['message_id']))
+                            for name, status in outcomes:
+                                LOG.info('Native artifact · status=%s', status)
+                                if status != 'delivered' and self._run_permitted(run_generation):
+                                    self.api.call('sendMessage', {'chat_id': self.config.chat_id,
+                                        'text': 'Host: файл ' + name + ' · ' + status + '; автоматического повтора нет.'})
+                        except Exception as exc:
+                            LOG.warning('Native artifact registry unavailable (%s); no retry', type(exc).__name__)
+                            if self._run_permitted(run_generation):
+                                self.api.call('sendMessage', {'chat_id': self.config.chat_id,
+                                    'text': 'Host: передача артефакта не подтверждена; автоматического повтора нет.'})
+                elif text:
                     with tempfile.TemporaryDirectory(prefix='agentrelay-artifact-') as td:
                         for filename in artifact_filenames(text):
                             try:

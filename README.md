@@ -1061,3 +1061,26 @@ revoked automatically. No archive download/extraction or inspection of files
 inside an archive; no guarantee of continued availability or contents. Private
 repos may require Actions: read on WORK_CI_TOKEN. Required declarations survive
 feedback revisions by source+locator. Repo artifact links remain compatible.
+
+### NA-06.7.4 — Native ChatGPT Artifacts
+
+`NATIVE_ARTIFACT_REGISTRY=on` with `MEDIA_ENABLED=on` enables native CWA
+artifact receipts in ordinary explicitly addressed human chat turns. Native files
+are independent of GitHub jobs, with source cwa_native and turn identity instead
+of a commit SHA. Use actual sandbox links with unique ASCII basenames. Existing
+CWA PR14.0 handoff is reused; Host checks returned conversation, filename, size,
+SHA-256 and destination before sending bytes through existing Telegram transport.
+Supports DOCX, XLSX, PPTX, PDF, ZIP and existing text/image extensions; up to
+three files per turn within MAX_MEDIA_MB (1–10 MiB). No native delivery from
+peer, catchup or action-trailer turns; image generation monitor remains separate.
+CWA resolves a unique conversation-owned filename, not a per-message file ID:
+this is not proof of which exact model message created the file. Reuse of names
+can fail closed; ask for unique names. Canonical final text is required in opt-in
+mode. Durable SQLite receipts beside the profile cursor record claims before
+retrieval and send, byte evidence and Telegram message ID on acknowledgement.
+No payload cache, signed URL, product file ID, credentials or absolute path in
+receipts. No automatic retry or replay, even after interruption. Recent five
+receipts are supplied only to the same human in the same bot/group/conversation.
+Claim history is retained without automatic cleanup. This increment does not
+integrate native creation into background Developer jobs or implement manual
+resend / cross-host artifact transfer. When disabled, legacy media behavior stays.

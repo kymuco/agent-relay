@@ -23,7 +23,7 @@ MAX_TEXT_CHARS = 60000
 MAX_VOICE_REPLY_CHARS = 2500
 TEXT_EXTS = frozenset({'.txt', '.py', '.md', '.json', '.csv', '.log', '.yaml', '.yml',
                        '.js', '.ts', '.html', '.css', '.xml', '.toml', '.ini', '.sql', '.sh', '.ps1'})
-ARTIFACT_EXTS = TEXT_EXTS | {'.pdf', '.png', '.jpg', '.jpeg', '.webp', '.zip', '.docx'}
+ARTIFACT_EXTS = TEXT_EXTS | {'.pdf', '.png', '.jpg', '.jpeg', '.webp', '.zip', '.docx', '.xlsx', '.pptx'}
 INBOUND_DOCUMENT_EXTS = TEXT_EXTS | {'.pdf', '.docx', '.png', '.jpeg', '.jpg', '.webp'}
 UNSUPPORTED_MEDIA_KINDS = ('animation', 'video', 'video_note', 'sticker', 'audio')
 _FILENAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_. -]{0,119}$')
