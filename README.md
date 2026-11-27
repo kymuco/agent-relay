@@ -989,3 +989,29 @@ model call or workflow creation. WORK_LOCAL_VERIFY=on is retired and rejected;
 WORK_WORKSPACE_ROOT and WORK_LOCAL_TESTS now permit but do not trigger local
 execution. All new records separate plan, admission and observed evidence. Local
 presets still execute trusted repository code with the Host user's OS permissions.
+
+### NA-06.6 — Autonomous Feedback Loop
+
+`WORK_FEEDBACK_PROJECTS=demo` enables automatic repair for configured GitHub
+project aliases. No fixed repair iteration cap; WORK_MAX_ROUNDS still controls
+legacy Codex and initial human-amendment handling, not autonomous repairs.
+A confirmed CI failure or local failed/no-tests result can trigger one new
+Developer turn with the exact prior evidence, original human scope and earlier
+amendments. Developer may return unchanged (intentional failure, unrelated issue,
+no meaningful progress), blocked, or a new commit. No coordinator call per repair.
+Pending/missing/unavailable checks and ambiguous tool responses never auto-retry.
+Each new commit must have the previous SHA as its sole parent, with a source tree
+not previously seen in this repair loop. Independent read-only GitHub Git commit
+metadata is required (public repository or WORK_CI_TOKEN with Contents: read).
+No local checkout to verify ancestry. Required checks may not be weakened; an
+unadmitted or weakened plan stops without further execution. On identity failure
+or repeated tree, the prior historical verified SHA is retained; the branch may
+have moved. Stop, shutdown, and interrupted tasks fence further calls, no replay.
+Late human amendments remain queued for review rather than silently applied by
+repair. Up to 12 recent verified SHAs and attempt count are retained in feedback
+records; full commit history stays in the branch. No raw test logs are persisted;
+opt-in permits bounded redacted failure context to be sent to Developer, which may
+still contain sensitive data. Repeated trees are a deterministic no-progress guard,
+not a guarantee of semantic progress for every different tree. Local execution
+remains separately opted in. No merge, force push, release, install, or permission
+expansion. No new CI workflows are automatically created.

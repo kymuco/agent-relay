@@ -15,12 +15,14 @@ from local_workspace import workspace_label
 from local_execution import execution_label
 from local_diagnostics import diagnostic_label
 from verification_routing import verification_label
+from feedback_loop import feedback_label
 
 _PHASE_LABELS = {
     "queued": "📥 Поручение принято",
     "coordinator": "🧠 Составляю план",
     "developer": "💻 Разработчик работает с GitHub",
     "revision": "🔁 Учитываю уточнения",
+    "feedback": "🔁 Developer анализирует сбой",
     "verify": "🔎 Проверяю ветку и коммит",
     "local_test": "🧪 Проверяю код",
     "diagnostics": "🔎 Codex анализирует ошибку",
@@ -106,7 +108,7 @@ def work_keyboard(work_id: int, detail: bool, result: dict[str, Any],
         {"text": "Журнал", "callback_data": f"wp:j:{int(work_id)}"},
     ]]
     if phase in {"queued", "coordinator", "developer", "revision",
-                 "verify", "local_test", "ci", "workspace", "diagnostics", "review"}:
+                 "verify", "local_test", "ci", "workspace", "diagnostics", "feedback", "review"}:
         if stop_pending:
             rows.append([
                 {"text": "⏹ Да, остановить", "callback_data": f"wp:y:{int(work_id)}"},
@@ -207,6 +209,10 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
                               detail=detail) if result.get("remote_verified") is True else ""
     if plan:
         lines.append(_h(plan, 750 if detail else 200))
+    feedback = feedback_label(result.get("feedback"), result.get("commit_sha", ""),
+                              detail=detail) if result.get("remote_verified") is True else ""
+    if feedback:
+        lines.append(_h(feedback, 800 if detail else 200))
     # Each line is independently escaped/closed, so trimming by whole lines
     # cannot break a Telegram HTML tag or entity.
     kept: list[str] = []
@@ -279,4 +285,8 @@ def render_work_journal(record: dict[str, Any]) -> bytes:
                               detail=True) if result.get("remote_verified") is True else ""
     if plan:
         parts.extend(["", plan])
+    feedback = feedback_label(result.get("feedback"), result.get("commit_sha", ""),
+                              detail=True) if result.get("remote_verified") is True else ""
+    if feedback:
+        parts.extend(["", feedback])
     return ("\n".join(parts) + "\n").encode("utf-8")

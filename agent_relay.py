@@ -37,6 +37,8 @@ from verification_routing import (capabilities as verification_capabilities, adm
 from local_diagnostics import (parse_diagnostic_projects, should_diagnose,
                                diagnose_local_failure, diagnostic_label)
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
+from feedback_loop import (parse_feedback_projects, read_commit_identity, repairable,
+                           preserves_checks, feedback_context, feedback_label)
 from action_dispatch import DispatchClaims
 from agent_profile import (namespace_config, profile_directory, profile_log_path,
                            display_name, own_aliases, ProfileLease, ProfileOwnership)
@@ -154,6 +156,7 @@ class Config:
     work_workspace_root: str = ''
     work_local_tests: str = ''
     work_codex_diagnostics: str = ''
+    work_feedback_projects: str = ''
     work_diagnostic_timeout_seconds: int = 180
     natural_work_enabled: bool = False
     telegram_rich_mode: str = 'off'
@@ -319,6 +322,7 @@ class Config:
             work_workspace_root=os.getenv('WORK_WORKSPACE_ROOT', '').strip(),
             work_local_tests=os.getenv('WORK_LOCAL_TESTS', '').strip(),
             work_codex_diagnostics=os.getenv('WORK_CODEX_DIAGNOSTICS', '').strip(),
+            work_feedback_projects=os.getenv('WORK_FEEDBACK_PROJECTS', '').strip(),
             work_diagnostic_timeout_seconds=int(os.getenv('WORK_DIAGNOSTIC_TIMEOUT_SECONDS', '180')),
             natural_work_enabled=natural_work_enabled,
             telegram_rich_mode=telegram_rich_mode,
@@ -607,6 +611,7 @@ class AgentRelay:
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
+        self.feedback_projects = parse_feedback_projects(config.work_feedback_projects, self.work_repos)
         if config.action_mode != 'off' and not config.action_auto_projects.issubset(
                 set(self.work_projects) & set(self.work_repos)):
             raise ValueError('ACTION_AUTO_PROJECTS must contain only configured GitHub project aliases')
@@ -1900,7 +1905,8 @@ class AgentRelay:
             cloud_enabled=self.config.work_ci_verify,
             local_preset=self.local_tests.get(project),
             workspace_enabled=self.workspace_root is not None,
-            diagnostics_enabled=project in self.diagnostic_projects)
+            diagnostics_enabled=project in self.diagnostic_projects) | {
+                'autonomous_feedback': project in self.feedback_projects}
 
     def _run_github_work(self, payload: tuple[int, str, str], generation: int,
                          *, branch: str | None = None, human_request: str = '',
@@ -1921,6 +1927,13 @@ class AgentRelay:
                 raise ValueError('Direct delegation requires admitted native scope')
             LOG.info('GitHub-задача #%s · delegation=%s', work_id, delegation)
             task = original_task
+            authorized_amendments = []
+            feedback_enabled = project in self.feedback_projects
+            feedback = None
+            feedback_attempts = 0
+            feedback_commits = []
+            seen_trees = set()
+            identity = None
             verified = False
             previous_sha = ''
             report = None
@@ -1989,6 +2002,7 @@ class AgentRelay:
                 if round_no < self.config.work_max_rounds:
                     amendments = self.work.take_amendments(work_id)
                     if amendments:
+                        authorized_amendments.extend(amendments)
                         if self.progress is not None:
                             self.progress.pending_amendments(work_id, 0)
                         task = (
@@ -2010,96 +2024,241 @@ class AgentRelay:
                         'developer_summary': report.summary, 'remote_verified': False,
                         'local_check': verification_note}):
                     return
-            if verification is not None:
-                LOG.info('GitHub-задача #%s · verification=%s · admission=%s · reason=%s',
-                         work_id, verification['route'], verification['admission'],
-                         verification['admission_reason'] or '-')
-            if verified and report.status == 'ready' and wants_cloud(verification, enabled=self.config.work_ci_verify):
-                stage = 'GitHub CI observation'
-                if self.progress is not None:
-                    self.progress.update(work_id, 'ci')
-                ci = observe_ci(repo, report.branch, report.commit_sha,
-                                wait_seconds=self.config.work_ci_wait_seconds, permitted=permitted)
-                if ci is None or not permitted():
+            feedback_issue = ""
+            def current_evidence():
+                return {'delegation': delegation, 'developer_status': report.status,
+                        'repository': report.repository, 'branch': report.branch,
+                        'commit_sha': report.commit_sha, 'developer_summary': report.summary,
+                        'remote_verified': verified, 'local_check': verification_note,
+                        'verification': verification, 'ci': ci, 'workspace': workspace,
+                        'execution': execution, 'diagnostic': diagnostic, 'feedback': feedback}
+
+            def save_feedback(state, summary=""):
+                nonlocal feedback
+                feedback = {'commit_sha': report.commit_sha, 'status': state,
+                            'attempts': feedback_attempts, 'commits': feedback_commits[-12:],
+                            'summary': summary[:1200]}
+                LOG.info('GitHub-задача #%s · feedback=%s · attempts=%s',
+                         work_id, state, feedback_attempts)
+                return self.work.checkpoint_result(work_id, current_evidence())
+
+            while True:
+                if not permitted():
                     return
-                LOG.info('GitHub-задача #%s · CI=%s · runs=%s',
-                         work_id, ci['status'], ci['run_count'])
-                if not self.work.checkpoint_result(work_id, {
-                        'delegation': delegation,
-                        'developer_status': report.status, 'repository': report.repository,
-                        'branch': report.branch, 'commit_sha': report.commit_sha,
-                        'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note, 'verification': verification, 'ci': ci}):
+                if verification is not None:
+                    LOG.info('GitHub-задача #%s · verification=%s · admission=%s · reason=%s',
+                             work_id, verification['route'], verification['admission'],
+                             verification['admission_reason'] or '-')
+                if verified and report.status == 'ready' and wants_cloud(verification, enabled=self.config.work_ci_verify):
+                    stage = 'GitHub CI observation'
+                    if self.progress is not None:
+                        self.progress.update(work_id, 'ci')
+                    ci = observe_ci(repo, report.branch, report.commit_sha,
+                                    wait_seconds=self.config.work_ci_wait_seconds, permitted=permitted)
+                    if ci is None or not permitted():
+                        return
+                    LOG.info('GitHub-задача #%s · CI=%s · runs=%s',
+                             work_id, ci['status'], ci['run_count'])
+                    if not self.work.checkpoint_result(work_id, {
+                            'delegation': delegation,
+                            'developer_status': report.status, 'repository': report.repository,
+                            'branch': report.branch, 'commit_sha': report.commit_sha,
+                            'developer_summary': report.summary, 'remote_verified': True,
+                            'local_check': verification_note, 'verification': verification, 'ci': ci}):
+                        return
+                if (verified and report.status == 'ready' and self.workspace_root is not None
+                        and wants_local(verification, ci)):
+                    stage = 'local workspace preparation'
+                    if self.progress is not None:
+                        self.progress.update(work_id, 'workspace')
+                    workspace = prepare_workspace(
+                        self.work_projects[project], self.workspace_root, repo, report.commit_sha,
+                        bot_id=self.bot_id, work_id=work_id, permitted=permitted)
+                    if workspace is None or not permitted():
+                        return
+                    LOG.info('GitHub-задача #%s · workspace=%s · id=%s',
+                             work_id, workspace['status'], workspace['workspace_id'])
+                    if not self.work.checkpoint_result(work_id, {
+                            'delegation': delegation,
+                            'developer_status': report.status, 'repository': report.repository,
+                            'branch': report.branch, 'commit_sha': report.commit_sha,
+                            'developer_summary': report.summary, 'remote_verified': True,
+                            'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace}):
+                        return
+                preset = self.local_tests.get(project)
+                if (verified and report.status == 'ready' and preset
+                        and workspace is not None and workspace['status'] == 'prepared'
+                        and wants_local(verification, ci)
+                        and verification['preset'] == preset):
+                    stage = 'local test execution'
+                    if self.progress is not None:
+                        self.progress.update(work_id, 'local_test')
+                    execution = run_local_tests(
+                        self.work_projects[project], self.workspace_root, repo, report.commit_sha,
+                        workspace, preset, timeout=self.config.work_timeout_seconds, permitted=permitted,
+                        **({'failure_output': failure_output} if project in self.diagnostic_projects
+                            or feedback_enabled else {}))
+                    if execution is None or not permitted():
+                        return
+                    LOG.info('GitHub-задача #%s · local=%s · preset=%s · exit=%s · tests=%s',
+                             work_id, execution['status'], preset, execution['exit_code'], execution['tests_run'])
+                    if not self.work.checkpoint_result(work_id, {
+                            'delegation': delegation,
+                            'developer_status': report.status, 'repository': report.repository,
+                            'branch': report.branch, 'commit_sha': report.commit_sha,
+                            'developer_summary': report.summary, 'remote_verified': True,
+                            'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace,
+                            'execution': execution}):
+                        return
+                if project in self.diagnostic_projects and should_diagnose(execution):
+                    stage = 'Codex diagnostics'
+                    if self.progress is not None:
+                        self.progress.update(work_id, 'diagnostics')
+                    diagnostic = diagnose_local_failure(
+                        self.work_projects[project], self.workspace_root, repo, report.commit_sha,
+                        workspace, execution, failure_output[-1] if failure_output else '',
+                        runner=self.work.runner, timeout=self.config.work_diagnostic_timeout_seconds,
+                        permitted=permitted)
+                    if diagnostic is None or not permitted():
+                        return
+                    LOG.info('GitHub-задача #%s · diagnostics=%s · reason=%s',
+                             work_id, diagnostic['status'], diagnostic['reason'] or '-')
+                    if not self.work.checkpoint_result(work_id, {
+                            'delegation': delegation,
+                            'developer_status': report.status, 'repository': report.repository,
+                            'branch': report.branch, 'commit_sha': report.commit_sha,
+                            'developer_summary': report.summary, 'remote_verified': True,
+                            'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace,
+                            'execution': execution, 'diagnostic': diagnostic}):
+                        return
+                if not feedback_enabled or not verified or report.status != 'ready':
+                    break
+                if not feedback_commits or feedback_commits[-1] != report.commit_sha:
+                    feedback_commits.append(report.commit_sha)
+                issue = review_reason(verification, ci, execution)
+                if not issue:
+                    if not save_feedback('resolved' if feedback_attempts else 'not_needed'):
+                        return
+                    break
+                if not repairable(verification, ci, execution):
+                    if not save_feedback('nonrepairable'):
+                        return
+                    break
+                if self.work.pending_snapshot():
+                    if not save_feedback('human_amendments_pending'):
+                        return
+                    break
+                # Before a new model write, verify the exact branch still points
+                # to the prior SHA and pin its source tree. API failure is a stop,
+                # not a reason to download/execute the repository.
+                stage = 'feedback identity'
+                if not verify_remote_branch(self.work_projects[project], repo, report.branch, report.commit_sha):
+                    feedback_issue = 'remote_changed'
+                    if not save_feedback(feedback_issue):
+                        return
+                    break
+                if not permitted():
                     return
-            if (verified and report.status == 'ready' and self.workspace_root is not None
-                    and wants_local(verification, ci)):
-                stage = 'local workspace preparation'
-                if self.progress is not None:
-                    self.progress.update(work_id, 'workspace')
-                workspace = prepare_workspace(
-                    self.work_projects[project], self.workspace_root, repo, report.commit_sha,
-                    bot_id=self.bot_id, work_id=work_id, permitted=permitted)
-                if workspace is None or not permitted():
-                    return
-                LOG.info('GitHub-задача #%s · workspace=%s · id=%s',
-                         work_id, workspace['status'], workspace['workspace_id'])
-                if not self.work.checkpoint_result(work_id, {
-                        'delegation': delegation,
-                        'developer_status': report.status, 'repository': report.repository,
-                        'branch': report.branch, 'commit_sha': report.commit_sha,
-                        'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace}):
-                    return
-            preset = self.local_tests.get(project)
-            if (verified and report.status == 'ready' and preset
-                    and workspace is not None and workspace['status'] == 'prepared'
-                    and wants_local(verification, ci)
-                    and verification['preset'] == preset):
-                stage = 'local test execution'
-                if self.progress is not None:
-                    self.progress.update(work_id, 'local_test')
-                execution = run_local_tests(
-                    self.work_projects[project], self.workspace_root, repo, report.commit_sha,
-                    workspace, preset, timeout=self.config.work_timeout_seconds, permitted=permitted,
-                    **({'failure_output': failure_output} if project in self.diagnostic_projects else {}))
-                if execution is None or not permitted():
-                    return
-                LOG.info('GitHub-задача #%s · local=%s · preset=%s · exit=%s · tests=%s',
-                         work_id, execution['status'], preset, execution['exit_code'], execution['tests_run'])
-                if not self.work.checkpoint_result(work_id, {
-                        'delegation': delegation,
-                        'developer_status': report.status, 'repository': report.repository,
-                        'branch': report.branch, 'commit_sha': report.commit_sha,
-                        'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace,
-                        'execution': execution}):
-                    return
-            if project in self.diagnostic_projects and should_diagnose(execution):
-                stage = 'Codex diagnostics'
-                if self.progress is not None:
-                    self.progress.update(work_id, 'diagnostics')
-                diagnostic = diagnose_local_failure(
-                    self.work_projects[project], self.workspace_root, repo, report.commit_sha,
-                    workspace, execution, failure_output[-1] if failure_output else '',
-                    runner=self.work.runner, timeout=self.config.work_diagnostic_timeout_seconds,
-                    permitted=permitted)
+                if identity is None:
+                    identity = read_commit_identity(repo, report.commit_sha, permitted=permitted)
+                    if not permitted():
+                        return
+                    if identity is None:
+                        feedback_issue = 'identity_unavailable'
+                        if not save_feedback(feedback_issue):
+                            return
+                        break
+                    seen_trees.add(identity['tree'])
+                if self.work.pending_snapshot():
+                    if not save_feedback('human_amendments_pending'):
+                        return
+                    break
+                context = feedback_context(current_evidence(), failure_output[-1] if failure_output else '')
                 failure_output.clear()
-                if diagnostic is None or not permitted():
+                feedback_attempts += 1
+                if not save_feedback('evaluating'):
                     return
-                LOG.info('GitHub-задача #%s · diagnostics=%s · reason=%s',
-                         work_id, diagnostic['status'], diagnostic['reason'] or '-')
-                if not self.work.checkpoint_result(work_id, {
-                        'delegation': delegation,
-                        'developer_status': report.status, 'repository': report.repository,
-                        'branch': report.branch, 'commit_sha': report.commit_sha,
-                        'developer_summary': report.summary, 'remote_verified': True,
-                        'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace,
-                        'execution': execution, 'diagnostic': diagnostic}):
+                rounds += 1
+                if not self.work.update(work_id, 'running', rounds, note='Developer анализирует результат проверки'):
                     return
+                if self.progress is not None:
+                    self.progress.update(work_id, 'feedback')
+                stage = 'feedback developer'
+                # One new turn in the same lane, with the original authorization
+                # and every already dispatched human amendment, not a new grant.
+                scope = original_task
+                if authorized_amendments:
+                    scope += '\nHuman-authorized amendments: ' + json.dumps(authorized_amendments, ensure_ascii=False)
+                candidate = self._background.repair(
+                    work_id=work_id, repo=repo, branch=report.branch,
+                    previous_sha=report.commit_sha, authorized_task=scope,
+                    human_request=human_request or original_task, feedback=context,
+                    verification_capabilities=self._verification_capabilities(project), permitted=permitted)
+                if candidate is None or not permitted():
+                    return
+                if candidate.status == 'blocked':
+                    feedback_issue = 'developer_blocked'
+                    if not save_feedback(feedback_issue, candidate.summary):
+                        return
+                    break
+                stage = 'feedback remote verification'
+                if not verify_remote_branch(self.work_projects[project], repo, candidate.branch, candidate.commit_sha):
+                    feedback_issue = 'remote_changed'
+                    if not save_feedback(feedback_issue):
+                        return
+                    break
+                if not permitted():
+                    return
+                if candidate.status == 'unchanged':
+                    feedback_issue = 'developer_finished'
+                    if not save_feedback(feedback_issue, candidate.summary):
+                        return
+                    break
+                if candidate.commit_sha in feedback_commits:
+                    feedback_issue = 'no_progress'
+                    if not save_feedback(feedback_issue, 'Повтор ранее проверенного SHA'):
+                        return
+                    break
+                next_identity = read_commit_identity(repo, candidate.commit_sha, permitted=permitted)
+                if not permitted():
+                    return
+                if next_identity is None or next_identity['parents'] != [report.commit_sha]:
+                    feedback_issue = 'identity_unavailable'
+                    if not save_feedback(feedback_issue, 'Новый коммит не подтверждён как прямой потомок предыдущего'):
+                        return
+                    break
+                if next_identity['tree'] in seen_trees:
+                    feedback_issue = 'no_progress'
+                    if not save_feedback(feedback_issue, 'Повтор дерева исходников; новый SHA не означает прогресс'):
+                        return
+                    break
+                next_plan = admit_plan(candidate.verification, candidate.commit_sha,
+                                       self._verification_capabilities(project))
+                old_plan = verification
+                report, identity, verification = candidate, next_identity, next_plan
+                seen_trees.add(identity['tree'])
+                feedback_commits.append(report.commit_sha)
+                verification_note = 'Remote Git branch, SHA and direct parent independently verified.'
+                ci = workspace = execution = diagnostic = None
+                failure_output.clear()
+                if not preserves_checks(old_plan, verification):
+                    feedback_issue = 'verification_weakened'
+                    if not save_feedback(feedback_issue):
+                        return
+                    break
+                if not save_feedback('evaluating'):
+                    return
+                if self.work.pending_snapshot():
+                    feedback_issue = 'human_amendments_pending'
+                    if not save_feedback(feedback_issue):
+                        return
+                    break
+                # No numeric iteration ceiling. The next round verifies the new
+                # commit exactly once, and only confirmed failure may continue.
             stage = 'final evidence'
             review_data = json.dumps({
                 'ci': ci, 'workspace': workspace, 'execution': execution,
-                'diagnostic': diagnostic, 'verification': verification,
+                'diagnostic': diagnostic, 'verification': verification, 'feedback': feedback,
                 'delegation': delegation,
                 'developer_status': report.status,
                 'repository': report.repository,
@@ -2138,6 +2297,9 @@ class AgentRelay:
             if execution is not None and execution['status'] != 'passed':
                 target_status = 'needs_review'
                 title = 'Коммит подтверждён; ' + execution_label(execution, workspace, report.commit_sha)
+            if feedback_issue:
+                target_status = 'needs_review'
+                title = 'Коммит подтверждён ранее; Feedback Loop: ' + feedback_issue
             evidence = json.loads(review_data)
             evidence['coordinator_summary'] = message
             status = self.control.admit(generation, lambda: self.work.finalize(
@@ -2156,7 +2318,7 @@ class AgentRelay:
                     local_check=verification_note,
                     pending_amendments=pending_count, delegation=delegation, ci=ci,
                     workspace=workspace, execution=execution, diagnostic=diagnostic,
-                    verification=verification)
+                    verification=verification, feedback=feedback)
                 card_updated = self.progress.update(work_id, status, note=title)
             if not card_updated:
                 # One short fallback when no status card is available.
@@ -2175,16 +2337,20 @@ class AgentRelay:
                              ('\n' + execution_label(execution, workspace, report.commit_sha)
                               if execution is not None else '') +
                              ('\n' + diagnostic_label(diagnostic, execution, workspace, report.commit_sha)
-                              if diagnostic is not None else '')),
+                              if diagnostic is not None else '') +
+                             ('\n' + feedback_label(feedback, report.commit_sha)
+                              if feedback is not None else '')),
                 })
             LOG.info('GitHub-задача #%s: %s · итераций %s',
                      work_id, status, rounds)
         except Exception as exc:
             if not permitted():
                 return
-            self.work.update(work_id, 'failed', note='Ошибка этапа: ' + stage[:100])
+            # A failed/ambiguous feedback turn never erases prior verified evidence.
+            terminal = 'needs_review' if stage.startswith('feedback') else 'failed'
+            self.work.update(work_id, terminal, note='Ошибка этапа: ' + stage[:100])
             status_edited = (
-                self.progress.update(work_id, 'failed',
+                self.progress.update(work_id, terminal,
                                      note='Сбой на этапе ' + stage[:80])
                 if self.progress is not None else False)
             LOG.error('GitHub-задача #%s: ошибка на этапе %s (%s)',
