@@ -223,7 +223,10 @@ def render_work_card(record: dict[str, Any], *, detail: bool = False) -> str:
         lines.append(_h(feedback, 800 if detail else 200))
     if outputs:
         lines.extend(["", "<b>Артефакты (метаданные GitHub):</b>"])
-        lines.extend(_h(artifact_label(item), 250) for item in outputs)
+        for item in outputs:
+            locator, sep, metadata = artifact_label(item).partition(" · ")
+            lines.append("<code>" + _h(locator, 180) + "</code>" +
+                         (" · " + _h(metadata, 250) if sep else ""))
     # Each line is independently escaped/closed, so trimming by whole lines
     # cannot break a Telegram HTML tag or entity.
     kept: list[str] = []

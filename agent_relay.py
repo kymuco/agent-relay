@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import sqlite3
 import re
 from collections import deque
 import threading
@@ -39,7 +40,7 @@ from local_diagnostics import (parse_diagnostic_projects, should_diagnose,
 from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from artifact_registry import (parse_artifact_projects, merge_required, register_artifacts,
                                artifact_label)
-from native_artifacts import NativeArtifactRegistry, deliver_native, receipt_context
+from native_artifacts import NativeArtifactRegistry, deliver_native, receipt_context, native_filenames
 from feedback_loop import (parse_feedback_projects, read_commit_identity, repairable,
                            preserves_checks, feedback_context, feedback_label)
 from action_dispatch import DispatchClaims
@@ -1081,7 +1082,7 @@ class AgentRelay:
                 prompt += receipt_context(self.native_artifacts.recent(
                     bot_id=self.bot_id, chat_id=self.config.chat_id, user_id=sender['id'],
                     conversation_id=self.config.conversation_id))
-            except (OSError, ValueError, RuntimeError):
+            except (OSError, ValueError, sqlite3.Error):
                 LOG.warning('Native artifact receipts unavailable')
             prompt += ('\n[AgentRelay native file output] For an explicitly requested standalone file, '
                        'use native sandbox file creation when available; no GitHub task is needed. '
@@ -1359,8 +1360,8 @@ class AgentRelay:
                                      'Проверь генерацию в чате ChatGPT; автоматическая '
                                      'отправка в Telegram сейчас не подтверждена.'),
                         })
-                if self.native_artifacts is not None:
-                    if (addressed and not action_seen and not generation_requested
+                if self.native_artifacts is not None and not generation_requested:
+                    if (addressed and not action_seen
                             and getattr(getattr(result, 'conversation', None), 'conversation_id', None)
                             == self.config.conversation_id):
                         try:
@@ -1382,7 +1383,10 @@ class AgentRelay:
                             if self._run_permitted(run_generation):
                                 self.api.call('sendMessage', {'chat_id': self.config.chat_id,
                                     'text': 'Host: передача артефакта не подтверждена; автоматического повтора нет.'})
-                elif text:
+                    elif addressed and not action_seen and native_filenames(str(result.text or '')):
+                        self.api.call('sendMessage', {'chat_id': self.config.chat_id,
+                            'text': 'Host: идентичность разговора CWA не подтверждена; файл не отправлен.'})
+                elif text and (self.native_artifacts is None or (addressed and not action_seen)):
                     with tempfile.TemporaryDirectory(prefix='agentrelay-artifact-') as td:
                         for filename in artifact_filenames(text):
                             try:

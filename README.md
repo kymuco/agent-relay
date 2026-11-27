@@ -1072,7 +1072,8 @@ CWA PR14.0 handoff is reused; Host checks returned conversation, filename, size,
 SHA-256 and destination before sending bytes through existing Telegram transport.
 Supports DOCX, XLSX, PPTX, PDF, ZIP and existing text/image extensions; up to
 three files per turn within MAX_MEDIA_MB (1–10 MiB). No native delivery from
-peer, catchup or action-trailer turns; image generation monitor remains separate.
+peer, catchup or action-trailer turns; image-intent turns retain the existing
+image monitor and legacy media path (not native receipts).
 CWA resolves a unique conversation-owned filename, not a per-message file ID:
 this is not proof of which exact model message created the file. Reuse of names
 can fail closed; ask for unique names. Canonical final text is required in opt-in

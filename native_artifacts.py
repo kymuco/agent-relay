@@ -218,6 +218,7 @@ def deliver_native(registry: NativeArtifactRegistry, *, client, conversation_id:
             registry.transition(aid,"sending","delivery_unknown",reason="telegram_outcome_unknown")
             outcomes.append((name,"delivery_unknown"))
         else:
-            registry.transition(aid,"sending","delivered",telegram_message_id=mid)
+            if not registry.transition(aid,"sending","delivered",telegram_message_id=mid):
+                raise RuntimeError("native delivery receipt could not be persisted")
             outcomes.append((name,"delivered"))
     return outcomes
