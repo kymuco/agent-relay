@@ -1914,7 +1914,8 @@ class AgentRelay:
             workspace_enabled=self.workspace_root is not None,
             diagnostics_enabled=project in self.diagnostic_projects) | {
                 'autonomous_feedback': project in self.feedback_projects,
-                'artifact_sources': ['github_repository'] if project in self.artifact_projects else []}
+                'artifact_sources': (['github_repository'] + (['github_actions'] if self.config.work_ci_verify else [])
+                                     if project in self.artifact_projects else [])}
 
     def _run_github_work(self, payload: tuple[int, str, str], generation: int,
                          *, branch: str | None = None, human_request: str = '',
@@ -2260,7 +2261,9 @@ class AgentRelay:
                     artifact_requests, repo, report.commit_sha,
                     enabled=project in self.artifact_projects,
                     verified_final=not (feedback_issue or review_reason(verification, ci, execution)
-                                        or self.work.pending_snapshot()), permitted=permitted)
+                                        or self.work.pending_snapshot()), permitted=permitted,
+                    branch=report.branch, ci=ci if verification and verification['admission'] == 'admitted'
+                    and verification['route'] in ('cloud', 'hybrid') else None)
                 if artifacts is None or not permitted():
                     return
                 LOG.info('GitHub-задача #%s · artifacts=%s · available=%s', work_id,

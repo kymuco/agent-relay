@@ -1040,3 +1040,24 @@ existing profile-scoped task history (30 prior tasks), no new disk cache.
 Telegram cards, journals and Host result reads expose registered locators. Actual
 byte download, SHA-256 of payload, Actions archives, native CWA files, local
 outputs, and artifact transfer across hosts are later adapters, not implemented.
+
+### NA-06.7.3 — GitHub Actions Artifacts
+
+Existing WORK_ARTIFACT_PROJECTS and WORK_CI_VERIFY=on enable this source; no new
+setting or automatic workflow creation. Developer declares source github_actions,
+exact upload-artifact name, required boolean, delivery link. Host uses only an
+admitted cloud/hybrid plan with passed CI evidence for the final verified SHA.
+It rechecks each observed run's repository, head repository, SHA, branch, success
+and attempt before and after listing metadata. Only first-attempt runs supported:
+per-run artifact listings do not prove which attempt produced an archive. No
+implicit rerun, local fallback, guessing a name, or selecting ambiguous matches.
+Up to 20 observed runs and 100 artifacts per run, no incomplete pagination;
+missing, expired, ambiguous or unavailable required outputs need review.
+Archive metadata records exact run ID, artifact ID, archive size, creation and
+expiry, and optional GitHub-reported SHA-256 digest (not Host-computed). Links
+are normal GitHub authenticated archive links, not signed redirects. Expired
+links are withheld when views are regenerated; old Telegram messages cannot be
+revoked automatically. No archive download/extraction or inspection of files
+inside an archive; no guarantee of continued availability or contents. Private
+repos may require Actions: read on WORK_CI_TOKEN. Required declarations survive
+feedback revisions by source+locator. Repo artifact links remain compatible.

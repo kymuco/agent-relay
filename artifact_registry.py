@@ -20,8 +20,11 @@ _REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 _MAX = 5
 _MAX_BODY = 4 * 1024 * 1024
 _SOURCE = "github_repository"
+_ACTIONS = "github_actions"
+_ACTION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,119}")
 _UNAVAILABLE = ("not_authorized", "verification_incomplete", "metadata_unavailable",
-                "not_found", "not_regular_file")
+                "not_found", "not_regular_file", "actions_ci_not_passed",
+                "actions_run_mismatch", "actions_attempt_ambiguous", "ambiguous_name", "expired")
 
 
 def parse_artifact_projects(raw: str, projects: Mapping[str, str]) -> frozenset[str]:
@@ -52,44 +55,60 @@ def _valid_repo(repo: Any) -> bool:
         part not in (".", "..") for part in repo.split("/"))
 
 
+def _request_key(item: dict) -> tuple[str, str]:
+    return item["source"], item["path"] if item["source"] == _SOURCE else item["name"]
+
+
 def parse_artifact_requests(value: Any) -> list[dict]:
     if not isinstance(value, list) or len(value) > _MAX:
         raise ValueError("artifacts must be a bounded array")
     result = []
     seen = set()
     for item in value:
-        if (type(item) is not dict or set(item) != {"source", "path", "required", "delivery"}
-                or item["source"] != _SOURCE or item["delivery"] != "link"
-                or type(item["required"]) is not bool or not _path(item["path"])):
-            raise ValueError("invalid repository artifact declaration")
-        if item["path"] in seen:
-            raise ValueError("duplicate artifact path")
-        seen.add(item["path"])
+        if (type(item) is not dict or item.get("delivery") != "link"
+                or type(item.get("required")) is not bool):
+            raise ValueError("invalid artifact declaration")
+        source = item.get("source")
+        if source == _SOURCE:
+            if set(item) != {"source", "path", "required", "delivery"} or not _path(item["path"]):
+                raise ValueError("invalid repository artifact declaration")
+        elif source == _ACTIONS:
+            if (set(item) != {"source", "name", "required", "delivery"}
+                    or not isinstance(item["name"], str) or not _ACTION_NAME.fullmatch(item["name"])
+                    or item["name"].strip() != item["name"]):
+                raise ValueError("invalid Actions artifact declaration")
+        else:
+            raise ValueError("unknown artifact source")
+        key = _request_key(item)
+        if key in seen:
+            raise ValueError("duplicate artifact locator")
+        seen.add(key)
         result.append(dict(item))
     return result
 
 
 def merge_required(previous: list[dict], current: list[dict]) -> list[dict]:
     """A subsequent repair may not silently drop or downgrade a required file."""
-    merged = {r["path"]: dict(r) for r in parse_artifact_requests(current)}
+    merged = {_request_key(r): dict(r) for r in parse_artifact_requests(current)}
     for item in parse_artifact_requests(previous):
         if item["required"]:
-            if item["path"] in merged:
-                merged[item["path"]]["required"] = True
+            key = _request_key(item)
+            if key in merged:
+                merged[key]["required"] = True
             else:
-                merged[item["path"]] = dict(item)
+                merged[key] = dict(item)
     if len(merged) > _MAX:
         # Prefer required outputs over optional ones; never silently drop a required output.
         required = [r for r in merged.values() if r["required"]]
         if len(required) > _MAX:
             raise ValueError("too many required artifacts across revisions")
-        merged = {r["path"]: r for r in (required + [r for r in merged.values()
+        merged = {_request_key(r): r for r in (required + [r for r in merged.values()
                                                      if not r["required"]])[:_MAX]}
     return list(merged.values())
 
 
-def _artifact_id(repo: str, sha: str, path: str) -> str:
-    return hashlib.sha256(json.dumps([_SOURCE, repo.lower(), sha, path],
+def _artifact_id(repo: str, sha: str, path: str, source: str = _SOURCE) -> str:
+    return hashlib.sha256(json.dumps([source, repo.lower(), sha, path],
                                    ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[:24]
 
 
@@ -100,6 +119,18 @@ def _record(request: dict, repo: str, sha: str, *, reason: str = "",
             "filename": request["path"].rsplit("/", 1)[-1],
             "status": "unavailable" if reason else "available",
             "reason": reason, "git_blob_sha": blob, "size": size,
+            "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+def _actions_record(request: dict, repo: str, sha: str, *, reason: str = "",
+                    metadata: dict | None = None) -> dict:
+    data = metadata or {}
+    return {**request, "artifact_id": _artifact_id(repo, sha, request["name"], _ACTIONS),
+            "repository": repo, "commit_sha": sha, "filename": request["name"] + ".zip",
+            "status": "unavailable" if reason else "available", "reason": reason,
+            "github_artifact_id": data.get("github_artifact_id"), "run_id": data.get("run_id"),
+            "size": data.get("size"), "expires_at": data.get("expires_at"),
+            "created_at": data.get("created_at"), "digest": data.get("digest", ""),
             "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
@@ -140,7 +171,8 @@ def _tree_entries(repo: str, tree_sha: str, *, permitted: Callable[[], bool]) ->
 
 def register_artifacts(requests: list[dict], repo: str, sha: str, *,
                        enabled: bool, verified_final: bool,
-                       permitted: Callable[[], bool]) -> list[dict] | None:
+                       permitted: Callable[[], bool], branch: str = '',
+                       ci: dict | None = None) -> list[dict] | None:
     """None means stopped. Required unavailable results can never count as delivered."""
     from feedback_loop import read_commit_identity
     requests = parse_artifact_requests(requests)
@@ -153,7 +185,10 @@ def register_artifacts(requests: list[dict], repo: str, sha: str, *,
     reason = "" if enabled and verified_final else (
         "not_authorized" if not enabled else "verification_incomplete")
     entries = None
-    if not reason:
+    repo_reason = reason
+    actions_reason = reason
+    actions_entries = {}
+    if not reason and any(r["source"] == _SOURCE for r in requests):
         identity = read_commit_identity(repo, sha, permitted=permitted)
         if not permitted():
             return None
@@ -162,12 +197,33 @@ def register_artifacts(requests: list[dict], repo: str, sha: str, *,
         if not permitted():
             return None
         if entries is None:
-            reason = "metadata_unavailable"
+            repo_reason = "metadata_unavailable"
+    if not reason and any(r["source"] == _ACTIONS for r in requests):
+        from github_actions_artifacts import collect_actions_artifacts
+        observed = collect_actions_artifacts(repo, branch, sha, ci, permitted=permitted)
+        if observed is None or not permitted():
+            return None
+        actions_reason, actions_entries = observed
     records = []
     for item in requests:
         if not permitted():
             return None
-        denial = reason
+        if item["source"] == _ACTIONS:
+            denial = actions_reason
+            meta = None
+            if not denial:
+                candidates = actions_entries.get(item["name"], [])
+                if not candidates:
+                    denial = "not_found"
+                elif len(candidates) != 1:
+                    denial = "ambiguous_name"
+                elif candidates[0]["expired"]:
+                    denial = "expired"
+                else:
+                    meta = candidates[0]
+            records.append(_actions_record(item, repo, sha, reason=denial, metadata=meta))
+            continue
+        denial = repo_reason
         blob, size = "", None
         if not denial:
             entry = entries.get(item["path"])
@@ -193,18 +249,27 @@ def artifact_records(data: Any, repo: str, sha: str) -> list[dict]:
         if not isinstance(item, dict) or item.get("repository") != repo or item.get("commit_sha") != sha:
             return []
         try:
+            locator = "name" if item.get("source") == _ACTIONS else "path"
             request = parse_artifact_requests([{k: item[k] for k in
-                          ("source", "path", "required", "delivery")}])[0]
+                          ("source", locator, "required", "delivery")}])[0]
             stamp = item["observed_at"]
             if not isinstance(stamp, str) or len(stamp) > 50 or datetime.fromisoformat(stamp).tzinfo is None:
                 return []
         except (KeyError, ValueError, TypeError):
             return []
-        path = request["path"]
-        identifier = _artifact_id(repo, sha, path)
-        if (path in seen or item.get("artifact_id") != identifier
-                or item.get("filename") != path.rsplit("/", 1)[-1]):
+        key = _request_key(request)
+        identifier = _artifact_id(repo, sha, key[1], key[0])
+        filename = key[1] + ".zip" if key[0] == _ACTIONS else key[1].rsplit("/", 1)[-1]
+        if (key in seen or item.get("artifact_id") != identifier
+                or item.get("filename") != filename):
             return []
+        if key[0] == _ACTIONS:
+            clean = _validate_actions_record(item, request, repo, sha, identifier, stamp)
+            if clean is None:
+                return []
+            seen.add(key)
+            result.append(clean)
+            continue
         status, reason, blob, size = (item.get(k) for k in
                                       ("status", "reason", "git_blob_sha", "size"))
         if status == "available":
@@ -216,18 +281,49 @@ def artifact_records(data: Any, repo: str, sha: str) -> list[dict]:
                 return []
         else:
             return []
-        seen.add(path)
+        seen.add(key)
         result.append({**request, "artifact_id": identifier, "repository": repo,
-                       "commit_sha": sha, "filename": path.rsplit("/", 1)[-1],
+                       "commit_sha": sha, "filename": filename,
                        "status": status, "reason": reason, "git_blob_sha": blob,
                        "size": size, "observed_at": stamp})
     return result
 
 
+def _validate_actions_record(item, request, repo, sha, identifier, stamp):
+    from github_actions_artifacts import _positive, timestamp, _DIGEST
+    status, reason, aid, run_id, size, expires, created, digest = (item.get(k) for k in
+        ("status", "reason", "github_artifact_id", "run_id", "size", "expires_at", "created_at", "digest"))
+    if status == "available":
+        expiry, creation = timestamp(expires), timestamp(created)
+        if (reason != "" or not _positive(aid) or not _positive(run_id)
+                or type(size) is not int or size < 0 or expiry is None or creation is None
+                or expiry <= creation or not isinstance(digest, str)
+                or (digest and not _DIGEST.fullmatch(digest))):
+            return None
+    elif status == "unavailable":
+        if (reason not in _UNAVAILABLE or any(v is not None for v in (aid, run_id, size, expires, created))
+                or digest != ""):
+            return None
+    else:
+        return None
+    return {**request, "artifact_id": identifier, "repository": repo, "commit_sha": sha,
+            "filename": request["name"] + ".zip", "status": status, "reason": reason,
+            "github_artifact_id": aid, "run_id": run_id, "size": size,
+            "expires_at": expires, "created_at": created, "digest": digest, "observed_at": stamp}
+
+
 def withhold_artifacts(records: list[dict]) -> list[dict]:
-    return [dict(item, status='unavailable', reason='verification_incomplete',
-                 git_blob_sha='', size=None) if item['status'] == 'available' else dict(item)
-            for item in records]
+    outputs = []
+    for item in records:
+        result = dict(item)
+        if item["status"] == "available":
+            result.update(status="unavailable", reason="verification_incomplete", size=None)
+            if item["source"] == _ACTIONS:
+                result.update(github_artifact_id=None, run_id=None, expires_at=None, created_at=None, digest="")
+            else:
+                result["git_blob_sha"] = ""
+        outputs.append(result)
+    return outputs
 
 
 def artifact_url(record: dict) -> str | None:
@@ -235,6 +331,12 @@ def artifact_url(record: dict) -> str | None:
     if not records or records[0]["status"] != "available":
         return None
     item = records[0]
+    if item["source"] == _ACTIONS:
+        from github_actions_artifacts import timestamp
+        if timestamp(item["expires_at"]) <= datetime.now(timezone.utc):
+            return None
+        return ("https://github.com/" + item["repository"] + "/actions/runs/" + str(item["run_id"])
+                + "/artifacts/" + str(item["github_artifact_id"]))
     return ("https://github.com/" + item["repository"] + "/blob/" + item["commit_sha"]
             + "/" + quote(item["path"], safe="/"))
 
@@ -245,9 +347,16 @@ def result_artifacts(result: Mapping[str, Any]) -> list[dict]:
 
 
 def artifact_label(record: dict, *, include_url: bool = False) -> str:
+    source, locator = _request_key(record)
     if record["status"] != "available":
-        return record["path"] + " · недоступен (" + record["reason"] + ")" + (
+        return locator + " · недоступен (" + record["reason"] + ")" + (
             " · обязательный" if record["required"] else "")
-    label = record["path"] + " · " + str(record["size"]) + " Б · GitHub"
     url = artifact_url(record)
+    if source == _ACTIONS:
+        if not url:
+            return locator + " · срок хранения истёк"
+        label = (record["filename"] + " · " + str(record["size"]) + " Б · GitHub Actions · run "
+                 + str(record["run_id"]) + " · до " + record["expires_at"])
+    else:
+        label = locator + " · " + str(record["size"]) + " Б · GitHub"
     return label + (" · " + url if include_url and url else "")
