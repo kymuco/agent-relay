@@ -2015,6 +2015,7 @@ class AgentRelay:
             diagnostics_enabled=project in self.diagnostic_projects) | {
                 'autonomous_feedback': project in self.feedback_projects,
                 'artifact_sources': (['github_repository'] + (['github_actions'] if self.config.work_ci_verify else [])
+                                     + (['local_runner'] if self.workspace_root is not None and project in self.local_tests else [])
                                      if project in self.artifact_projects else [])}
 
     def _run_github_work(self, payload: tuple[int, str, str], generation: int,
@@ -2040,6 +2041,7 @@ class AgentRelay:
             authorized_amendments = []
             feedback_enabled = project in self.feedback_projects
             artifact_requests = []
+            local_outputs = {}
             artifacts = []
             feedback = None
             feedback_commits = []
@@ -2196,11 +2198,14 @@ class AgentRelay:
                     stage = 'local test execution'
                     if self.progress is not None:
                         self.progress.update(work_id, 'local_test')
+                    local_outputs.clear()
+                    local_names = tuple(a['name'] for a in artifact_requests if a['source'] == 'local_runner') if project in self.artifact_projects else ()
                     execution = run_local_tests(
                         self.work_projects[project], self.workspace_root, repo, report.commit_sha,
                         workspace, preset, timeout=self.config.work_timeout_seconds, permitted=permitted,
                         **({'failure_output': failure_output} if project in self.diagnostic_projects
-                            or feedback_enabled else {}))
+                            or feedback_enabled else {}),
+                        **({'artifact_names': local_names, 'artifact_output': local_outputs} if local_names else {}))
                     if execution is None or not permitted():
                         return
                     LOG.info('GitHub-задача #%s · local=%s · preset=%s · exit=%s · tests=%s',
@@ -2338,6 +2343,7 @@ class AgentRelay:
                 feedback_commits.append(report.commit_sha)
                 verification_note = 'Remote Git branch, SHA and direct parent independently verified.'
                 ci = workspace = execution = diagnostic = None
+                local_outputs.clear()
                 failure_output.clear()
                 if not preserves_checks(old_plan, verification):
                     feedback_issue = 'verification_weakened'
@@ -2363,7 +2369,8 @@ class AgentRelay:
                     verified_final=not (feedback_issue or review_reason(verification, ci, execution)
                                         or self.work.pending_snapshot()), permitted=permitted,
                     branch=report.branch, ci=ci if verification and verification['admission'] == 'admitted'
-                    and verification['route'] in ('cloud', 'hybrid') else None)
+                    and verification['route'] in ('cloud', 'hybrid') else None,
+                    workspace=workspace, execution=execution, local_outputs=local_outputs)
                 if artifacts is None or not permitted():
                     return
                 LOG.info('GitHub-задача #%s · artifacts=%s · available=%s', work_id,

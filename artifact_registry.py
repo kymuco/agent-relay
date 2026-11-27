@@ -21,10 +21,13 @@ _MAX = 5
 _MAX_BODY = 4 * 1024 * 1024
 _SOURCE = "github_repository"
 _ACTIONS = "github_actions"
+_LOCAL = "local_runner"
 _ACTION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,119}")
 _UNAVAILABLE = ("not_authorized", "verification_incomplete", "metadata_unavailable",
                 "not_found", "not_regular_file", "actions_ci_not_passed",
-                "actions_run_mismatch", "actions_attempt_ambiguous", "ambiguous_name", "expired")
+                "actions_run_mismatch", "actions_attempt_ambiguous", "ambiguous_name", "expired",
+                "local_not_passed", "unsafe_local_output", "local_output_size",
+                "local_output_changed", "local_workspace_changed")
 
 
 def parse_artifact_projects(raw: str, projects: Mapping[str, str]) -> frozenset[str]:
@@ -65,8 +68,8 @@ def parse_artifact_requests(value: Any) -> list[dict]:
     result = []
     seen = set()
     for item in value:
-        if (type(item) is not dict or item.get("delivery") != "link"
-                or type(item.get("required")) is not bool):
+        if (type(item) is not dict or type(item.get("required")) is not bool
+                or item.get("delivery") != ("retain" if item.get("source") == _LOCAL else "link")):
             raise ValueError("invalid artifact declaration")
         source = item.get("source")
         if source == _SOURCE:
@@ -77,12 +80,18 @@ def parse_artifact_requests(value: Any) -> list[dict]:
                     or not isinstance(item["name"], str) or not _ACTION_NAME.fullmatch(item["name"])
                     or item["name"].strip() != item["name"]):
                 raise ValueError("invalid Actions artifact declaration")
+        elif source == _LOCAL:
+            from local_artifacts import local_filename
+            if (set(item) != {"source", "name", "required", "delivery"} or not local_filename(item["name"])):
+                raise ValueError("invalid local artifact declaration")
         else:
             raise ValueError("unknown artifact source")
         key = _request_key(item)
-        if key in seen:
+        # Local filesystem names must remain unique on Windows as well as Linux.
+        duplicate_key = (key[0], key[1].casefold()) if source == _LOCAL else key
+        if duplicate_key in seen:
             raise ValueError("duplicate artifact locator")
-        seen.add(key)
+        seen.add(duplicate_key)
         result.append(dict(item))
     return result
 
@@ -134,6 +143,17 @@ def _actions_record(request: dict, repo: str, sha: str, *, reason: str = "",
             "observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
 
+def _local_record(request, repo, sha, *, reason="", metadata=None, workspace=None):
+    meta=metadata or {}
+    return {**request, "artifact_id": _artifact_id(repo,sha,request["name"],_LOCAL),
+            "repository":repo,"commit_sha":sha,"filename":request["name"],
+            "status":"unavailable" if reason else "available","reason":reason,
+            "workspace_id":workspace["workspace_id"] if workspace and not reason else None,
+            "size":meta.get("size") if not reason else None,
+            "sha256":meta.get("sha256") if not reason else None,
+            "observed_at":datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
 def _tree_entries(repo: str, tree_sha: str, *, permitted: Callable[[], bool]) -> dict | None:
     """Read Git tree metadata only; never fetch blob contents or signed download URLs."""
     from github_ci import _NoRedirect
@@ -172,7 +192,8 @@ def _tree_entries(repo: str, tree_sha: str, *, permitted: Callable[[], bool]) ->
 def register_artifacts(requests: list[dict], repo: str, sha: str, *,
                        enabled: bool, verified_final: bool,
                        permitted: Callable[[], bool], branch: str = '',
-                       ci: dict | None = None) -> list[dict] | None:
+                       ci: dict | None = None, workspace=None, execution=None,
+                       local_outputs=None) -> list[dict] | None:
     """None means stopped. Required unavailable results can never count as delivered."""
     from feedback_loop import read_commit_identity
     requests = parse_artifact_requests(requests)
@@ -204,10 +225,30 @@ def register_artifacts(requests: list[dict], repo: str, sha: str, *,
         if observed is None or not permitted():
             return None
         actions_reason, actions_entries = observed
+    from local_execution import execution_record
+    from local_workspace import workspace_record
+    prepared = workspace_record(workspace, sha)
+    tested = execution_record(execution, prepared, sha)
     records = []
     for item in requests:
         if not permitted():
             return None
+        if item["source"] == _LOCAL:
+            denial = reason
+            meta = None
+            if not denial:
+                if not tested or tested["status"] != "passed":
+                    denial = "local_not_passed"
+                else:
+                    meta = (local_outputs or {}).get(item["name"])
+                    denial = meta.get("reason","metadata_unavailable") if isinstance(meta,dict) else "not_found"
+                    if denial and denial not in _UNAVAILABLE:
+                        denial = "metadata_unavailable"
+            value = _local_record(item,repo,sha,reason=denial,metadata=meta,workspace=prepared)
+            if not artifact_records([value],repo,sha):
+                value = _local_record(item,repo,sha,reason="metadata_unavailable")
+            records.append(value)
+            continue
         if item["source"] == _ACTIONS:
             denial = actions_reason
             meta = None
@@ -249,7 +290,7 @@ def artifact_records(data: Any, repo: str, sha: str) -> list[dict]:
         if not isinstance(item, dict) or item.get("repository") != repo or item.get("commit_sha") != sha:
             return []
         try:
-            locator = "name" if item.get("source") == _ACTIONS else "path"
+            locator = "name" if item.get("source") in (_ACTIONS,_LOCAL) else "path"
             request = parse_artifact_requests([{k: item[k] for k in
                           ("source", locator, "required", "delivery")}])[0]
             stamp = item["observed_at"]
@@ -263,6 +304,13 @@ def artifact_records(data: Any, repo: str, sha: str) -> list[dict]:
         if (key in seen or item.get("artifact_id") != identifier
                 or item.get("filename") != filename):
             return []
+        if key[0] == _LOCAL:
+            clean = _validate_local_record(item,request,repo,sha,identifier,stamp)
+            if clean is None:
+                return []
+            seen.add(key)
+            result.append(clean)
+            continue
         if key[0] == _ACTIONS:
             clean = _validate_actions_record(item, request, repo, sha, identifier, stamp)
             if clean is None:
@@ -287,6 +335,25 @@ def artifact_records(data: Any, repo: str, sha: str) -> list[dict]:
                        "status": status, "reason": reason, "git_blob_sha": blob,
                        "size": size, "observed_at": stamp})
     return result
+
+
+def _validate_local_record(item,request,repo,sha,identifier,stamp):
+    from local_artifacts import MAX_LOCAL_ARTIFACT_BYTES
+    from local_workspace import _ID
+    status,reason,wid,size,digest=(item.get(k) for k in ("status","reason","workspace_id","size","sha256"))
+    if status=="available":
+        if (reason!="" or not isinstance(wid,str) or not _ID.fullmatch(wid)
+                or type(size) is not int or not 0<size<=MAX_LOCAL_ARTIFACT_BYTES
+                or not isinstance(digest,str) or not re.fullmatch(r"[0-9a-f]{64}",digest)):
+            return None
+    elif status=="unavailable":
+        if reason not in _UNAVAILABLE or any(v is not None for v in (wid,size,digest)):
+            return None
+    else:
+        return None
+    return {**request,"artifact_id":identifier,"repository":repo,"commit_sha":sha,
+            "filename":request["name"],"status":status,"reason":reason,
+            "workspace_id":wid,"size":size,"sha256":digest,"observed_at":stamp}
 
 
 def _validate_actions_record(item, request, repo, sha, identifier, stamp):
@@ -320,6 +387,8 @@ def withhold_artifacts(records: list[dict]) -> list[dict]:
             result.update(status="unavailable", reason="verification_incomplete", size=None)
             if item["source"] == _ACTIONS:
                 result.update(github_artifact_id=None, run_id=None, expires_at=None, created_at=None, digest="")
+            elif item["source"] == _LOCAL:
+                result.update(workspace_id=None, sha256=None)
             else:
                 result["git_blob_sha"] = ""
         outputs.append(result)
@@ -331,6 +400,8 @@ def artifact_url(record: dict) -> str | None:
     if not records or records[0]["status"] != "available":
         return None
     item = records[0]
+    if item["source"] == _LOCAL:
+        return None
     if item["source"] == _ACTIONS:
         from github_actions_artifacts import timestamp
         if timestamp(item["expires_at"]) <= datetime.now(timezone.utc):
@@ -341,7 +412,7 @@ def artifact_url(record: dict) -> str | None:
             + "/" + quote(item["path"], safe="/"))
 
 
-def bound_artifact_records(data: Any, repo: str, sha: str, ci: Any) -> list[dict]:
+def bound_artifact_records(data: Any, repo: str, sha: str, ci: Any, workspace=None, execution=None) -> list[dict]:
     """Reject available Actions metadata disconnected from successful Host CI evidence."""
     from github_ci import ci_record
     values = artifact_records(data, repo, sha)
@@ -350,12 +421,19 @@ def bound_artifact_records(data: Any, repo: str, sha: str, ci: Any) -> list[dict
            and (not observed or observed["status"] != "passed"
                 or item["run_id"] not in observed["run_ids"]) for item in values):
         return []
+    from local_execution import execution_record
+    tested = execution_record(execution, workspace, sha)
+    if any(item["source"] == _LOCAL and item["status"] == "available"
+           and (not tested or tested["status"] != "passed"
+                or item["workspace_id"] != tested["workspace_id"]) for item in values):
+        return []
     return values
 
 
 def result_artifacts(result: Mapping[str, Any]) -> list[dict]:
     return bound_artifact_records(result.get("artifacts"), result.get("repository"),
-                                  result.get("commit_sha"), result.get("ci")) if result.get("remote_verified") is True else []
+                                  result.get("commit_sha"), result.get("ci"), result.get("workspace"),
+                                  result.get("execution")) if result.get("remote_verified") is True else []
 
 
 def artifact_label(record: dict, *, include_url: bool = False) -> str:
@@ -369,6 +447,8 @@ def artifact_label(record: dict, *, include_url: bool = False) -> str:
             return locator + " · срок хранения истёк"
         label = (record["filename"] + " · " + str(record["size"]) + " Б · GitHub Actions · run "
                  + str(record["run_id"]) + " · до " + record["expires_at"])
+    elif source == _LOCAL:
+        label = locator + " · " + str(record["size"]) + " Б · Local Runner · сохранён на Host (не отправлен)"
     else:
         label = locator + " · " + str(record["size"]) + " Б · GitHub"
     return label + (" · " + url if include_url and url else "")

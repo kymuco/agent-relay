@@ -110,7 +110,9 @@ def execution_label(data: Any, workspace: Any, sha: str) -> str:
 
 def run_local_tests(source: Path, root: Path, repo: str, sha: str, workspace: dict,
                     preset: str, *, timeout: int, permitted: Callable[[], bool],
-                    failure_output: list[str] | None = None) -> dict | None:
+                    failure_output: list[str] | None = None,
+                    artifact_names: tuple[str, ...] = (),
+                    artifact_output: dict | None = None) -> dict | None:
     from local_codex import _child_environment, _kill_tree
     prepared = workspace_record(workspace, sha)
     if not prepared or prepared["status"] != "prepared" or preset not in _PRESETS:
@@ -118,6 +120,8 @@ def run_local_tests(source: Path, root: Path, repo: str, sha: str, workspace: di
     if not permitted():
         return None
     started = time.monotonic()
+    if artifact_output is not None:
+        artifact_output.clear()
 
     def result(status, code=None, count=None):
         return _record(status, prepared, preset, code, count, time.monotonic()-started)
@@ -135,6 +139,13 @@ def run_local_tests(source: Path, root: Path, repo: str, sha: str, workspace: di
         env = _child_environment()
         env.pop("CODEX_HOME", None)
         env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        env.pop("AGENTRELAY_ARTIFACT_DIR", None)
+        if artifact_names:
+            from local_artifacts import prepare_output_dir
+            output_dir = prepare_output_dir(source, root, sha, prepared, artifact_names, permitted=permitted)
+            if output_dir is None or not permitted():
+                return None
+            env["AGENTRELAY_ARTIFACT_DIR"] = str(output_dir)
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         with tempfile.TemporaryFile(mode="w+b") as output:
             if not permitted():
@@ -182,6 +193,13 @@ def run_local_tests(source: Path, root: Path, repo: str, sha: str, workspace: di
                         return result("unavailable", code, count)
                 if code == 5 and (preset == "pytest" or count == 0):
                     return result("no_tests", code, 0)
+                if code == 0 and artifact_names and artifact_output is not None:
+                    from local_artifacts import collect_local_outputs
+                    outputs = collect_local_outputs(source, root, repo, sha, prepared, artifact_names,
+                                                    permitted=permitted)
+                    if outputs is None or not permitted():
+                        return None
+                    artifact_output.update(outputs)
                 return result("passed" if code == 0 else "failed", code, count)
             finally:
                 if proc.poll() is None:

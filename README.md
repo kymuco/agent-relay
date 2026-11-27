@@ -1101,3 +1101,26 @@ and nearest user ancestor. Never execute recovered actions, peer handoffs or voi
 Only linked native files or existing image monitor may be delivered. No model replay.
 Bounded synchronous recovery in the turn handler; existing image background monitor
 unchanged. Unconfirmed result reported to human. No restart replay. CWA unchanged.
+
+### NA-06.7.5 — Local Runner Artifacts
+
+Existing WORK_ARTIFACT_PROJECTS plus WORK_WORKSPACE_ROOT and WORK_LOCAL_TESTS
+opt in to this source; no new command capability or automatic local fallback.
+Developer declares source local_runner, exact ASCII basename, required boolean,
+delivery retain. Must use admitted local/hybrid verification. Only for authorized
+local computation, existing preset executes committed code. Host creates a fresh
+<workspace_id>.artifacts sibling directory under WORK_WORKSPACE_ROOT and passes
+its path to the child via AGENTRELAY_ARTIFACT_DIR only for declared outputs.
+Tests should use that variable only if present, and must not write generated
+files into the checkout. After successful execution, Host revalidates the clean
+detached worktree, reads only declared regular single-link files, checks
+size (1–10 MiB per file), computes SHA-256. No directory scan, arbitrary local
+path, symlink/reparse point/hardlink retrieval, automatic cleanup or execution
+of artifacts. Final records bind SHA and workspace to successful execution;
+required unavailable outputs need review. Failed and superseded run directories
+are retained locally but never registered as final output. Files remain mutable;
+metadata is an observation, not immutable storage; future delivery must recheck
+bytes. Local file links and Telegram transfer are deferred to NA-06.7.6.
+Local tests are trusted code running with the Host user's permissions, not
+an OS sandbox, and may themselves access or modify other resources. Limits bound
+Host collection, not disk writes of the child. Operator owns cleanup/retention.

@@ -298,7 +298,7 @@ class WorkProgress:
             loop = feedback_record(feedback, commit_sha) if remote_verified is True else None
             if loop is not None:
                 rec["result"]["feedback"] = loop
-            outputs = bound_artifact_records(artifacts, repository, commit_sha, observed) if remote_verified is True else []
+            outputs = bound_artifact_records(artifacts, repository, commit_sha, observed, prepared, tested) if remote_verified is True else []
             if outputs:
                 rec["result"]["artifacts"] = outputs
             rec.setdefault("events", []).append(
