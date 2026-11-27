@@ -1085,3 +1085,19 @@ receipts are supplied only to the same human in the same bot/group/conversation.
 Claim history is retained without automatic cleanup. This increment does not
 integrate native creation into background Developer jobs or implement manual
 resend / cross-host artifact transfer. When disabled, legacy media behavior stays.
+
+### NA-06.7.4.1 — Native artifact read recovery
+
+With NATIVE_ARTIFACT_REGISTRY=on, native file delivery retries temporary
+discovery/transport/HTTP errors at delays 0, 2, 5, 10 seconds. New temporary
+destination per read; no CWA write or Telegram send retry. Fixed stage/reason/HTTP
+codes logged and persisted on failure, no raw exception/body/locator. Pinned CWA
+does not expose curl exit code. Integrity, ambiguous identity, size, forbidden
+locator and local publication failures are terminal. For addressed human turns,
+a random host-generated marker is appended before the single CWA send. On an
+eligible ambiguous failure, read the public canonical snapshot via read client;
+require exact conversation, unique user marker, current completed visible final
+and nearest user ancestor. Never execute recovered actions, peer handoffs or voice.
+Only linked native files or existing image monitor may be delivered. No model replay.
+Bounded synchronous recovery in the turn handler; existing image background monitor
+unchanged. Unconfirmed result reported to human. No restart replay. CWA unchanged.

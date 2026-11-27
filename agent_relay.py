@@ -41,6 +41,7 @@ from work_feedback import context_prompt, scoped, render_read, TERMINAL
 from artifact_registry import (parse_artifact_projects, merge_required, register_artifacts,
                                artifact_label)
 from native_artifacts import NativeArtifactRegistry, deliver_native, receipt_context, native_filenames
+from artifact_recovery import recover_turn, recovery_eligible
 from feedback_loop import (parse_feedback_projects, read_commit_identity, repairable,
                            preserves_checks, feedback_context, feedback_label)
 from action_dispatch import DispatchClaims
@@ -1192,6 +1193,10 @@ class AgentRelay:
                 verification_by_project={name: self._verification_capabilities(name) for name in projects})
             prompt += action_prompt(action_token, projects, execute=self.action_claims is not None,
                                     catalog=catalog)
+        recovery_marker = None
+        if self.native_artifacts is not None and addressed and not sender_is_bot:
+            recovery_marker = '[AgentRelay recovery identity: ' + uuid.uuid4().hex + ']'
+            prompt += '\n' + recovery_marker + '\nThis is Host turn identity; do not quote it in the response.'
         params: dict[str, Any] = {'conversation': self.config.conversation_id}
         if inbound and inbound.media:
             params['media'] = inbound.media
@@ -1209,7 +1214,43 @@ class AgentRelay:
                             start_thread=self._start_managed_thread)
                 if self.config.chat_typing else nullcontext())
             with typing_scope:
-                result = self._cwa_send(prompt, purpose='chat', **params)
+                try:
+                    result = self._cwa_send(prompt, purpose='chat', **params)
+                except Exception as exc:
+                    if not recovery_marker or not self._run_permitted(run_generation):
+                        raise
+                    if not recovery_eligible(exc):
+                        self._native_recovery_notice(message, run_generation,
+                            'Host: ответ CWA не подтверждён; повторного запроса к модели не будет.')
+                        return
+                    self._native_recovery_notice(message, run_generation,
+                        'Host: ответ CWA потерян; проверяю сохранённый результат без повторного запроса.')
+                    recovered = recover_turn(self.image_client, self.config.conversation_id, recovery_marker,
+                        permitted=lambda: self._run_permitted(run_generation))
+                    if not self._run_permitted(run_generation):
+                        return
+                    if recovered is None:
+                        self._native_recovery_notice(message, run_generation,
+                            'Host: завершённый ответ этого запроса не подтверждён. Запрос не повторялся.')
+                        return
+                    # Only file delivery; never dispatch recovered actions or peer handoffs.
+                    observation = parse_action_response(recovered, token=None, projects={})
+                    if (observation.seen or '[[handoff:' in recovered.lower()
+                            or '[[stop_dialogue]]' in recovered.lower()
+                            or re.search(r'(?im)^\s*/relay@', recovered)):
+                        self._native_recovery_notice(message, run_generation,
+                            'Host: ответ найден, но содержит управляющее действие; оно не исполнено.')
+                        return
+                    if generation_requested and before_images is not None:
+                        self._start_image_monitor(before_images, reply_message_id=message['message_id'],
+                                                  generation=run_generation, serial=image_serial)
+                    elif native_filenames(recovered):
+                        self._deliver_native_result(recovered, sender, message, update_id, run_generation)
+                    else:
+                        self._native_recovery_notice(message, run_generation,
+                            'Host: ответ найден в ChatGPT, но подтверждённых ссылок на файлы нет. '
+                            'Автоматическое выполнение действий отключено при восстановлении.')
+                    return
             # A stop during CWA can never be rolled back. The answer is
             # discarded even if /resume has been received in the meantime.
             if not self._run_permitted(run_generation):
@@ -1364,25 +1405,7 @@ class AgentRelay:
                     if (addressed and not action_seen
                             and getattr(getattr(result, 'conversation', None), 'conversation_id', None)
                             == self.config.conversation_id):
-                        try:
-                            outcomes = deliver_native(self.native_artifacts, client=self.client,
-                                conversation_id=self.config.conversation_id, text=str(result.text or ''),
-                                bot_id=self.bot_id, chat_id=self.config.chat_id, user_id=sender['id'],
-                                update_id=update_id, request_message_id=message['message_id'],
-                                max_bytes=self.config.max_media_bytes,
-                                permitted=lambda: self._run_permitted(run_generation),
-                                publish=lambda data, name: send_file(self.config.telegram_token, 'sendDocument',
-                                    self.config.chat_id, data, name, reply_message_id=message['message_id']))
-                            for name, status in outcomes:
-                                LOG.info('Native artifact · status=%s', status)
-                                if status != 'delivered' and self._run_permitted(run_generation):
-                                    self.api.call('sendMessage', {'chat_id': self.config.chat_id,
-                                        'text': 'Host: файл ' + name + ' · ' + status + '; автоматического повтора нет.'})
-                        except Exception as exc:
-                            LOG.warning('Native artifact registry unavailable (%s); no retry', type(exc).__name__)
-                            if self._run_permitted(run_generation):
-                                self.api.call('sendMessage', {'chat_id': self.config.chat_id,
-                                    'text': 'Host: передача артефакта не подтверждена; автоматического повтора нет.'})
+                        self._deliver_native_result(str(result.text or ''), sender, message, update_id, run_generation)
                     elif addressed and not action_seen and native_filenames(str(result.text or '')):
                         self.api.call('sendMessage', {'chat_id': self.config.chat_id,
                             'text': 'Host: идентичность разговора CWA не подтверждена; файл не отправлен.'})
@@ -1425,6 +1448,35 @@ class AgentRelay:
             if sender_is_bot:
                 self._stop_peer_reply()
             LOG.error('Ответ не завершён · update=%s · %s · без повтора', update_id, type(exc).__name__)
+
+    def _native_recovery_notice(self, message, generation, text):
+        if not self._run_permitted(generation):
+            return
+        try:
+            self.api.call('sendMessage', {'chat_id': self.config.chat_id, 'text': text,
+                'reply_parameters': {'message_id': message['message_id'], 'allow_sending_without_reply': True}})
+        except Exception:
+            LOG.warning('Native artifact notice unavailable')
+
+    def _deliver_native_result(self, text, sender, message, update_id, generation):
+        try:
+            outcomes = deliver_native(self.native_artifacts, client=self.client,
+                conversation_id=self.config.conversation_id, text=text,
+                bot_id=self.bot_id, chat_id=self.config.chat_id, user_id=sender['id'],
+                update_id=update_id, request_message_id=message['message_id'],
+                max_bytes=self.config.max_media_bytes,
+                permitted=lambda: self._run_permitted(generation),
+                publish=lambda data, name: send_file(self.config.telegram_token, 'sendDocument',
+                    self.config.chat_id, data, name, reply_message_id=message['message_id']))
+            for name, status in outcomes:
+                LOG.info('Native artifact · status=%s', status)
+                if status != 'delivered':
+                    self._native_recovery_notice(message, generation,
+                        'Host: файл ' + name + ' · ' + status + '; автоматической повторной отправки нет.')
+        except Exception as exc:
+            LOG.warning('Native artifact registry unavailable (%s); no retry', type(exc).__name__)
+            self._native_recovery_notice(message, generation,
+                'Host: передача артефакта не подтверждена; автоматического повтора нет.')
 
     def _handle_catchup(self, updates: list[dict[str, Any]], generation: int) -> None:
         if (self.config.catchup_max_replies == 0 or self._catchup_replied

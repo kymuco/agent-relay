@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from relay_media import ARTIFACT_EXTS, MAX_BYTES, safe_filename
+from artifact_recovery import READ_DELAYS, read_error, wait_permitted
+from relay_logging import LOG
 
 # Match a complete sandbox basename, not a prefix of a nested path or query.
 _LINK = re.compile(r"(?<![\w/])sandbox:/mnt/data/([A-Za-z0-9][A-Za-z0-9_.-]{0,119})(?=$|[\s)\]>\"'])")
@@ -182,7 +184,8 @@ def receipt_context(records: list[dict]) -> str:
 def deliver_native(registry: NativeArtifactRegistry, *, client, conversation_id: str,
                    text: str, bot_id: int, chat_id: int, user_id: int, update_id: int,
                    request_message_id: int, max_bytes: int, permitted: Callable[[], bool],
-                   publish: Callable[[bytes, str], dict]) -> list[tuple[str, str]]:
+                   publish: Callable[[bytes, str], dict],
+                   delays=READ_DELAYS, wait=wait_permitted) -> list[tuple[str, str]]:
     outcomes = []
     for name in native_filenames(text):
         if not permitted():
@@ -194,16 +197,29 @@ def deliver_native(registry: NativeArtifactRegistry, *, client, conversation_id:
         if not permitted():
             registry.transition(aid,"retrieving","stopped")
             break
-        try:
-            with tempfile.TemporaryDirectory(prefix="agentrelay-native-artifact-") as td:
-                data,digest = verified_bytes(client,conversation_id,name,Path(td),max_bytes=max_bytes)
-        except Exception:
-            registry.transition(aid,"retrieving","unavailable",reason="handoff_failed")
-            outcomes.append((name,"unavailable"))
-            continue
+        data = None
+        reason = "HANDOFF_FAILED"
+        for attempt, delay in enumerate(delays, 1):
+            if not wait(delay, permitted) or not permitted():
+                break
+            try:
+                with tempfile.TemporaryDirectory(prefix="agentrelay-native-artifact-") as td:
+                    data,digest = verified_bytes(client,conversation_id,name,Path(td),max_bytes=max_bytes)
+                break
+            except Exception as exc:
+                stage, code, http, temporary = read_error(exc)
+                reason = f"{stage}:{code}:http={http or '-'}"
+                LOG.warning("Native artifact read · attempt=%s · stage=%s · reason=%s · http=%s",
+                            attempt, stage, code, http or "-")
+                if not temporary:
+                    break
         if not permitted():
             registry.transition(aid,"retrieving","stopped")
             break
+        if data is None:
+            registry.transition(aid,"retrieving","unavailable",reason=reason)
+            outcomes.append((name,"unavailable"))
+            continue
         if not registry.transition(aid,"retrieving","sending",size=len(data),sha256=digest):
             break
         if not permitted():
