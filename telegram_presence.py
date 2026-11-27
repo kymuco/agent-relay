@@ -20,7 +20,7 @@ from local_execution import execution_record
 from local_diagnostics import diagnostic_record
 from verification_routing import verification_record
 from feedback_loop import feedback_record
-from artifact_registry import artifact_records
+from artifact_registry import bound_artifact_records
 from work_card_views import (render_work_card, render_work_journal,
                              journal_event, work_keyboard)
 
@@ -298,7 +298,7 @@ class WorkProgress:
             loop = feedback_record(feedback, commit_sha) if remote_verified is True else None
             if loop is not None:
                 rec["result"]["feedback"] = loop
-            outputs = artifact_records(artifacts, repository, commit_sha) if remote_verified is True else []
+            outputs = bound_artifact_records(artifacts, repository, commit_sha, observed) if remote_verified is True else []
             if outputs:
                 rec["result"]["artifacts"] = outputs
             rec.setdefault("events", []).append(

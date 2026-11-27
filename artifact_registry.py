@@ -341,9 +341,21 @@ def artifact_url(record: dict) -> str | None:
             + "/" + quote(item["path"], safe="/"))
 
 
+def bound_artifact_records(data: Any, repo: str, sha: str, ci: Any) -> list[dict]:
+    """Reject available Actions metadata disconnected from successful Host CI evidence."""
+    from github_ci import ci_record
+    values = artifact_records(data, repo, sha)
+    observed = ci_record(ci, sha)
+    if any(item["source"] == _ACTIONS and item["status"] == "available"
+           and (not observed or observed["status"] != "passed"
+                or item["run_id"] not in observed["run_ids"]) for item in values):
+        return []
+    return values
+
+
 def result_artifacts(result: Mapping[str, Any]) -> list[dict]:
-    return artifact_records(result.get("artifacts"), result.get("repository"),
-                            result.get("commit_sha")) if result.get("remote_verified") is True else []
+    return bound_artifact_records(result.get("artifacts"), result.get("repository"),
+                                  result.get("commit_sha"), result.get("ci")) if result.get("remote_verified") is True else []
 
 
 def artifact_label(record: dict, *, include_url: bool = False) -> str:
