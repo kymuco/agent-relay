@@ -611,7 +611,8 @@ class AgentRelay:
         self.work = WorkState(config.work_state_file) if config.work_enabled else None
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
-        self.feedback_projects = parse_feedback_projects(config.work_feedback_projects, self.work_repos)
+        self.feedback_projects = parse_feedback_projects(config.work_feedback_projects, {
+            alias: repo for alias, repo in self.work_repos.items() if alias in self.work_projects})
         if config.action_mode != 'off' and not config.action_auto_projects.issubset(
                 set(self.work_projects) & set(self.work_repos)):
             raise ValueError('ACTION_AUTO_PROJECTS must contain only configured GitHub project aliases')
@@ -1920,6 +1921,7 @@ class AgentRelay:
             return
         repo = self.work_repos[project]
         stage = 'delegation'
+        feedback_attempts = 0
         try:
             if delegation not in ('direct', 'coordinated'):
                 raise ValueError('Unknown delegation route')
@@ -1930,8 +1932,8 @@ class AgentRelay:
             authorized_amendments = []
             feedback_enabled = project in self.feedback_projects
             feedback = None
-            feedback_attempts = 0
             feedback_commits = []
+            feedback_observations = []
             seen_trees = set()
             identity = None
             verified = False
@@ -2037,7 +2039,7 @@ class AgentRelay:
                 nonlocal feedback
                 feedback = {'commit_sha': report.commit_sha, 'status': state,
                             'attempts': feedback_attempts, 'commits': feedback_commits[-12:],
-                            'summary': summary[:1200]}
+                            'observations': feedback_observations[-12:], 'summary': summary[:1200]}
                 LOG.info('GitHub-задача #%s · feedback=%s · attempts=%s',
                          work_id, state, feedback_attempts)
                 return self.work.checkpoint_result(work_id, current_evidence())
@@ -2059,12 +2061,7 @@ class AgentRelay:
                         return
                     LOG.info('GitHub-задача #%s · CI=%s · runs=%s',
                              work_id, ci['status'], ci['run_count'])
-                    if not self.work.checkpoint_result(work_id, {
-                            'delegation': delegation,
-                            'developer_status': report.status, 'repository': report.repository,
-                            'branch': report.branch, 'commit_sha': report.commit_sha,
-                            'developer_summary': report.summary, 'remote_verified': True,
-                            'local_check': verification_note, 'verification': verification, 'ci': ci}):
+                    if not self.work.checkpoint_result(work_id, current_evidence()):
                         return
                 if (verified and report.status == 'ready' and self.workspace_root is not None
                         and wants_local(verification, ci)):
@@ -2078,12 +2075,7 @@ class AgentRelay:
                         return
                     LOG.info('GitHub-задача #%s · workspace=%s · id=%s',
                              work_id, workspace['status'], workspace['workspace_id'])
-                    if not self.work.checkpoint_result(work_id, {
-                            'delegation': delegation,
-                            'developer_status': report.status, 'repository': report.repository,
-                            'branch': report.branch, 'commit_sha': report.commit_sha,
-                            'developer_summary': report.summary, 'remote_verified': True,
-                            'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace}):
+                    if not self.work.checkpoint_result(work_id, current_evidence()):
                         return
                 preset = self.local_tests.get(project)
                 if (verified and report.status == 'ready' and preset
@@ -2102,13 +2094,7 @@ class AgentRelay:
                         return
                     LOG.info('GitHub-задача #%s · local=%s · preset=%s · exit=%s · tests=%s',
                              work_id, execution['status'], preset, execution['exit_code'], execution['tests_run'])
-                    if not self.work.checkpoint_result(work_id, {
-                            'delegation': delegation,
-                            'developer_status': report.status, 'repository': report.repository,
-                            'branch': report.branch, 'commit_sha': report.commit_sha,
-                            'developer_summary': report.summary, 'remote_verified': True,
-                            'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace,
-                            'execution': execution}):
+                    if not self.work.checkpoint_result(work_id, current_evidence()):
                         return
                 if project in self.diagnostic_projects and should_diagnose(execution):
                     stage = 'Codex diagnostics'
@@ -2123,19 +2109,17 @@ class AgentRelay:
                         return
                     LOG.info('GitHub-задача #%s · diagnostics=%s · reason=%s',
                              work_id, diagnostic['status'], diagnostic['reason'] or '-')
-                    if not self.work.checkpoint_result(work_id, {
-                            'delegation': delegation,
-                            'developer_status': report.status, 'repository': report.repository,
-                            'branch': report.branch, 'commit_sha': report.commit_sha,
-                            'developer_summary': report.summary, 'remote_verified': True,
-                            'local_check': verification_note, 'verification': verification, 'ci': ci, 'workspace': workspace,
-                            'execution': execution, 'diagnostic': diagnostic}):
+                    if not self.work.checkpoint_result(work_id, current_evidence()):
                         return
                 if not feedback_enabled or not verified or report.status != 'ready':
                     break
                 if not feedback_commits or feedback_commits[-1] != report.commit_sha:
                     feedback_commits.append(report.commit_sha)
                 issue = review_reason(verification, ci, execution)
+                feedback_observations.append({
+                    'sha': report.commit_sha, 'route': verification['route'] if verification else '',
+                    'ci': ci['status'] if ci else '', 'local': execution['status'] if execution else '',
+                    'diagnostic': diagnostic['status'] if diagnostic else '', 'issue': issue})
                 if not issue:
                     if not save_feedback('resolved' if feedback_attempts else 'not_needed'):
                         return
@@ -2173,11 +2157,12 @@ class AgentRelay:
                     if not save_feedback('human_amendments_pending'):
                         return
                     break
-                context = feedback_context(current_evidence(), failure_output[-1] if failure_output else '')
+                excerpt = failure_output[-1] if failure_output else ''
                 failure_output.clear()
                 feedback_attempts += 1
                 if not save_feedback('evaluating'):
                     return
+                context = feedback_context(current_evidence(), excerpt)
                 rounds += 1
                 if not self.work.update(work_id, 'running', rounds, note='Developer анализирует результат проверки'):
                     return
@@ -2347,8 +2332,14 @@ class AgentRelay:
             if not permitted():
                 return
             # A failed/ambiguous feedback turn never erases prior verified evidence.
-            terminal = 'needs_review' if stage.startswith('feedback') else 'failed'
-            self.work.update(work_id, terminal, note='Ошибка этапа: ' + stage[:100])
+            terminal = 'needs_review' if stage.startswith('feedback') or feedback_attempts else 'failed'
+            if feedback_attempts:
+                try:
+                    save_feedback('ambiguous', 'Сбой этапа; автоматический повтор запрещён')
+                except Exception:
+                    LOG.warning('Feedback checkpoint unavailable')
+            self.work.update(work_id, terminal, rounds if feedback_attempts else 0,
+                             note='Ошибка этапа: ' + stage[:100])
             status_edited = (
                 self.progress.update(work_id, terminal,
                                      note='Сбой на этапе ' + stage[:80])

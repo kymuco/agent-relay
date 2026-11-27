@@ -1008,8 +1008,9 @@ unadmitted or weakened plan stops without further execution. On identity failure
 or repeated tree, the prior historical verified SHA is retained; the branch may
 have moved. Stop, shutdown, and interrupted tasks fence further calls, no replay.
 Late human amendments remain queued for review rather than silently applied by
-repair. Up to 12 recent verified SHAs and attempt count are retained in feedback
-records; full commit history stays in the branch. No raw test logs are persisted;
+repair. Up to 12 recent verified SHAs, compact per-round verification outcomes
+and attempt count are retained in feedback records; full commit history stays
+in the branch. No raw test logs are persisted;
 opt-in permits bounded redacted failure context to be sent to Developer, which may
 still contain sensitive data. Repeated trees are a deterministic no-progress guard,
 not a guarantee of semantic progress for every different tree. Local execution

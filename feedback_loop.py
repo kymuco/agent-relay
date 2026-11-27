@@ -89,14 +89,26 @@ def feedback_record(data: Any, sha: str) -> dict | None:
             or data.get("commit_sha") != sha or data.get("status") not in _STATES):
         return None
     count, commits, summary = data.get("attempts"), data.get("commits"), data.get("summary")
+    observations = data.get('observations', [])
     if (type(count) is not int or count < 0 or not isinstance(commits, list)
             or not 1 <= len(commits) <= 12 or len(commits) > count + 1
             or any(not isinstance(v, str) or not _SHA.fullmatch(v) for v in commits)
             or len(set(commits)) != len(commits) or commits[-1] != sha
             or not isinstance(summary, str) or len(summary) > 1200):
         return None
+    if not isinstance(observations, list) or len(observations) > 12:
+        return None
+    clean = []
+    for item in observations:
+        if (not isinstance(item, dict) or set(item) != {"sha", "route", "ci", "local", "diagnostic", "issue"}
+                or not all(isinstance(v, str) and len(v) <= 80 for v in item.values())
+                or not _SHA.fullmatch(item["sha"])):
+            return None
+        clean.append(dict(item))
+    if len({item["sha"] for item in clean}) != len(clean):
+        return None
     return {"commit_sha": sha, "status": data["status"], "attempts": count,
-            "commits": list(commits), "summary": summary}
+            "commits": list(commits), "observations": clean, "summary": summary}
 
 
 def feedback_label(data: Any, sha: str, *, detail=False) -> str:
@@ -108,6 +120,10 @@ def feedback_label(data: Any, sha: str, *, detail=False) -> str:
         label += " · " + record["summary"]
     if detail and len(record["commits"]) > 1:
         label += " · SHA: " + " → ".join(v[:12] for v in record["commits"])
+    if detail and record["observations"]:
+        label += " · проверки: " + "; ".join(
+            item["sha"][:8] + " " + (item["ci"] or "—") + "/" + (item["local"] or "—")
+            for item in record["observations"])
     return label
 
 

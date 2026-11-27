@@ -238,7 +238,9 @@ def developer_prompt(instruction: str, *, repo: str, work_id: int,
            "and omit verification. If a repair is necessary, create exactly ONE new commit whose sole parent is "
            "the previous verified SHA, preserving all earlier authorized changes. Never weaken, remove or skip "
            "required verification, alter expected results to hide a bug, or change CI to suppress failures. "
-           "Do not fix intentionally failing tests. Keep previous required checks (cloud/local/hybrid and preset); "
+           "Do not fix intentionally failing tests. Compare recent verification observations; if the same failure "
+           "persists and changes are not meaningfully improving the result, stop unchanged. "
+           "Keep previous required checks (cloud/local/hybrid and preset); "
            "you may add a necessary authorized check. Do not create an empty commit or repeat earlier source trees. "
            "For new ready reports include verification as above. Do not request an unbounded repeat without progress.\n"
            if feedback is not None else "")
