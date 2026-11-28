@@ -1180,3 +1180,41 @@ stop is active (event outbox delivery can continue); resume does not replay
 work or authorize cognition. Temporary observation errors do not prevent
 Telegram polling. No new permissions, mission state, model wakeup, peer
 transport or automatic work execution. No additional configuration required.
+
+### NA-07.3 — Mission State & Grant (observe only)
+
+Opt in by adding `MISSION_ALLOWED_USER_IDS=<your numeric Telegram user ID>`
+to the existing named profile environment (e.g. .env.ragna). These IDs must
+also be in WORK_ALLOWED_USER_IDS and ALLOWED_USER_IDS. Requires named profile,
+GitHub work and Native Agency observe or execute mode. Project must be in
+WORK_PROJECTS, WORK_REPOS and ACTION_AUTO_PROJECTS. No implicit owner or
+permission migration. Empty disables mission commands and invalidates existing
+active grants on refresh. Ordinary work settings are unchanged.
+
+Use explicitly addressed, non-forwarded human Telegram commands (replace the
+bot username and project alias):
+
+    /mission@ragnacobot start demo 60 10 3 12 | Implement a small tested CLI | CLI works; tests pass
+    /mission@ragnacobot status
+    /mission@ragnacobot revoke <exact mission_id>
+
+Limits are minutes (1–1440), decision turns (1–100), tasks (1–30), and total
+worker turns (1–200). Goal and criteria are mandatory. One active mission per
+profile; a fresh owner command is required after expiry/revocation/invalidation.
+The grant is immutable, bound to bot identity, owner, group, message, exact
+repository and emergency-control generation. A duplicate message cannot
+create another grant. The lifecycle is refreshed on polling/status/start/revoke;
+changing control generation (including /stop then /resume), owner, group or
+repository invalidates it. Any configured mission owner may revoke the exact
+active grant. No grant automatically resumes. Historical startup backlog
+commands do not create grants; only fresh messages reach the handler.
+
+Mission rows live in the existing work event SQLite database, with a unique
+active-mission constraint. Goals and criteria may be sensitive; keep local
+state private. Commands do not trigger CWA, developer, Codex, peer messages
+or GitHub writes. Budgets are stored but not spent; counters are zero until
+later execution stages. No historical WorkState/decision rows are linked to a
+mission, no automatic wakeups, no new merge or delegation permission. The
+mission is a recorded planning envelope, NOT a grant usable by any existing
+dispatcher. Status/revoke work while paused; a new mission cannot be created
+while paused. No live verification implied by offline tests.

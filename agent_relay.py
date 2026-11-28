@@ -23,6 +23,7 @@ from typing import Any
 from agent_control import ControlState
 from agent_events import EventJournal
 from decision_scheduler import DecisionScheduler
+from mission_state import MissionStore, MissionPolicy, MissionRejected, parse_request as parse_mission_request
 from local_codex import (WorkState, parse_projects, parse_work_command,
                          parse_orchestrator_decision, work_prompt)
 from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
@@ -182,6 +183,7 @@ class Config:
     agent_profile: str = ''
     agent_name: str = ''
     verify_final_text: bool = True
+    mission_allowed_user_ids: frozenset[int] = frozenset()
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -353,6 +355,8 @@ class Config:
             work_progress_file=os.getenv('WORK_PROGRESS_FILE', '.agent-relay-progress.json'),
             agent_profile=os.getenv('AGENT_PROFILE', '').strip(),
             agent_name=os.getenv('AGENT_NAME', '').strip(),
+            mission_allowed_user_ids=numeric_ids(os.getenv('MISSION_ALLOWED_USER_IDS', ''),
+                                                 'MISSION_ALLOWED_USER_IDS'),
         ))
 
 
@@ -566,6 +570,12 @@ class AgentRelay:
                 or config.work_executor != 'github' or not config.action_auto_projects
                 or config.work_local_verify):
             raise ValueError('Execute requires smoke-test acknowledgement, GitHub work, explicit auto projects and WORK_LOCAL_VERIFY=off')
+        if config.mission_allowed_user_ids and (
+                not config.mission_allowed_user_ids.issubset(config.work_allowed_user_ids)
+                or not config.mission_allowed_user_ids.issubset(config.allowed_user_ids)
+                or not config.agent_profile or not config.work_enabled
+                or config.work_executor != 'github' or config.action_mode == 'off'):
+            raise ValueError('Mission owners require a named GitHub Native Agency profile and authorized work users')
         me = api.call('getMe')
         if type(me.get('id')) is not int or me['id'] <= 0 or not isinstance(me.get('username'), str) or not me['username']:
             raise ValueError('Telegram getMe returned invalid bot identity')
@@ -630,6 +640,7 @@ class AgentRelay:
                      if config.work_enabled else None)
         self.decision_scheduler = (DecisionScheduler(self.events)
                                    if self.events is not None else None)
+        self.missions = MissionStore(self.events) if self.events is not None else None
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
         self.feedback_projects = parse_feedback_projects(config.work_feedback_projects, {
@@ -985,6 +996,8 @@ class AgentRelay:
                 'reply_parameters': {'message_id': message['message_id'],
                                      'allow_sending_without_reply': True},
             })
+            return
+        if self._handle_mission_command(message, expected_generation=expected_generation):
             return
         run_generation = (self.control.generation() if expected_generation is None
                           else expected_generation)
@@ -1592,6 +1605,67 @@ class AgentRelay:
         text = str(message.get('text') or '').strip().split(maxsplit=1)
         return bool(text and text[0].lower() ==
                     f'/catchup@{self.bot_username}'.lower())
+
+    def _mission_policy(self, generation: int | None = None) -> MissionPolicy:
+        projects = {alias: repo for alias, repo in self.work_repos.items()
+                    if alias in self.work_projects and alias in self.config.action_auto_projects}
+        return MissionPolicy(self.config.mission_allowed_user_ids, projects,
+                             self.config.chat_id, self.control.generation() if generation is None else generation)
+
+    def _handle_mission_command(self, message: dict[str, Any], *, expected_generation: int | None = None) -> bool:
+        """Owner-only local grant management, never a model or work dispatch."""
+        raw = message.get('text')
+        if not isinstance(raw, str):
+            return False
+        words = raw.strip().split(maxsplit=2)
+        if not words or words[0].lower() != f'/mission@{self.bot_username}'.lower():
+            return False
+        chat, sender = message.get('chat') or {}, message.get('from') or {}
+        if (chat.get('id') != self.config.chat_id or chat.get('type') not in ('group', 'supergroup')
+                or not trusted_sender(message, self.config.allowed_user_ids, self.config.peers,
+                                      self.config.peer_bot_ids, self.bot_id)
+                or sender.get('is_bot') is not False or sender.get('id') not in self.config.mission_allowed_user_ids
+                or any(key in message for key in ('forward_origin', 'forward_date', 'external_reply',
+                                                  'quote', 'via_bot', 'sender_chat'))
+                or type(message.get('message_id')) is not int or message['message_id'] <= 0):
+            return True
+        verb = words[1].lower() if len(words) > 1 else ''
+        argument = words[2] if len(words) > 2 else ''
+        try:
+            if self.missions is None:
+                reply = 'Миссии отключены.'
+            elif verb == 'start':
+                request = parse_mission_request(argument)
+                generation = self.control.generation() if expected_generation is None else expected_generation
+                policy = self._mission_policy(generation)
+                mission = self.control.admit(generation, lambda: self.missions.create(
+                    request, owner_user_id=sender['id'], message_id=message['message_id'], policy=policy))
+                reply = ('Миссия не создана: ассистент остановлен или поколение изменилось.' if mission is None else
+                         'Миссия сохранена: ' + mission['mission_id'] + '\nПроект: ' + mission['project'] +
+                         '\nРежим наблюдения: модель и исполнители не запущены.')
+            elif verb == 'status' and not argument:
+                mission = self.missions.latest(self._mission_policy())
+                reply = ('Миссий пока нет.' if mission is None else
+                         f"Миссия {mission['mission_id']} · {mission['status']} · {mission['project']}\n"
+                         f"Лимиты: решения {mission['max_decisions']}, задачи {mission['max_tasks']}, "
+                         f"ходы исполнителей {mission['max_worker_turns']}\n"
+                         'NA-07.3: автономное исполнение отключено.')
+            elif verb == 'revoke':
+                changed = self.missions.revoke(argument.strip(), owner_user_id=sender['id'],
+                                               policy=self._mission_policy())
+                reply = 'Разрешение миссии отозвано.' if changed else 'Активная миссия с таким ID не найдена.'
+            else:
+                reply = (f'/mission@{self.bot_username} start <проект> <минуты> <решения> <задачи> <ходы исполнителей> '
+                         '| <цель> | <критерий; критерий> · status · revoke <mission_id>')
+        except MissionRejected as exc:
+            reply = 'Миссия не изменена: ' + str(exc)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            LOG.warning('NA-07.3 mission state unavailable (%s)', type(exc).__name__)
+            reply = 'Состояние миссии недоступно. Автоматического повтора нет.'
+        self.api.call('sendMessage', {'chat_id': self.config.chat_id, 'text': reply,
+                                     'reply_parameters': {'message_id': message['message_id'],
+                                                          'allow_sending_without_reply': True}})
+        return True
 
     def _handle_work_command(
         self, message: dict[str, Any],
@@ -2841,6 +2915,8 @@ class AgentRelay:
                 work_queue.put_nowait(({'_catchup_batch': self._catchup_history},
                                        self.control.generation()))
             for update in fresh:
+                if self._handle_mission_command(update.get('message') or {}):
+                    continue
                 if not self.control.paused:
                     if self._handle_task_reply(
                             update.get('message') or {}, work_queue, update=update):
@@ -2852,6 +2928,11 @@ class AgentRelay:
         while not self._shutdown.is_set():
             try:
                 self._observe_work_events()
+                if self.missions is not None:
+                    try:
+                        self.missions.latest(self._mission_policy())
+                    except (OSError, sqlite3.Error, ValueError) as exc:
+                        LOG.warning('NA-07.3 refresh deferred (%s)', type(exc).__name__)
                 updates = self.api.call('getUpdates', {
                     'offset': self.cursor.offset,
                     'timeout': 30,
@@ -2868,6 +2949,8 @@ class AgentRelay:
                     if self._control_command(message):
                         # A human emergency command outranks a running worker.
                         self.process_update(item, preadvanced=True)
+                    elif self._handle_mission_command(message):
+                        pass  # Owner-only grant control, even while paused.
                     elif self._handle_work_command(message, work_queue):
                         pass  # Explicit work control bypasses CWA worker.
                     elif self._handle_task_reply(message, work_queue, update=item):
