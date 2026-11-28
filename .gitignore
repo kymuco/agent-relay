@@ -28,3 +28,5 @@ logs/
 .env.*
 !.env.example
 .agent-relay-profiles/
+
+*.events.sqlite3*

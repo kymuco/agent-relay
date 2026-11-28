@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_control import ControlState
+from agent_events import EventJournal
 from local_codex import (WorkState, parse_projects, parse_work_command,
                          parse_orchestrator_decision, work_prompt)
 from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
@@ -622,7 +623,10 @@ class AgentRelay:
         self.diagnostic_projects = parse_diagnostic_projects(config.work_codex_diagnostics, self.local_tests)
         if not 10 <= config.work_diagnostic_timeout_seconds <= 600:
             raise ValueError('WORK_DIAGNOSTIC_TIMEOUT_SECONDS must be between 10 and 600')
-        self.work = WorkState(config.work_state_file) if config.work_enabled else None
+        self.events = (EventJournal(str(config.work_state_file) + '.events.sqlite3',
+                                    'bot-' + str(self.bot_id)) if config.work_enabled else None)
+        self.work = (WorkState(config.work_state_file, event_journal=self.events)
+                     if config.work_enabled else None)
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
         self.feedback_projects = parse_feedback_projects(config.work_feedback_projects, {
@@ -2830,6 +2834,8 @@ class AgentRelay:
                         LOG.warning('Очередь заполнена: новое сообщение пропущено')
         while not self._shutdown.is_set():
             try:
+                if self.work is not None:
+                    self.work.flush_events()
                 updates = self.api.call('getUpdates', {
                     'offset': self.cursor.offset,
                     'timeout': 30,

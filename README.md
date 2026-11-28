@@ -1124,3 +1124,39 @@ bytes. Local file links and Telegram transfer are deferred to NA-06.7.6.
 Local tests are trusted code running with the Host user's permissions, not
 an OS sandbox, and may themselves access or modify other resources. Limits bound
 Host collection, not disk writes of the child. Operator owns cleanup/retention.
+
+### NA-07.1 — Durable Event Runtime
+
+When work is enabled, the Host creates a local SQLite journal next to
+`WORK_STATE_FILE` (suffix `.events.sqlite3`). Named profiles inherit their
+existing isolated work-state paths; journal identity is bound to Telegram bot
+ID. Do not share these files between processes or reset them independently.
+No new settings, model calls, network events, autonomous dispatch or authority
+are introduced.
+
+Every new persisted WorkState transition captures one Host event:
+work.accepted (local reservation), work.started (running phase, not proof of
+remote submission), work.completed, work.failed, work.needs_review,
+work.interrupted or work.stopped. Repeated running stage updates and result
+checkpoints do not emit new lifecycle events. Terminal status is immutable
+through update(), so a Telegram presentation error cannot undo finalized work.
+Legacy snapshots are not backfilled; a legacy active task marked interrupted
+on startup produces a real new transition. Status alone is not proof of tests,
+remote writes or achievement of a goal; commit evidence is included only when
+the retained verified result matches the work identity. No raw task text,
+model summaries, logs or credentials are copied into the event payload.
+
+The event outbox is written in the same atomic JSON replacement as WorkState.
+SQLite append is idempotent on the persisted event UUID, with a monotonic
+local read cursor. After a successful SQLite transaction, acknowledged events
+are dropped from memory and from the next JSON write. If the process exits
+before that write, restart replays the same IDs, not the work. Delivery is
+retried on WorkState changes, startup and the existing Telegram polling loop;
+temporary append failures retain the outbox. Startup journal initialization
+or invalid persisted state can fail closed. This protects against process
+interruption, not arbitrary disk corruption or independent deletion of files.
+No automatic rotation: monitor disk usage; keep JSON and journal backups
+together. Custom state paths must be ignored in Git. This is a local event
+producer, not yet a mission scheduler, consumer acknowledgement protocol or
+cross-host federation. Emergency stop still fences work; events are historical
+facts, never permission to act. Existing work is never automatically replayed.

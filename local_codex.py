@@ -6,6 +6,8 @@ output can only supply a Codex task. Never relaunch an interrupted work.
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 import os
 import re
 import shutil
@@ -21,6 +23,7 @@ from typing import Any
 
 from work_feedback import HISTORY_LIMIT, TERMINAL, result_record, snapshot
 from artifact_registry import artifact_records, withhold_artifacts
+from agent_events import EventJournal, STATUS_EVENTS, transition_event
 
 _ALIAS = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 _ALLOWED_ENV = {
@@ -307,8 +310,10 @@ class WorkState:
     """Single in-flight task, crash-safe status, never replay on restart."""
     ACTIVE = {"queued", "running"}
 
-    def __init__(self, file: str):
+    def __init__(self, file: str, *, event_journal: EventJournal | None = None):
         self.path = Path(file)
+        self.event_journal = event_journal
+        self._event_outbox: list[dict] = []
         self._lock = threading.Lock()
         self.runner = CodexRunner()
         self.record: dict[str, Any] = {"id": 0, "status": "idle", "project": "", "stage": 0}
@@ -333,21 +338,59 @@ class WorkState:
                                or type(item.get("stage")) is not int for item in history)
                         or len({item["id"] for item in history}) != len(history)):
                     raise ValueError("invalid work history")
+                pending_events = saved.pop("event_outbox", [])
+                if not isinstance(pending_events, list) or any(not isinstance(e, dict) for e in pending_events):
+                    raise ValueError("invalid event outbox")
+                if self.event_journal is not None:
+                    for event in pending_events:
+                        self.event_journal.validate(event)
+                self._event_outbox = pending_events
                 self.record = saved
             except (OSError, ValueError, UnicodeError) as exc:
                 raise ValueError("Work state unreadable; refusing local work") from exc
-            if self.record["status"] in self.ACTIVE:
-                self.record["status"] = "interrupted"
-                self._write()
+        self._event_state = (self.record["id"], self.record["status"])
+        if self.record["status"] in self.ACTIVE:
+            self.record["status"] = "interrupted"
+            self._write()
+        self.flush_events()
+
+    def _flush_events_locked(self) -> bool:
+        if self.event_journal is None or not self._event_outbox:
+            return not self._event_outbox
+        try:
+            self.event_journal.append(self._event_outbox)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            logging.getLogger(__name__).warning("Work event delivery deferred (%s)", type(exc).__name__)
+            return False
+        # The on-disk outbox may still contain delivered IDs. Replaying them
+        # is safe; the next atomic WorkState write drops acknowledged entries.
+        self._event_outbox = []
+        return True
+
+    def flush_events(self) -> bool:
+        """Reconcile the durable outbox; never run a worker or model."""
+        with self._lock:
+            return self._flush_events_locked()
 
     def _write(self) -> None:
+        state = (self.record["id"], self.record["status"])
+        pending = list(self._event_outbox)
+        if (self.event_journal is not None and state != self._event_state
+                and state[0] > 0 and state[1] in STATUS_EVENTS):
+            pending.append(transition_event(self.event_journal.agent_id, self.record))
+        saved = dict(self.record)
+        if pending:
+            saved["event_outbox"] = pending
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         with tmp.open("w", encoding="utf-8") as stream:
-            json.dump(self.record, stream, ensure_ascii=False)
+            json.dump(saved, stream, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, self.path)
+        self._event_state = state
+        self._event_outbox = pending
+        self._flush_events_locked()
 
     def start(self, project: str, *, branch: str | None = None,
               proposal_id: str | None = None, repository: str = "",
@@ -372,7 +415,8 @@ class WorkState:
     def update(self, id: int, status: str, stage: int = 0,
                note: str = "") -> bool:
         with self._lock:
-            if self.record["id"] != id or self._cancel.is_set():
+            if (self.record["id"] != id or self._cancel.is_set()
+                    or self.record["status"] not in self.ACTIVE):
                 return False
             self.record.update(status=status, stage=stage, note=note[:350])
             self._write()
