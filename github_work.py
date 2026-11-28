@@ -42,7 +42,7 @@ def parse_repositories(raw: str) -> dict[str, str]:
 
 class ChatRegistry:
     """Atomic, durable IDs of two independent long-lived ChatGPT conversations."""
-    _LANES = frozenset(("coordinator", "developer"))
+    _LANES = frozenset(("coordinator", "developer", "mission"))
 
     def __init__(self, path: str, *, main_id: str = '', claim_lane=None,
                  retained_lanes: dict[str, str] | None = None):

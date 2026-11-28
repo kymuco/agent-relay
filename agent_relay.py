@@ -24,6 +24,7 @@ from agent_control import ControlState
 from agent_events import EventJournal
 from decision_scheduler import DecisionScheduler
 from mission_state import MissionStore, MissionPolicy, MissionRejected, parse_request as parse_mission_request
+from mission_cognition import MissionCognition
 from local_codex import (WorkState, parse_projects, parse_work_command,
                          parse_orchestrator_decision, work_prompt)
 from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
@@ -184,6 +185,8 @@ class Config:
     agent_name: str = ''
     verify_final_text: bool = True
     mission_allowed_user_ids: frozenset[int] = frozenset()
+    mission_cognition_enabled: bool = False
+    mission_cognition_ack: bool = False
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -357,6 +360,8 @@ class Config:
             agent_name=os.getenv('AGENT_NAME', '').strip(),
             mission_allowed_user_ids=numeric_ids(os.getenv('MISSION_ALLOWED_USER_IDS', ''),
                                                  'MISSION_ALLOWED_USER_IDS'),
+            mission_cognition_enabled=os.getenv('MISSION_COGNITION', 'off').strip().lower() == 'on',
+            mission_cognition_ack=os.getenv('MISSION_COGNITION_READ_ONLY_ACK', 'off').strip().lower() == 'on',
         ))
 
 
@@ -543,17 +548,17 @@ class Cursor:
 class AgentRelay:
     def __init__(self, config: Config, api: Any, client: Any,
                  coordinator_client: Any = None, developer_client: Any = None,
-                 image_client: Any = None):
+                 image_client: Any = None, mission_client: Any = None):
         config = namespace_config(config)
         self.profile_lease = None
         try:
-            self._initialize(config, api, client, coordinator_client, developer_client, image_client)
+            self._initialize(config, api, client, coordinator_client, developer_client, image_client, mission_client)
         except BaseException:
             if self.profile_lease is not None:
                 self.profile_lease.close()
             raise
 
-    def _initialize(self, config, api, client, coordinator_client, developer_client, image_client):
+    def _initialize(self, config, api, client, coordinator_client, developer_client, image_client, mission_client):
         self.config = config
         if config.work_local_verify:
             raise ValueError('WORK_LOCAL_VERIFY=on is retired; use WORK_LOCAL_TESTS and Developer verification plans')
@@ -576,6 +581,11 @@ class AgentRelay:
                 or not config.agent_profile or not config.work_enabled
                 or config.work_executor != 'github' or config.action_mode == 'off'):
             raise ValueError('Mission owners require a named GitHub Native Agency profile and authorized work users')
+        if config.mission_cognition_enabled and (
+                not config.mission_cognition_ack or not config.mission_allowed_user_ids
+                or mission_client is None or any(mission_client is other for other in
+                    (client, coordinator_client, developer_client, image_client))):
+            raise ValueError('Mission cognition requires explicit read-only acknowledgement, owners and independent CWA client')
         me = api.call('getMe')
         if type(me.get('id')) is not int or me['id'] <= 0 or not isinstance(me.get('username'), str) or not me['username']:
             raise ValueError('Telegram getMe returned invalid bot identity')
@@ -641,6 +651,12 @@ class AgentRelay:
         self.decision_scheduler = (DecisionScheduler(self.events)
                                    if self.events is not None else None)
         self.missions = MissionStore(self.events) if self.events is not None else None
+        self.mission_cognition = (MissionCognition(mission_client, registry, self._cwa_send,
+                                                   agent_name=self.agent_name)
+                                  if config.mission_cognition_enabled else None)
+        self._mission_thread = None
+        if self.missions is not None:
+            self.missions.recover_cognition(enabled=config.mission_cognition_enabled)
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
         self.feedback_projects = parse_feedback_projects(config.work_feedback_projects, {
@@ -1639,17 +1655,29 @@ class AgentRelay:
                 generation = self.control.generation() if expected_generation is None else expected_generation
                 policy = self._mission_policy(generation)
                 mission = self.control.admit(generation, lambda: self.missions.create(
-                    request, owner_user_id=sender['id'], message_id=message['message_id'], policy=policy))
+                    request, owner_user_id=sender['id'], message_id=message['message_id'], policy=policy,
+                    arm_cognition=self.config.mission_cognition_enabled is True))
                 reply = ('Миссия не создана: ассистент остановлен или поколение изменилось.' if mission is None else
                          'Миссия сохранена: ' + mission['mission_id'] + '\nПроект: ' + mission['project'] +
-                         '\nРежим наблюдения: модель и исполнители не запущены.')
+                         ('\nПервый когнитивный ход ожидает запуска; исполнение отключено.'
+                          if mission.get('cognition') else '\nРежим наблюдения: модель и исполнители не запущены.'))
             elif verb == 'status' and not argument:
                 mission = self.missions.latest(self._mission_policy())
                 reply = ('Миссий пока нет.' if mission is None else
                          f"Миссия {mission['mission_id']} · {mission['status']} · {mission['project']}\n"
                          f"Лимиты: решения {mission['max_decisions']}, задачи {mission['max_tasks']}, "
                          f"ходы исполнителей {mission['max_worker_turns']}\n"
-                         'NA-07.3: автономное исполнение отключено.')
+                         'Автономное исполнение отключено.')
+                if mission and mission.get('cognition'):
+                    cognition = mission['cognition']
+                    reply += f"\nКогнитивные ходы: {mission['used_decisions']}/{mission['max_decisions']} · {cognition['state']}"
+                    decision = cognition.get('decision')
+                    if decision:
+                        reply += f"\nРешение (не исполнено): {decision['action']}\n{decision['reason']}"
+                        if decision['task']:
+                            reply += '\nПредлагаемая задача: ' + decision['task']
+                    elif cognition.get('reason'):
+                        reply += '\nПричина: ' + cognition['reason']
             elif verb == 'revoke':
                 changed = self.missions.revoke(argument.strip(), owner_user_id=sender['id'],
                                                policy=self._mission_policy())
@@ -2850,6 +2878,46 @@ class AgentRelay:
                           type(exc).__name__)
         return True
 
+    def _run_mission_cognition(self, mission: dict, generation: int) -> None:
+        decision = None
+        reason = 'turn_failed'
+        try:
+            if self._run_permitted(generation):
+                current = self.missions.latest(self._mission_policy(generation))
+                if current and current['mission_id'] == mission['mission_id'] and current['status'] == 'active':
+                    decision = self.mission_cognition.turn(mission)
+        except Exception as exc:
+            LOG.warning('NA-07.4 cognition failed (%s); no replay', type(exc).__name__)
+        try:
+            if not self._shutdown.is_set():
+                saved = self.control.admit(generation, lambda: self.missions.finish_cognition(
+                    mission['mission_id'], self._mission_policy(generation), decision=decision, reason=reason))
+                if saved is not None:
+                    LOG.info('NA-07.4 · cognition attempt recorded (no execution)')
+                    return
+            self.missions.finish_cognition(mission['mission_id'], self._mission_policy(),
+                                           permitted=False)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            LOG.warning('NA-07.4 cognition result not recorded (%s); no replay', type(exc).__name__)
+
+    def _tick_mission_cognition(self) -> None:
+        if self.mission_cognition is None or self._shutdown.is_set() or self.control.paused:
+            return
+        if self._mission_thread is not None and self._mission_thread.is_alive():
+            return
+        generation = self.control.generation()
+        try:
+            mission = self.control.admit(generation, lambda: self.missions.claim_cognition(
+                self._mission_policy(generation)))
+            if mission is None:
+                return
+            self._mission_thread = threading.Thread(
+                target=self._run_mission_cognition, args=(mission, generation),
+                name='AgentRelayMissionCognition', daemon=True)
+            self._start_managed_thread(self._mission_thread)
+        except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+            LOG.warning('NA-07.4 cognition admission deferred or interrupted (%s)', type(exc).__name__)
+
     def _observe_work_events(self) -> None:
         # No cognition or dispatch in NA-07.2. A journal failure must not
         # delay Telegram control commands or change a completed work status.
@@ -2933,6 +3001,7 @@ class AgentRelay:
                         self.missions.latest(self._mission_policy())
                     except (OSError, sqlite3.Error, ValueError) as exc:
                         LOG.warning('NA-07.3 refresh deferred (%s)', type(exc).__name__)
+                self._tick_mission_cognition()
                 updates = self.api.call('getUpdates', {
                     'offset': self.cursor.offset,
                     'timeout': 30,
@@ -3015,10 +3084,11 @@ def main() -> None:
         if config.work_enabled and config.work_executor == 'github':
             coordinator_client = BrowserlessHTTPClient(auth_file=config.auth_file)
             developer_client = BrowserlessHTTPClient(auth_file=config.work_developer_auth_file or config.auth_file)
+        mission_client = BrowserlessHTTPClient(auth_file=config.auth_file) if config.mission_cognition_enabled else None
         app = AgentRelay(config, api, client,
                          coordinator_client=coordinator_client,
                          developer_client=developer_client,
-                         image_client=image_client)
+                         image_client=image_client, mission_client=mission_client)
         app.serve()
     except KeyboardInterrupt:
         if app is None:

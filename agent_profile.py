@@ -148,7 +148,7 @@ class ProfileOwnership:
                 raise ValueError("Conversation or bot belongs to another profile") from exc
 
     def _claim(self, db, lane: str, cid: str):
-        if lane not in {"main", "coordinator", "developer"} or not isinstance(cid, str) or not cid:
+        if lane not in {"main", "coordinator", "developer", "mission"} or not isinstance(cid, str) or not cid:
             raise ValueError("Invalid profile conversation identity")
         db.execute("INSERT OR IGNORE INTO conversations VALUES (?, ?, ?)",
                    (self.profile, lane, cid))

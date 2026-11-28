@@ -83,6 +83,10 @@ class MissionStore:
                 UNIQUE(chat_id, message_id))""")
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_active_mission
                           ON missions(status) WHERE status='active'""")
+            db.execute("""CREATE TABLE IF NOT EXISTS mission_cognition (
+                mission_id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                claimed_at INTEGER, ended_at INTEGER, decision_body TEXT,
+                reason TEXT)""")
 
     @staticmethod
     def _row(row):
@@ -116,7 +120,7 @@ class MissionStore:
                        (status, now, reason, mission_id))
 
     def create(self, request: MissionRequest, *, owner_user_id: int, message_id: int,
-               policy: MissionPolicy) -> dict:
+               policy: MissionPolicy, arm_cognition: bool = False) -> dict:
         request.validate()
         if (type(owner_user_id) is not int or owner_user_id not in policy.owners
                 or type(message_id) is not int or message_id <= 0):
@@ -152,7 +156,10 @@ class MissionStore:
             db.execute("""INSERT INTO missions(mission_id, chat_id, message_id, grant_body, status)
                           VALUES (?, ?, ?, ?, 'active')""",
                        (grant["mission_id"], policy.chat_id, message_id, body))
-            return self._row((body, "active", None, None))
+            if arm_cognition:
+                db.execute("INSERT INTO mission_cognition(mission_id,state) VALUES (?, 'ready')",
+                           (grant["mission_id"],))
+            return self._with_cognition(db, self._row((body, "active", None, None)))
 
     def latest(self, policy: MissionPolicy) -> dict | None:
         """Refresh expiry/authority against current Host facts; no work binding."""
@@ -160,9 +167,71 @@ class MissionStore:
             db.execute("BEGIN IMMEDIATE")
             self.journal._check_identity(db)
             self._refresh(db, policy, int(self.clock()))
-            return self._row(db.execute(
+            return self._with_cognition(db, self._row(db.execute(
                 "SELECT grant_body, status, ended_at, end_reason FROM missions ORDER BY seq DESC LIMIT 1"
-            ).fetchone())
+            ).fetchone()))
+
+    def _with_cognition(self, db, mission):
+        if mission is not None:
+            row = db.execute("""SELECT state, claimed_at, decision_body, reason
+                                FROM mission_cognition WHERE mission_id=?""",
+                             (mission["mission_id"],)).fetchone()
+            if row:
+                state, claimed, body, reason = row
+                mission["used_decisions"] = int(claimed is not None)
+                mission["cognition"] = {"state": state, "reason": reason,
+                                        "decision": json.loads(body) if body else None}
+        return mission
+
+    def recover_cognition(self, *, enabled: bool):
+        """Only call at exclusive Host startup. Never replay a reserved turn."""
+        with closing(self.journal._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self.journal._check_identity(db)
+            now = int(self.clock())
+            db.execute("""UPDATE mission_cognition SET state='interrupted',
+                          ended_at=?, reason='restart_after_claim' WHERE state='claimed'""", (now,))
+            if not enabled:
+                db.execute("""UPDATE mission_cognition SET state='discarded',
+                              ended_at=?, reason='cognition_disabled' WHERE state='ready'""", (now,))
+
+    def claim_cognition(self, policy: MissionPolicy) -> dict | None:
+        """Atomically reserve one initial turn and debit the decision budget."""
+        with closing(self.journal._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self.journal._check_identity(db)
+            now = int(self.clock())
+            self._refresh(db, policy, now)
+            row = db.execute("""SELECT m.grant_body, m.status, m.ended_at, m.end_reason
+                FROM missions m JOIN mission_cognition c ON c.mission_id=m.mission_id
+                WHERE m.status='active' AND c.state='ready'""").fetchone()
+            mission = self._row(row)
+            if mission is None or mission["max_decisions"] < 1:
+                return None
+            db.execute("""UPDATE mission_cognition SET state='claimed', claimed_at=?
+                          WHERE mission_id=? AND state='ready'""", (now, mission["mission_id"]))
+            return self._with_cognition(db, mission)
+
+    def finish_cognition(self, mission_id: str, policy: MissionPolicy,
+                         *, decision: dict | None = None, reason: str = "turn_failed",
+                         permitted: bool = True) -> bool:
+        """Record a proposal only if the exact grant is still live."""
+        with closing(self.journal._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self.journal._check_identity(db)
+            now = int(self.clock())
+            self._refresh(db, policy, now)
+            active = db.execute("SELECT 1 FROM missions WHERE mission_id=? AND status='active'",
+                                (mission_id,)).fetchone()
+            if not permitted or not active:
+                state, body, reason = "discarded", None, "grant_no_longer_live"
+            elif decision is None:
+                state, body = "failed", None
+            else:
+                state, body, reason = "observed", json.dumps(decision, ensure_ascii=False), None
+            return db.execute("""UPDATE mission_cognition SET state=?, ended_at=?, decision_body=?, reason=?
+                                 WHERE mission_id=? AND state='claimed'""",
+                              (state, now, body, reason, mission_id)).rowcount == 1
 
     def revoke(self, mission_id: str, *, owner_user_id: int, policy: MissionPolicy) -> bool:
         if type(owner_user_id) is not int or owner_user_id not in policy.owners:

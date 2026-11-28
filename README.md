@@ -1218,3 +1218,32 @@ mission, no automatic wakeups, no new merge or delegation permission. The
 mission is a recorded planning envelope, NOT a grant usable by any existing
 dispatcher. Status/revoke work while paused; a new mission cannot be created
 while paused. No live verification implied by offline tests.
+
+### NA-07.4 — Autonomous Cognition (initial observation)
+
+Opt in with MISSION_COGNITION=on and MISSION_COGNITION_READ_ONLY_ACK=on
+in the named profile, in addition to mission owner configuration. Only enable
+if the main CWA account has no mutating native tools/connectors; a prompt and
+the acknowledgement are not a technical sandbox. Uses a separate CWA client
+with main auth, a separate persistent mission conversation, canonical final
+text verification and the existing profile conversation ownership checks.
+
+Only a NEW mission created while enabled arms a durable initial observation
+in the same transaction as its grant. The Host polling loop reserves one
+decision before starting a managed background thread; no human follow-up is
+needed. Exactly one attempt, even if max_decisions is larger. Earlier missions
+and unrelated WorkState events do not trigger cognition. The current mission
+scope and generation must still be valid when the result is stored. /stop,
+revocation and expiry prevent acceptance of stale results, but cannot recall
+an already submitted remote request. A claimed turn interrupted by restart
+is never retried automatically; disabling cognition discards unclaimed turns.
+The decision budget counts the reservation even on failure or interruption.
+
+Use /mission@BOT status to see cognition state, decision and proposed task.
+No additional Telegram publication or executor call follows the turn.
+Supported decisions: propose_task, wait, propose_finish, escalate. All are
+observations only, never actual task creation, verified completion or a grant
+for external writes. Existing developer, coordinator and main chat remain
+separate. Multi-step missions, mission-bound work events, automatic execution
+and result integration are later stages. The persistent mission conversation
+may contain earlier mission context; the current grant is authoritative.
