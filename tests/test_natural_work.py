@@ -159,9 +159,9 @@ class NaturalWorkTests(unittest.TestCase):
                 app._handle_natural_work(self.message(
                     "Рагна, учти деление на ноль"),Queue())
                 release.set()
-                end=time.monotonic()+5
-                while time.monotonic()<end and app.work.active(1):
-                    time.sleep(0.02)
+                # Terminal WorkState precedes the Telegram report. Wait for
+                # the managed thread itself, not merely the status transition.
+                self.assertTrue(app.wait_for_background(timeout=10))
             self.assertEqual(app.work.record["status"],"needs_review")
             posts=[x.args[1]["text"] for x in api.call.call_args_list
                    if x.args[0]=="sendMessage"]

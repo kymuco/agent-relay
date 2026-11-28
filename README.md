@@ -1160,3 +1160,23 @@ together. Custom state paths must be ignored in Git. This is a local event
 producer, not yet a mission scheduler, consumer acknowledgement protocol or
 cross-host federation. Emergency stop still fences work; events are historical
 facts, never permission to act. Existing work is never automatically replayed.
+
+### NA-07.2 — Decision Scheduler (observe only)
+
+Work-enabled hosts classify up to 100 journal events per existing Telegram
+polling iteration, without extra threads, CWA calls, external actions or new
+environment variables. Completed, failed and needs_review events are potential
+cognition candidates; accepted and started are ignored; interrupted requires
+reconciliation; stopped is ignored. A candidate is only an observation, not
+a pending executable wake or proof that a result is correct. All historical
+events, including ones recorded before this upgrade, can be classified for
+diagnostics; none can authorize a later action. Future mission admission must
+bind fresh events explicitly, not replay these observations.
+
+The scheduler cursor and classification rows commit in one SQLite transaction
+in the existing `.events.sqlite3` journal. Restart or failed transactions do
+not duplicate decisions. The scheduler pauses observation while emergency
+stop is active (event outbox delivery can continue); resume does not replay
+work or authorize cognition. Temporary observation errors do not prevent
+Telegram polling. No new permissions, mission state, model wakeup, peer
+transport or automatic work execution. No additional configuration required.

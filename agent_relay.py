@@ -22,6 +22,7 @@ from typing import Any
 
 from agent_control import ControlState
 from agent_events import EventJournal
+from decision_scheduler import DecisionScheduler
 from local_codex import (WorkState, parse_projects, parse_work_command,
                          parse_orchestrator_decision, work_prompt)
 from github_work import (BackgroundDeveloper, ChatRegistry, parse_repositories,
@@ -627,6 +628,8 @@ class AgentRelay:
                                     'bot-' + str(self.bot_id)) if config.work_enabled else None)
         self.work = (WorkState(config.work_state_file, event_journal=self.events)
                      if config.work_enabled else None)
+        self.decision_scheduler = (DecisionScheduler(self.events)
+                                   if self.events is not None else None)
         self.work_repos = (parse_repositories(config.work_repos)
                            if config.work_enabled and config.work_executor == 'github' else {})
         self.feedback_projects = parse_feedback_projects(config.work_feedback_projects, {
@@ -2773,6 +2776,20 @@ class AgentRelay:
                           type(exc).__name__)
         return True
 
+    def _observe_work_events(self) -> None:
+        # No cognition or dispatch in NA-07.2. A journal failure must not
+        # delay Telegram control commands or change a completed work status.
+        if self.work is None or self.decision_scheduler is None:
+            return
+        try:
+            self.work.flush_events()
+            if not self.control.paused and not self._shutdown.is_set():
+                count = self.decision_scheduler.tick()
+                if count:
+                    LOG.debug('NA-07.2 · observed work events=%s', count)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            LOG.warning('NA-07.2 observation deferred (%s)', type(exc).__name__)
+
     def serve(self) -> None:
         if (self.progress is not None and self.work is not None and
                 self.work.record.get('status') == 'interrupted'):
@@ -2834,8 +2851,7 @@ class AgentRelay:
                         LOG.warning('Очередь заполнена: новое сообщение пропущено')
         while not self._shutdown.is_set():
             try:
-                if self.work is not None:
-                    self.work.flush_events()
+                self._observe_work_events()
                 updates = self.api.call('getUpdates', {
                     'offset': self.cursor.offset,
                     'timeout': 30,
